@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <atomic>
 
 // Linux specific headers
 #include <sys/socket.h>
@@ -15,6 +16,20 @@
 #include <fcntl.h>
 #include <linux/joystick.h>
 #include <sys/resource.h>
+
+#undef BTN_A
+#undef BTN_B
+#undef BTN_X
+#undef BTN_Y
+#undef BTN_L
+#undef BTN_R
+#undef BTN_TL
+#undef BTN_TR
+#undef BTN_SELECT
+#undef BTN_START
+#undef BTN_MODE
+#undef BTN_THUMBL
+#undef BTN_THUMBR
 
 namespace ns {
 
@@ -66,12 +81,21 @@ inline uint64_t now_us() noexcept {
     return (uint64_t)duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-} // namespace ns
+}
 
-// State struct to hold current gamepad status (Linux Joystick API is event-driven)
 struct GamepadState {
-    bool buttons[16] = {false};
-    int16_t axes[8] = {0};
+    std::atomic<bool> buttons[16];
+    std::atomic<int16_t> axes[8];
+
+    GamepadState() {
+        for(int i=0; i<16; ++i) buttons[i].store(false, std::memory_order_relaxed);
+        for(int i=0; i<8; ++i) axes[i].store(0, std::memory_order_relaxed);
+    }
+
+    void copy_to(bool* dest_buttons, int16_t* dest_axes) const {
+        for(int i=0; i<16; ++i) dest_buttons[i] = buttons[i].load(std::memory_order_relaxed);
+        for(int i=0; i<8; ++i) dest_axes[i] = axes[i].load(std::memory_order_relaxed);
+    }
 };
 
 uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8000) {
@@ -92,39 +116,40 @@ ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
     ns::HIDReport r;
     r.reset();
 
-    // Standard Linux xpad driver mapping for Xbox controllers
-    if (pad.buttons[0]) r.buttons |= ns::BTN_B; // A
-    if (pad.buttons[1]) r.buttons |= ns::BTN_A; // B
-    if (pad.buttons[2]) r.buttons |= ns::BTN_Y; // X
-    if (pad.buttons[3]) r.buttons |= ns::BTN_X; // Y
+    bool b[16];
+    int16_t a[8];
+    pad.copy_to(b, a);
 
-    if (pad.buttons[4]) r.buttons |= ns::BTN_L; // LB
-    if (pad.buttons[5]) r.buttons |= ns::BTN_R; // RB
+    if (b[0]) r.buttons |= ns::BTN_B; 
+    if (b[1]) r.buttons |= ns::BTN_A; 
+    if (b[2]) r.buttons |= ns::BTN_Y; 
+    if (b[3]) r.buttons |= ns::BTN_X; 
+
+    if (b[4]) r.buttons |= ns::BTN_L; 
+    if (b[5]) r.buttons |= ns::BTN_R; 
     
-    // Linux maps LT and RT to axes 2 and 5. Value is -32768 (unpressed) to 32767 (fully pressed)
-    if (pad.axes[2] > 0) r.buttons |= ns::BTN_ZL;
-    if (pad.axes[5] > 0) r.buttons |= ns::BTN_ZR;
+    if (a[2] > 0) r.buttons |= ns::BTN_ZL;
+    if (a[5] > 0) r.buttons |= ns::BTN_ZR;
 
-    if (pad.buttons[6]) r.buttons |= ns::BTN_MINUS;  // Back
-    if (pad.buttons[7]) r.buttons |= ns::BTN_PLUS;   // Start
-    if (pad.buttons[9]) r.buttons |= ns::BTN_LSTICK; // L3
-    if (pad.buttons[10])r.buttons |= ns::BTN_RSTICK; // R3
+    if (b[6]) r.buttons |= ns::BTN_MINUS;  
+    if (b[7]) r.buttons |= ns::BTN_PLUS;   
+    if (b[9]) r.buttons |= ns::BTN_LSTICK; 
+    if (b[10])r.buttons |= ns::BTN_RSTICK; 
 
-    if (pad.buttons[9] && pad.buttons[10]) {
+    if (b[9] && b[10]) {
         r.buttons |= ns::BTN_HOME;
         r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK); 
     }
 
-    if (pad.buttons[6] && pad.buttons[7]) {
+    if (b[6] && b[7]) {
         r.buttons |= ns::BTN_CAPTURE;
         r.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS); 
     }
 
-    // D-PAD on Linux is usually mapped to axes 6 (X) and 7 (Y)
-    bool up    = (pad.axes[7] < -16000);
-    bool down  = (pad.axes[7] >  16000);
-    bool left  = (pad.axes[6] < -16000);
-    bool right = (pad.axes[6] >  16000);
+    bool up    = (a[7] < -16000);
+    bool down  = (a[7] >  16000);
+    bool left  = (a[6] < -16000);
+    bool right = (a[6] >  16000);
 
     if (up && right)       r.hat = ns::HAT_NE;
     else if (up && left)   r.hat = ns::HAT_NW;
@@ -135,105 +160,101 @@ ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
     else if (left)         r.hat = ns::HAT_W;
     else if (right)        r.hat = ns::HAT_E;
 
-    // Thumbsticks are axes 0 (LX), 1 (LY), 3 (RX), 4 (RY)
-    r.lx = apply_deadzone(pad.axes[0], false);
-    r.ly = apply_deadzone(pad.axes[1], true);
-    r.rx = apply_deadzone(pad.axes[3], false);
-    r.ry = apply_deadzone(pad.axes[4], true);
+    r.lx = apply_deadzone(a[0], false);
+    r.ly = apply_deadzone(a[1], false);  
+    r.rx = apply_deadzone(a[3], false);
+    r.ry = apply_deadzone(a[4], false);  
 
     return r;
 }
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: ./gamepad <RASPBERRY PI IP>\n";
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP> [device_path (e.g. /dev/input/js0)]\n";
         return 1;
     }
 
     std::string host = argv[1];
-    uint16_t port    = ns::DEFAULT_PORT;
+    std::string device = (argc >= 3) ? argv[2] : "/dev/input/js0";
 
-    // Attempt to set high priority (Requires sudo for full effect on Linux)
+    int js_fd = open(device.c_str(), O_RDONLY);
+    if (js_fd < 0) {
+        std::cerr << "Error opening gamepad device: " << device << "\n";
+        return 1;
+    }
+    std::cout << "Gamepad successfully opened at: " << device << "\n";
+
     setpriority(PRIO_PROCESS, 0, -20);
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
-        std::cerr << "Failed to create socket.\n";
+        std::cerr << "Failed to create UDP socket.\n";
+        close(js_fd);
         return 1;
     }
 
-    struct addrinfo hints{}, *res = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    
-    char port_buf[8];
-    snprintf(port_buf, sizeof(port_buf), "%u", port);
-    if (getaddrinfo(host.c_str(), port_buf, &hints, &res) != 0) {
-        std::cerr << "Failed to resolve host.\n";
+    struct sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(ns::DEFAULT_PORT);
+    if (inet_pton(AF_INET, host.c_str(), &dest.sin_addr) <= 0) {
+        std::cerr << "Invalid IP address: " << host << "\n";
+        close(js_fd);
         close(sock);
         return 1;
     }
 
-    sockaddr_in dest{};
-    memcpy(&dest, res->ai_addr, sizeof(dest));
-    freeaddrinfo(res);
+    std::cout << "Streaming data to " << host << ":" << ns::DEFAULT_PORT << "... Press CTRL+C to exit.\n";
 
-    std::cout << "Started... Press CTRL+C to exit.\n";
-
-    uint32_t seq = 0;
     GamepadState state;
-    
-    // Open gamepad device in non-blocking mode
-    const char* js_dev = "/dev/input/js0";
-    int js_fd = open(js_dev, O_RDONLY | O_NONBLOCK);
+    std::atomic<bool> running{true};
 
-    while (true) {
-        bool connected = false;
+    // Thread for transmitting network reports via high-precision busy-wait polling loop
+    std::thread sender_thread([&]() {
+        uint32_t packet_seq = 0;
+        auto next_tick = std::chrono::steady_clock::now();
 
-        if (js_fd >= 0) {
-            js_event event;
-            // Read all queued events
-            while (read(js_fd, &event, sizeof(event)) > 0) {
-                event.type &= ~JS_EVENT_INIT; // Ignore synthetic init flags
-                
-                if (event.type == JS_EVENT_BUTTON && event.number < 16) {
-                    state.buttons[event.number] = event.value;
-                } else if (event.type == JS_EVENT_AXIS && event.number < 8) {
-                    state.axes[event.number] = event.value;
-                }
+        while (running.load(std::memory_order_relaxed)) {
+            while (std::chrono::steady_clock::now() < next_tick) {
+                std::atomic_thread_fence(std::memory_order_relaxed);
             }
 
-            // Check if device disconnected
-            if (errno != EAGAIN) {
-                close(js_fd);
-                js_fd = -1;
-            } else {
-                connected = true;
-            }
-        } else {
-            // Attempt reconnect quietly
-            js_fd = open(js_dev, O_RDONLY | O_NONBLOCK);
+            ns::Packet pkt{};
+            pkt.magic         = ns::PROTO_MAGIC;
+            pkt.version       = ns::PROTO_VERSION;
+            pkt.flags         = ns::FLAG_NONE;
+            pkt.autofire_mask = 0;
+            pkt.seq           = packet_seq++;
+            pkt.ts_us         = ns::now_us();
+            pkt.report        = map_linux_js_to_switch(state);
+
+            sendto(sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
+
+            next_tick += std::chrono::milliseconds(2);
         }
+    });
 
-        ns::Packet pkt{};
-        pkt.magic   = ns::PROTO_MAGIC;
-        pkt.version = ns::PROTO_VERSION;
-        pkt.flags   = ns::FLAG_NONE;
-        pkt.seq     = seq++;
-        pkt.ts_us   = ns::now_us();
+    struct js_event event;
+    // Main thread handling incoming OS joystick device event parsing
+    while (read(js_fd, &event, sizeof(event)) > 0) {
+        uint8_t type = event.type & ~JS_EVENT_INIT;
 
-        if (connected) {
-            pkt.report = map_linux_js_to_switch(state);
-            sendto(sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
-            std::this_thread::sleep_for(std::chrono::milliseconds(2)); 
-        } else {
-            pkt.report.reset();
-            sendto(sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (type == JS_EVENT_BUTTON) {
+            if (event.number < 16) {
+                state.buttons[event.number].store(event.value, std::memory_order_relaxed);
+            }
+        } else if (type == JS_EVENT_AXIS) {
+            if (event.number < 8) {
+                state.axes[event.number].store(event.value, std::memory_order_relaxed);
+            }
         }
     }
 
-    if (js_fd >= 0) close(js_fd);
+    running = false;
+    if (sender_thread.joinable()) {
+        sender_thread.join();
+    }
+
+    close(js_fd);
     close(sock);
     return 0;
 }
