@@ -103,6 +103,12 @@ g++ -O3 -pthread ns-gamepad.cpp -o ns-gamepad
 ```bash
 ./ns-gamepad 192.168.1.X [/dev/input/jsY]
 ```
+💡 **Tip:** To find out which `jsY` index to use, install `jstest-gtk` or `joystick` to find the correct device name by tracking real-time inputs:
+```bash
+sudo apt install joystick
+# Test which device reacts to your buttons (e.g., js0, js1, etc.)
+jstest /dev/input/js0
+```
 
 *You may need to run with `sudo` or add your user to the `input` group if the application cannot access controller events.*
 
