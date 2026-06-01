@@ -8,63 +8,75 @@ This project was built from scratch in **pure C++** and uses **UDP** to guarante
 
 ## 🛠️ Build and Run Tutorial
 
-### Part 1: Raspberry Pi (Backend & USB Gadget)
+### Part 1: Raspberry Pi (Backend Only)
 
-1.  **Clone the repository** onto your Raspberry Pi:
-    ```bash
-    git clone https://github.com/Dycool/Nintendo-Switch-PC-Control.git
-    cd Nintendo-Switch-PC-Control
-    ```
+To save space and time on your Raspberry Pi, clone **only** the backend folder:
 
-2.  **Compile the backend** C++ code:
-    ```bash
-    cd backend/rpi
-    mkdir build && cd build
-    cmake ..
-    make
-    ```
+1. **Clone only the backend folder**:
+   ```bash
+   git clone --no-checkout https://github.com
+   cd Nintendo-Switch-PC-Control
+   git sparse-checkout set backend
+   git checkout
+   ```
 
-3.  **Run the USB Gadget Script**:
-    This script makes the Pi pretend to be a HORI Pokken controller. You must run this *before* plugging the Pi into the Switch and *before* starting the backend.
-    ```bash
-    cd .. # Go back to backend/rpi folder
-    sudo bash setup_gadget.sh
-    ```
+2. **Compile the backend** C++ code:
+   ```bash
+   cd backend/rpi
+   mkdir build && cd build
+   cmake ..
+   make
+   ```
 
-4.  **Start the Backend**:
-    ```bash
-    cd build
-    sudo chrt -f 99 ./ns-backend
-    ```
-    *(The `chrt` command gives the process maximum real-time priority for lowest latency).*
+3. **Run the USB Gadget Script**:
+   This script makes the Pi pretend to be a HORI Pokken controller. You must run this *before* plugging the Pi into the Switch and *before* starting the backend.
+   ```bash
+   cd .. # Go back to backend/rpi folder
+   sudo bash setup_gadget.sh
+   ```
 
-5.  **Connect to Switch:** Now, plug the appropriate USB port (USB-C on Pi 4, inner Micro-USB on Pi Zero) into the Switch dock.
+4. **Start the Backend**:
+   ```bash
+   cd build
+   sudo chrt -f 99 ./ns-backend
+   ```
+   *(The `chrt` command gives the process maximum real-time priority for lowest latency).*
+
+5. **Connect to Switch:** Now, plug the appropriate USB port (USB-C on Pi 4, inner Micro-USB on Pi Zero) into the Switch dock.
 
 ---
 
-### Part 2: PC (Frontend)
+### Part 2: PC (Frontend Only)
 
-Now that your Pi is ready and listening, you need to run the frontend on your PC to send inputs.
+On your computer, clone **only** the frontend folder:
+
+1. **Clone only the frontend folder**:
+   ```bash
+   git clone --no-checkout https://github.com
+   cd Nintendo-Switch-PC-Control
+   git sparse-checkout set frontend
+   git checkout
+   ```
 
 #### 🪟 For Windows
-1.  **Navigate** to the `frontend/windows/` folder.
-2.  **Compile the frontend:** Double-click the `build.bat` script in Windows Explorer, or run it from the command line. It will automatically detect MSVC or MinGW/MSYS2 and compile the `gamepad.exe` executable.
-3.  **Run the program:** Open a command prompt (CMD or PowerShell), navigate to the folder containing the compiled executable, and run it by providing your Pi's IP address:
-    ```cmd
-    gamepad.exe 192.168.1.X
-    ```
+1. **Navigate** to the `frontend/windows/` folder.
+2. **Compile the frontend:** Double-click the `build.bat` script in Windows Explorer, or run it from the command line. It will automatically detect MSVC or MinGW/MSYS2 and compile the `gamepad.exe` executable.
+3. **Run the program:** Open a command prompt (CMD or PowerShell), navigate to the folder containing the compiled executable, and run it by providing your Pi's IP address:
+   ```cmd
+   gamepad.exe 192.168.1.X
+   ```
 
 #### 🐧 For Linux (Ubuntu / Debian / SteamOS)
-1.  **Navigate** to the `frontend/linux/` folder.
-2.  **Compile the frontend:** Use `g++` (requires `build-essential`):
-    ```bash
-    g++ -O3 -pthread ns-gamepad.cpp -o ns-gamepad
-    ```
-3.  **Run the program:** Provide your Pi's IP address:
-    ```bash
-    ./ns-gamepad 192.168.1.X
-    ```
-    *(Note: You may need to run with `sudo` or add your user to the `input` group if the program cannot read your controller events).*
+1. **Navigate** to the `frontend/linux/` folder.
+2. **Compile the frontend:** Use `g++` (requires `build-essential`):
+   ```bash
+   g++ -O3 -pthread ns-gamepad.cpp -o ns-gamepad
+   ```
+3. **Run the program:** Provide your Pi's IP address:
+   ```bash
+   ./ns-gamepad 192.168.1.X
+   ```
+   *(Note: You may need to run with `sudo` or add your user to the `input` group if the program cannot read your controller events).*
 
 ---
 
