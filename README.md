@@ -204,6 +204,11 @@ For the lowest possible latency:
 * Avoid Wi-Fi power-saving modes.
 
 ---
+## Planned
+
+* UI for clients
+* Server-side Encryption
+---
 
 ## 📄 License
 
