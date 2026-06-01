@@ -12,7 +12,7 @@ This project was built from scratch in **pure C++** and uses **UDP** to guarante
 
 1.  **Clone the repository** onto your Raspberry Pi:
     ```bash
-    git clone [https://github.com/Dycool/Nintendo-Switch-PC-Control.git](https://github.com/Dycool/Nintendo-Switch-PC-Control.git)
+    git clone https://github.com/Dycool/Nintendo-Switch-PC-Control.git
     cd Nintendo-Switch-PC-Control
     ```
 
