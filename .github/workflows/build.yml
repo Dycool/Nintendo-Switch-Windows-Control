@@ -40,7 +40,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Build
         run: |
-          cd frontend/macos/
+          cd frontend/mac/
           clang++ -std=c++17 -ObjC++ -framework GameController -framework Foundation ns-gamepad.mm -o ns-gamepad
       - uses: actions/upload-artifact@v4
         with:
