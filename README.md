@@ -84,21 +84,15 @@ git sparse-checkout set frontend
 
 ## 🪟 Windows
 
-1. Navigate to the `frontend/windows/` folder.
+**Prerequisite:** You must have **MSYS2** installed. [Get it here](https://www.msys2.org/). 
+*Note: After installing, you must open the **MSYS2 UCRT64** terminal (not the default MSYS terminal) to build the project.*
+
+1. Open the **MSYS2 UCRT64** terminal and navigate to the `frontend/windows/` folder.
 
 2. Build the frontend by running:
 
-```cmd
-build.bat
-```
-
-The script automatically detects **MSVC** or **MinGW/MSYS2** and builds `gamepad.exe`.
-
-3. Run the application and provide your Raspberry Pi's IP address:
-
-```cmd
-gamepad.exe 192.168.1.X
-```
+```bash
+g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o gamepad.exe -static -lws2_32 -lxinput
 
 ---
 
