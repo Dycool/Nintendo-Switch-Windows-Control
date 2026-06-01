@@ -17,13 +17,12 @@ Before the Raspberry Pi can emulate a USB controller, you must enable the USB OT
 # 1. Enable the dwc2 driver in config.txt
 echo "dtoverlay=dwc2" | sudo tee -a /boot/firmware/config.txt
 
-# 2. Add required modules to cmdline.txt (this safely inserts them on the same line)
+# 2. Add required modules to cmdline.txt
 sudo sed -i 's/rootwait/rootwait modules-load=dwc2,libcomposite/' /boot/firmware/cmdline.txt
 
 # 3. Reboot the system to apply changes
 sudo reboot
 ```
-*(Note: If you are using an older version of Raspberry Pi OS, you may need to remove `/firmware` from the file paths above).*
 
 #### Clone the backend
 
