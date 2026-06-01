@@ -1,0 +1,68 @@
+name: Build All Binaries
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  # 1. Build Windows Frontend (Uses MSYS2/MinGW environment)
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Windows
+        shell: bash
+        run: |
+          cd frontend/windows/
+          g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: frontend/windows/ns-gamepad.exe
+
+  # 2. Build Linux Frontend
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Linux
+        run: |
+          cd frontend/linux/
+          g++ -O3 -pthread ns-gamepad.cpp -o ns-gamepad
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binary
+          path: frontend/linux/ns-gamepad
+
+  # 3. Build macOS Frontend
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build macOS
+        run: |
+          cd frontend/macos/
+          clang++ -std=c++17 -ObjC++ -framework GameController -framework Foundation ns-gamepad.mm -o ns-gamepad
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-binary
+          path: frontend/macos/ns-gamepad
+
+  # 4. Build Raspberry Pi Backend (Cross-compiled on Linux runner)
+  build-pi-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ARM Cross-Compiler
+        run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu cmake
+      - name: Build Pi Backend
+        run: |
+          cd backend/rpi
+          mkdir build && cd build
+          cmake .. -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
+          make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpi-backend-binary
+          path: backend/rpi/build/ns-backend
