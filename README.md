@@ -10,10 +10,39 @@ This project was built from scratch in **pure C++** and uses **UDP** to guarante
 
 ### Part 1: Raspberry Pi (Backend Only)
 
-Clone only the backend portion of the repository:
+#### ⚙️ Prerequisite: Enable USB Gadget Mode (Boot Settings)
+Before the Raspberry Pi can emulate a USB controller, you must enable the USB OTG drivers at the system level. 
+
+1. Edit the boot config file:
+   ```bash
+   sudo nano /boot/firmware/config.txt 
+   # Note: use /boot/config.txt on older Raspberry Pi OS versions
+   ```
+2. Scroll to the bottom and add the following line:
+   ```ini
+   dtoverlay=dwc2
+   ```
+3. Save and exit (Ctrl+O, Enter, Ctrl+X).
+4. Edit the kernel command line file:
+   ```bash
+   sudo nano /boot/firmware/cmdline.txt
+   # Note: use /boot/cmdline.txt on older Raspberry Pi OS versions
+   ```
+5. Add the following text right after `rootwait`. **(Important: Do not add a new line; `cmdline.txt` must remain a single, continuous line of text):**
+   ```text
+   modules-load=dwc2,libcomposite
+   ```
+6. Reboot your Raspberry Pi to apply the changes:
+   ```bash
+   sudo reboot
+   ```
+
+#### Clone the backend
+
+Once rebooted, clone only the backend portion of the repository:
 
 ```bash
-git clone --depth 1 --filter=blob:none --sparse https://github.com/Dycool/Nintendo-Switch-PC-Control.git && \
+git clone --depth 1 --filter=blob:none --sparse [https://github.com/Dycool/Nintendo-Switch-PC-Control.git](https://github.com/Dycool/Nintendo-Switch-PC-Control.git) && \
 cd Nintendo-Switch-PC-Control && \
 git sparse-checkout set backend
 ```
@@ -29,7 +58,7 @@ make
 
 #### Run the USB Gadget Script
 
-This script makes the Pi emulate a HORI Pokken Controller. Run it **before** connecting the Pi to the Switch and **before** starting the backend.
+This script sets up the `libcomposite` gadget to make the Pi emulate a HORI Pokken Controller. Run it **before** connecting the Pi to the Switch and **before** starting the backend.
 
 ```bash
 cd .. # Return to backend/rpi
@@ -59,7 +88,7 @@ Connect the Raspberry Pi to the Switch dock:
 Clone only the frontend portion of the repository:
 
 ```bash
-git clone --depth 1 --filter=blob:none --sparse https://github.com/Dycool/Nintendo-Switch-PC-Control.git && \
+git clone --depth 1 --filter=blob:none --sparse [https://github.com/Dycool/Nintendo-Switch-PC-Control.git](https://github.com/Dycool/Nintendo-Switch-PC-Control.git) && \
 cd Nintendo-Switch-PC-Control && \
 git sparse-checkout set frontend
 ```
@@ -118,10 +147,10 @@ jstest /dev/input/js0
 
 Any **XInput-compatible controller** connected to your PC (Xbox controllers and most standard PC gamepads) can control the Nintendo Switch.
 
-| Action  | Shortcut                              |
-| ------- | ------------------------------------- |
-| HOME    | Press **L3 + R3** simultaneously      |
-| CAPTURE | Press **START + BACK** simultaneously |
+| Action  | Shortcut                                |
+| ------- | --------------------------------------- |
+| HOME    | Press **L3 + R3** simultaneously        |
+| CAPTURE | Press **START + BACK** simultaneously   |
 
 ---
 
