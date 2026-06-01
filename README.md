@@ -16,9 +16,11 @@ This project was built from scratch in **pure C++** and uses **UDP** to guarante
     cd Nintendo-Switch-Windows-Control
     ```
 
-2.  **Compile the backend** C++ code (CMake is not required):
+2.  **Compile the backend** C++ code:
     ```bash
-    g++ -std=c++17 -O2 -Wall src/backend/main.cpp -I./include -o ns-backend -pthread
+    mkdir build && cd build
+    cmake ..
+    make ns-backend
     ```
 
 3.  **Run the USB Gadget Script**:
