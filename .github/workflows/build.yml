@@ -6,7 +6,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  # 1. Build Windows Frontend (Uses MSYS2/MinGW environment)
   build-windows:
     runs-on: windows-latest
     steps:
@@ -21,7 +20,6 @@ jobs:
           name: windows-binary
           path: frontend/windows/ns-gamepad.exe
 
-  # 2. Build Linux Frontend
   build-linux:
     runs-on: ubuntu-latest
     steps:
@@ -35,24 +33,20 @@ jobs:
           name: linux-binary
           path: frontend/linux/ns-gamepad
 
-  # 3. Build macOS Frontend
   build-macos:
-      runs-on: macos-latest
-      steps:
-        - name: Checkout Repository
-          uses: actions/checkout@v4
-        
-        - name: Sparse Checkout for macOS
-          run: |
-            git sparse-checkout init --cone
-            git sparse-checkout set frontend/macos
-        
-        - name:  Build
-          run: |
-            cd frontend/macos/
-            clang++ -std=c++17 -ObjC++ -framework GameController -framework Foundation ns-gamepad.mm -o ns-gamepad
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cd frontend/macos/
+          clang++ -std=c++17 -ObjC++ -framework GameController -framework Foundation ns-gamepad.mm -o ns-gamepad
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-binary
+          path: frontend/macos/ns-gamepad
 
-  # 4. Build Raspberry Pi Backend (Cross-compiled on Linux runner)
   build-pi-backend:
     runs-on: ubuntu-latest
     steps:
