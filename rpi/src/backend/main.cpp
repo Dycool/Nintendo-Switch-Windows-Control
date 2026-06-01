@@ -1,20 +1,3 @@
-// ─────────────────────────────────────────────────────────────────────────────
-//  ns-backend  –  runs on Raspberry Pi
-//
-//  Receives UDP packets from ns-frontend, maintains an atomic HID state,
-//  and a dedicated writer thread pushes reports to /dev/hidg0 at WRITER_HZ.
-//
-//  Features vs. the original Go version:
-//    • Direct UDP instead of SSH pipe  (lower latency, reconnectable)
-//    • Atomic 64-bit HID state (lock-free read in writer thread)
-//    • Watchdog: zeroes inputs after WATCHDOG_MS of silence
-//    • Autofire: backend-side toggle so frontend stays simple
-//    • epoll on the UDP socket for efficient blocking receive
-//    • Sequence-number based out-of-order discard
-//
-//  Build:  cmake .. && make ns-backend
-//  Usage:  ns-backend [-p PORT] [-d /dev/hidg0] [-r HZ] [-v]
-// ─────────────────────────────────────────────────────────────────────────────
 #include "../../include/protocol.hpp"
 
 #include <atomic>
@@ -99,7 +82,6 @@ static void writer_thread(const std::string& dev, int hz) {
         while (g_running.load(std::memory_order_relaxed)) {
             std::this_thread::sleep_until(next);
             
-            // [CORREÇÃO] 3. Evitar drift de tempo e rajadas se o sleep/escrita bloquear
             auto now = Clock::now();
             next = std::max(next + tick, now + tick);
 
@@ -111,7 +93,6 @@ static void writer_thread(const std::string& dev, int hz) {
             uint16_t  af_mask;
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
-                // [CORREÇÃO] 1. Limpar efetivamente o estado partilhado para não voltar a ler o botão preso no ciclo seguinte
                 if (silent) {
                     g_report.reset();
                     g_autofire_mask = 0;
@@ -256,7 +237,6 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        // [CORREÇÃO] 2. Reiniciar o Frontend: Permitir se for explícito (RESET) ou desfasamento brutal (reinício)
         bool is_reset = (pkt.flags & FLAG_RESET);
         bool sequence_jump = (expected_seq > pkt.seq) && ((expected_seq - pkt.seq) > 100);
 
