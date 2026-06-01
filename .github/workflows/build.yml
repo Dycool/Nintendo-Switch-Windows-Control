@@ -2,8 +2,12 @@ name: Build All Binaries
 
 on:
   push:
-    branches: [ "main" ]
+    tags:
+      - 'v*'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-windows:
@@ -15,10 +19,11 @@ jobs:
         run: |
           cd frontend/windows/
           g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput
+          zip ns-pc-control-windows.zip ns-gamepad.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-binary
-          path: frontend/windows/ns-gamepad.exe
+          name: windows-artifact
+          path: frontend/windows/ns-pc-control-windows.zip
 
   build-linux:
     runs-on: ubuntu-latest
@@ -28,24 +33,25 @@ jobs:
         run: |
           cd frontend/linux/
           g++ -O3 -pthread ns-gamepad.cpp -o ns-gamepad
+          zip ns-pc-control-linux.zip ns-gamepad
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-binary
-          path: frontend/linux/ns-gamepad
+          name: linux-artifact
+          path: frontend/linux/ns-pc-control-linux.zip
 
   build-macos:
     runs-on: macos-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
       - name: Build
         run: |
           cd frontend/mac/
           clang++ -std=c++17 -ObjC++ -framework GameController -framework Foundation ns-gamepad.mm -o ns-gamepad
+          zip ns-pc-control-mac.zip ns-gamepad
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-binary
-          path: frontend/mac/ns-gamepad
+          name: macos-artifact
+          path: frontend/mac/ns-pc-control-mac.zip
 
   build-pi-backend:
     runs-on: ubuntu-latest
@@ -59,7 +65,30 @@ jobs:
           mkdir build && cd build
           cmake .. -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
           make
+          cp ../setup_gadget.sh .
+          zip ns-pc-control-raspberry-pi.zip ns-backend setup_gadget.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: rpi-backend-binary
-          path: backend/rpi/build/ns-backend
+          name: rpi-artifact
+          path: backend/rpi/build/ns-pc-control-raspberry-pi.zip
+
+  release:
+    needs: [build-windows, build-linux, build-macos, build-pi-backend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: final-release
+          merge-multiple: true
+
+      - name: Create Draft Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            final-release/ns-pc-control-windows.zip
+            final-release/ns-pc-control-linux.zip
+            final-release/ns-pc-control-mac.zip
+            final-release/ns-pc-control-raspberry-pi.zip
+          draft: true
+          generate_release_notes: true
