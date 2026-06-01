@@ -93,6 +93,7 @@ git sparse-checkout set frontend
 
 ```bash
 g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o gamepad.exe -static -lws2_32 -lxinput
+```
 
 ---
 
