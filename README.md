@@ -204,6 +204,30 @@ For the lowest possible latency:
 * Avoid Wi-Fi power-saving modes.
 
 ---
+
+## 🔒 Security
+
+Each UDP datagram is authenticated with a truncated **HMAC-SHA256** tag derived from a compiled-in default key. The backend silently drops any packet with an invalid tag — preventing network attackers from injecting controller inputs.
+
+**No configuration needed.** The HMAC is always active on both sides. If you want a different key, edit `DEFAULT_SECRET` in `backend/rpi/include/protocol.hpp` and recompile.
+
+### Additional protection layers:
+| Layer | Purpose |
+|---|---|
+| Magic/version check | Rejects random internet noise on first read |
+| Per-IP rate limiter (2000 pkts/sec) | Prevents UDP flood from saturating the Pi |
+| IP pinning | Only the first valid client is accepted mid-session |
+| HMAC-SHA256 (16-byte truncated) | Cryptographically authenticates every packet |
+| Sequence counter | Prevents replay of old captured packets |
+
+**Latency impact:** ~1 µs per packet. No encryption — button states are visible on the wire, which is acceptable for a game controller.
+
+---
+
+## Planned
+
+* UI for clients
+---
 ## Planned
 
 * UI for clients

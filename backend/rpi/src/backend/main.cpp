@@ -1,4 +1,5 @@
 #include "../../include/protocol.hpp"
+#include "../../include/sha256.h"
 
 #include <atomic>
 #include <thread>
@@ -28,6 +29,26 @@ using ms    = std::chrono::milliseconds;
 // ── Global flags ──────────────────────────────────────────────────────────────
 static std::atomic<bool> g_running{true};
 static bool g_verbose = false;
+
+// HMAC authentication (key derived from DEFAULT_SECRET at startup)
+static uint8_t  g_hmac_key[32];
+
+// IP pinning: once a valid sender is seen, only accept packets from it
+// until the watchdog timer releases the lock.
+static bool         g_have_auth = false;
+static sockaddr_in  g_auth_addr{};
+
+// Per-IP rate limiting (token bucket, 32-entry hash table)
+static constexpr uint64_t RATE_WINDOW_US = 1'000'000;  // 1 second
+static constexpr uint32_t RATE_MAX_PKT   = 2000;        // max packets/sec per IP
+static constexpr int      RATE_TABLE     = 32;
+
+struct RateSlot {
+    uint32_t ip;           // IP in network byte order, 0 = empty
+    uint32_t count;
+    uint64_t window_start; // us
+};
+static RateSlot g_rate_table[RATE_TABLE];
 
 // ── Shared state (protected by g_mtx) ────────────────────────────────────────
 // HIDReport is exactly 8 bytes.  On arm64/x86-64 an aligned 64-bit load/store
@@ -154,6 +175,27 @@ static void stats_thread() {
     }
 }
 
+// ── Per-IP rate limiter ──────────────────────────────────────────────────────
+// Returns true if this packet is within the rate limit for its source IP.
+static bool rate_allow(uint32_t ip) {
+    uint64_t now = now_us();
+    uint32_t idx = ip % RATE_TABLE;
+    RateSlot &s = g_rate_table[idx];
+    if (s.ip != ip) {
+        s.ip = ip;
+        s.count = 1;
+        s.window_start = now;
+        return true;
+    }
+    if (now - s.window_start > RATE_WINDOW_US) {
+        s.count = 1;
+        s.window_start = now;
+        return true;
+    }
+    s.count++;
+    return s.count <= RATE_MAX_PKT;
+}
+
 // ── UDP receive loop (main thread) ────────────────────────────────────────────
 int main(int argc, char** argv) {
     uint16_t    port      = DEFAULT_PORT;
@@ -174,6 +216,9 @@ int main(int argc, char** argv) {
         }
     }
     rate_hz = std::clamp(rate_hz, 1, 1000);
+
+    // Derive HMAC key from the compiled-in default secret
+    derive_key(DEFAULT_SECRET, g_hmac_key);
 
     // Warn if HID device missing (common on first boot before setup_gadget.sh)
     struct stat dev_st{};
@@ -203,7 +248,7 @@ int main(int argc, char** argv) {
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind"); close(sock); return 1;
     }
-    std::printf("[backend] UDP %s:%u  device=%s  writer=%d Hz\n",
+    std::printf("[backend] UDP %s:%u  device=%s  writer=%d Hz  HMAC=always\n",
                 bind_addr.c_str(), port, device.c_str(), rate_hz);
 
     // ── Threads ───────────────────────────────────────────────────────────────
@@ -232,9 +277,47 @@ int main(int argc, char** argv) {
                                  (sockaddr*)&sender, &slen);
 
         if (bytes != (ssize_t)PACKET_SIZE) continue;
+
+        // ── 1. Per-IP rate limiter (trivial, drops flood before any real work) ──
+        uint32_t src_ip = sender.sin_addr.s_addr;
+        if (!rate_allow(src_ip)) {
+            if (g_verbose) puts("[backend] rate limit exceeded, dropped");
+            continue;
+        }
+
+        // ── 2. Magic + version check (very fast) ────────────────────────────────
         if (!packet_ok(pkt)) {
             if (g_verbose) puts("[backend] bad magic/version, dropped");
             continue;
+        }
+
+        // ── 3. IP pinning (fast — prevents non-pinned attackers from reaching HMAC)
+        if (g_have_auth) {
+            bool same_ip   = src_ip == g_auth_addr.sin_addr.s_addr;
+            bool same_port = sender.sin_port == g_auth_addr.sin_port;
+            if (!same_ip || !same_port) {
+                uint64_t last = g_last_rx_us.load(std::memory_order_acquire);
+                if (last != 0) {
+                    if (g_verbose) puts("[backend] wrong sender IP, dropped");
+                    continue;
+                }
+                if (g_verbose) puts("[backend] new sender IP accepted (old client timed out)");
+                g_have_auth = false;
+            }
+        }
+
+        // ── 4. HMAC authentication (always active) ───────────────────────────────
+        if (hmac_verify(g_hmac_key, 32,
+                        (const uint8_t *)&pkt, PACKET_AUTH_SIZE,
+                        pkt.hmac, HMAC_TAG_SIZE) != 0) {
+            if (g_verbose) puts("[backend] bad HMAC, dropped");
+            continue;
+        }
+
+        // ── 5. Pin the sender (if not already pinned) ────────────────────────────
+        if (!g_have_auth) {
+            g_auth_addr = sender;
+            g_have_auth = true;
         }
 
         bool is_reset = (pkt.flags & FLAG_RESET);

@@ -13,6 +13,7 @@
 #include <cstdint>             // Fixed-width integer types
 #include <thread>              // Threading support
 #include <algorithm>           // Standard algorithms (clamp)
+#include "sha256.h"            // HMAC-SHA256 for packet authentication
 
 namespace ns {
 
@@ -20,6 +21,7 @@ namespace ns {
 static constexpr uint32_t PROTO_MAGIC   = 0x4E535743u;  // 'NSWC' magic number for packet validation
 static constexpr uint8_t  PROTO_VERSION = 1;             // Protocol version for compatibility checking
 static constexpr uint16_t DEFAULT_PORT  = 7331;          // UDP port for sending gamepad data
+static constexpr const char* DEFAULT_SECRET = "nsc-R2xvCy7Eyw2nfbZIOGyKZPnostpaRY";
 
 /// Nintendo Switch Pro Controller button bitmask layout
 /// Bits correspond to specific buttons, allowing multiple buttons to be represented in a single uint16_t
@@ -60,7 +62,10 @@ enum Flags : uint8_t {
     FLAG_AUTOFIRE=0x02      // Enable autofire for specified buttons
 };
 
-/// UDP wire packet structure sent from PC frontend to Raspberry Pi backend (~24 bytes)
+/// HMAC authentication tag (truncated HMAC-SHA256)
+static constexpr size_t HMAC_TAG_SIZE = 16;
+
+/// UDP wire packet structure sent from PC frontend to Raspberry Pi backend (~44 bytes with HMAC)
 struct Packet {
     uint32_t  magic;         // PROTO_MAGIC for validation
     uint8_t   version;       // PROTO_VERSION for compatibility
@@ -69,11 +74,13 @@ struct Packet {
     uint32_t  seq;           // Monotonic sequence counter for packet ordering
     uint64_t  ts_us;         // Sender's steady_clock timestamp in microseconds (for latency calculation)
     HIDReport report;        // The actual gamepad input report
+    uint8_t   hmac[HMAC_TAG_SIZE];  // HMAC-SHA256 tag (all-zero when no secret)
 };
 #pragma pack(pop)
 
 /// Cached packet size for efficiency (avoids repeated sizeof calculations)
-static constexpr size_t PACKET_SIZE = sizeof(Packet);
+static constexpr size_t PACKET_SIZE      = sizeof(Packet);
+static constexpr size_t PACKET_AUTH_SIZE = PACKET_SIZE - HMAC_TAG_SIZE;
 
 /// Get current time in microseconds using steady_clock (high precision, monotonic)
 inline uint64_t now_us() noexcept {
@@ -178,15 +185,16 @@ ns::HIDReport map_xinput_to_switch(const XINPUT_GAMEPAD& pad) {
 }
 
 int main(int argc, char** argv) {
-    // Validate command-line arguments
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <RASPBERRY PI IP>\n";
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP>\n";
         return 1;
     }
-
-    // Parse Raspberry Pi IP address from arguments
     std::string host = argv[1];
     uint16_t port    = ns::DEFAULT_PORT;
+
+    // Derive HMAC key from compiled-in default secret (always active)
+    uint8_t hmac_key[32];
+    derive_key(ns::DEFAULT_SECRET, hmac_key);
 
     // Elevate process and thread priority for real-time input polling
     // HIGH_PRIORITY_CLASS ensures the process gets more CPU time
@@ -242,6 +250,11 @@ int main(int argc, char** argv) {
             pkt.seq           = seq++;
             pkt.ts_us         = ns::now_us();
             pkt.report        = report;
+            {
+                uint8_t full_hmac[32];
+                hmac_sha256(hmac_key, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
+                memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+            }
 
             // Send packet to Raspberry Pi
             sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));
@@ -258,6 +271,11 @@ int main(int argc, char** argv) {
             pkt.seq           = seq++;
             pkt.ts_us         = ns::now_us();
             pkt.report.reset();  // All inputs to neutral/zero
+            {
+                uint8_t full_hmac[32];
+                hmac_sha256(hmac_key, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
+                memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+            }
 
             // Send disconnection packet
             sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));

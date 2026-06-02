@@ -40,6 +40,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include "sha256.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Protocol namespace  (identical to Windows / Linux versions)
@@ -49,6 +50,7 @@ namespace ns {
 static constexpr uint32_t PROTO_MAGIC   = 0x4E535743u;  // 'NSWC' magic number for packet validation
 static constexpr uint8_t  PROTO_VERSION = 1;             // Protocol version for compatibility checking
 static constexpr uint16_t DEFAULT_PORT  = 7331;          // UDP port for sending gamepad data
+static constexpr const char* DEFAULT_SECRET = "nsc-R2xvCy7Eyw2nfbZIOGyKZPnostpaRY";
 
 /// Nintendo Switch Pro Controller button bitmask layout
 enum Button : uint16_t {
@@ -83,7 +85,10 @@ enum Flags : uint8_t {
     FLAG_AUTOFIRE = 0x02,
 };
 
-/// ~24-byte UDP wire packet sent to the Raspberry Pi backend
+/// HMAC authentication tag (truncated HMAC-SHA256)
+static constexpr size_t HMAC_TAG_SIZE = 16;
+
+/// ~44-byte UDP wire packet sent to the Raspberry Pi backend (with HMAC tag)
 struct Packet {
     uint32_t  magic;
     uint8_t   version;
@@ -92,10 +97,12 @@ struct Packet {
     uint32_t  seq;           // Monotonic sequence counter
     uint64_t  ts_us;         // steady_clock timestamp in microseconds
     HIDReport report;
+    uint8_t   hmac[HMAC_TAG_SIZE];
 };
 #pragma pack(pop)
 
-static constexpr size_t PACKET_SIZE = sizeof(Packet);
+static constexpr size_t PACKET_SIZE      = sizeof(Packet);
+static constexpr size_t PACKET_AUTH_SIZE = PACKET_SIZE - HMAC_TAG_SIZE;
 
 /// Monotonic high-precision timestamp in microseconds
 inline uint64_t now_us() noexcept {
@@ -335,8 +342,11 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP>\n";
         return 1;
     }
-
     std::string host = argv[1];
+
+    // Derive HMAC key from compiled-in default secret (always active)
+    uint8_t hmac_key[32];
+    derive_key(ns::DEFAULT_SECRET, hmac_key);
 
     // Install signal handlers for graceful Ctrl+C / SIGTERM shutdown
     signal(SIGINT,  on_signal);
@@ -395,6 +405,11 @@ int main(int argc, char** argv) {
             pkt.seq           = seq++;
             pkt.ts_us         = ns::now_us();
             pkt.report        = map_gc_to_switch(state);
+            {
+                uint8_t full_hmac[32];
+                hmac_sha256(hmac_key, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
+                memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+            }
 
             sendto(sock, &pkt, ns::PACKET_SIZE, 0,
                    (struct sockaddr*)&dest, sizeof(dest));
