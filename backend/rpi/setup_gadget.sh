@@ -1,3 +1,4 @@
+#!/bin/bash
 set -euo pipefail
 
 GADGET_DIR=/sys/kernel/config/usb_gadget/ns_procon
