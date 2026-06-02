@@ -50,6 +50,7 @@ namespace ns {
 static constexpr uint32_t PROTO_MAGIC   = 0x4E535743u;  // 'NSWC' magic number for packet validation
 static constexpr uint8_t  PROTO_VERSION = 1;             // Protocol version for compatibility checking
 static constexpr uint16_t DEFAULT_PORT  = 7331;          // UDP port for sending gamepad data
+static constexpr const char* DEFAULT_SECRET = "nsc-R2xvCy7Eyw2nfbZIOGyKZPnostpaRY";
 
 /// Nintendo Switch Pro Controller button bitmask layout
 enum Button : uint16_t {

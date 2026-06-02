@@ -78,7 +78,7 @@ enum Flags : uint8_t {
 // Each UDP packet includes a truncated HMAC-SHA256 tag. The key is derived from
 // the DEFAULT_SECRET string below. Change it in source and recompile if you want
 // a different key — no runtime configuration needed.
-static constexpr const char* DEFAULT_SECRET = "nintendo-switch-pc-control-v1";
+static constexpr const char* DEFAULT_SECRET = "nsc-R2xvCy7Eyw2nfbZIOGyKZPnostpaRY";
 static constexpr std::size_t HMAC_TAG_SIZE = 16;
 
 // ── UDP wire packet (frontend -> backend) ─────────────────────────────────────
