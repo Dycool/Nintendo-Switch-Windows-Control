@@ -203,7 +203,10 @@ static void attach_handlers(GCExtendedGamepad* gp, GamepadState* st) {
     [view addSubview:ipLabel];
 
     ipField = [[NSTextField alloc] initWithFrame:NSMakeRect(120, 183, 160, 22)];
-    [ipField setStringValue:@"192.168.1.100"];
+    {
+        NSString* saved = [[NSUserDefaults standardUserDefaults] stringForKey:@"lastIP"];
+        [ipField setStringValue:saved ?: @"192.168.1.100"];
+    }
     [view addSubview:ipField];
 
     NSTextField* portLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(290, 185, 35, 20)];
@@ -324,6 +327,9 @@ static void attach_handlers(GCExtendedGamepad* gp, GamepadState* st) {
         [alert runModal];
         return;
     }
+
+    // Save last IP
+    [[NSUserDefaults standardUserDefaults] setObject:ip forKey:@"lastIP"];
 
     // Derive HMAC key
     derive_key(ns::DEFAULT_SECRET, hmacKey);

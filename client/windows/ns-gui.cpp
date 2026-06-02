@@ -219,6 +219,32 @@ static uint16_t g_targetPort = ns::DEFAULT_PORT;
 static std::vector<ControllerEntry> g_controllers;
 static std::unique_ptr<ControllerReader> g_reader;
 
+// ── Registry helpers ──
+static const wchar_t* REG_KEY = L"Software\\NintendoSwitchPCControl";
+static const wchar_t* REG_VAL_IP = L"LastIP";
+
+static std::wstring LoadSavedIP() {
+    HKEY hKey = nullptr;
+    std::wstring ip;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[64]{};
+        DWORD len = sizeof(buf);
+        DWORD type = 0;
+        if (RegQueryValueEx(hKey, REG_VAL_IP, nullptr, &type, (LPBYTE)buf, &len) == ERROR_SUCCESS && type == REG_SZ)
+            ip = buf;
+        RegCloseKey(hKey);
+    }
+    return ip;
+}
+
+static void SaveLastIP(const wchar_t* ip) {
+    HKEY hKey = nullptr;
+    if (RegCreateKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        RegSetValueEx(hKey, REG_VAL_IP, 0, REG_SZ, (const BYTE*)ip, (DWORD)((wcslen(ip) + 1) * sizeof(wchar_t)));
+        RegCloseKey(hKey);
+    }
+}
+
 // ── Control IDs ──
 enum { IDC_IP = 101, IDC_CTRL, IDC_CONNECT, IDC_REFRESH };
 
@@ -361,6 +387,8 @@ static void DoConnect(HWND hWnd) {
 
     derive_key(ns::DEFAULT_SECRET, g_hmacKey);
 
+    SaveLastIP(ipBuf);
+
     char hostA[64]{};
     WideCharToMultiByte(CP_UTF8, 0, ipBuf, -1, hostA, sizeof(hostA), nullptr, nullptr);
     g_targetHost = hostA;
@@ -448,7 +476,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             // ── IP row ──
             makeLabel(L"Raspberry Pi IP:", x, y + 4, 110, 22);
-            g_hIpEdit = makeEdit(IDC_IP, x + 115, y, 265, 24, L"192.168.1.100");
+            std::wstring savedIp = LoadSavedIP();
+            if (savedIp.empty()) savedIp = L"192.168.1.100";
+            g_hIpEdit = makeEdit(IDC_IP, x + 115, y, 265, 24, savedIp.c_str());
             y += 36;
 
             // ── Controller row ──

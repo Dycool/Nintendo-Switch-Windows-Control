@@ -64,6 +64,35 @@ inline uint64_t now_us() noexcept {
 }
 }
 
+// ── Config path helpers ──
+static std::string get_config_dir() {
+    const char* home = getenv("HOME");
+    if (!home) return ".";
+    return std::string(home) + "/.config/ns-pc-control";
+}
+
+static std::string load_saved_config() {
+    std::string path = get_config_dir() + "/config";
+    char buf[256]{};
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return "";
+    if (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        if (len > 0 && buf[len-1] == '\n') buf[len-1] = '\0';
+    }
+    fclose(f);
+    return buf;
+}
+
+static void save_config(const char* ip, const char* port) {
+    std::string dir = get_config_dir();
+    if (g_mkdir_with_parents(dir.c_str(), 0755) != 0) return;
+    std::string path = dir + "/config";
+    std::string content = std::string(ip) + "\n" + port + "\n";
+    FILE* f = fopen(path.c_str(), "w");
+    if (f) { fputs(content.c_str(), f); fclose(f); }
+}
+
 // ── Global state ──
 static GtkWidget* ipEntry = nullptr;
 static GtkWidget* portEntry = nullptr;
@@ -265,6 +294,8 @@ extern "C" void on_connect_clicked(GtkWidget*, gpointer) {
     int sel = gtk_combo_box_get_active(GTK_COMBO_BOX(ctrlCombo));
     if (sel < 0 || g_joysticks.empty()) return;
 
+    save_config(ip, portStr);
+
     derive_key(ns::DEFAULT_SECRET, g_hmacKey);
     g_packetCount = 0;
     g_connected = true;
@@ -344,7 +375,10 @@ int main(int argc, char* argv[]) {
     gtk_grid_attach(GTK_GRID(grid), ipLabel, 0, 0, 1, 1);
 
     ipEntry = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(ipEntry), "192.168.1.100");
+    {
+        std::string saved = load_saved_config();
+        gtk_entry_set_text(GTK_ENTRY(ipEntry), saved.empty() ? "192.168.1.100" : saved.c_str());
+    }
     gtk_grid_attach(GTK_GRID(grid), ipEntry, 1, 0, 3, 1);
 
     GtkWidget* portLabel = gtk_label_new("Port:");

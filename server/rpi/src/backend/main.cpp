@@ -280,24 +280,20 @@ static void upnp_remove_mapping(uint16_t) {}
 int main(int argc, char** argv) {
     uint16_t    port      = DEFAULT_PORT;
     std::string device    = "/dev/hidg0";
-    int         rate_hz   = WRITER_HZ;
     std::string bind_addr = "0.0.0.0";
     bool        do_upnp   = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a(argv[i]);
         if      (a == "-p" && i+1 < argc) port      = (uint16_t)std::atoi(argv[++i]);
-        else if (a == "-d" && i+1 < argc) device    = argv[++i];
-        else if (a == "-r" && i+1 < argc) rate_hz   = std::atoi(argv[++i]);
         else if (a == "-b" && i+1 < argc) bind_addr = argv[++i];
         else if (a == "-v")               g_verbose  = true;
         else if (a == "--upnp")           do_upnp    = true;
         else if (a == "-h") {
-            puts("ns-backend  [-p PORT] [-d /dev/hidg0] [-r HZ] [-b ADDR] [--upnp] [-v]");
+            puts("ns-backend  [-p PORT] [-b ADDR] [--upnp] [-v]");
             return 0;
         }
     }
-    rate_hz = std::clamp(rate_hz, 1, 1000);
 
     // Derive HMAC key from the compiled-in default secret
     derive_key(DEFAULT_SECRET, g_hmac_key);
@@ -334,10 +330,10 @@ int main(int argc, char** argv) {
         perror("bind"); close(sock); return 1;
     }
     std::printf("[backend] UDP %s:%u  device=%s  writer=%d Hz  HMAC=always\n",
-                bind_addr.c_str(), port, device.c_str(), rate_hz);
+                bind_addr.c_str(), port, device.c_str(), WRITER_HZ);
 
     // ── Threads ───────────────────────────────────────────────────────────────
-    std::thread wt(writer_thread, device, rate_hz);
+    std::thread wt(writer_thread, device, WRITER_HZ);
     std::thread st(stats_thread);
 
     // ── epoll ─────────────────────────────────────────────────────────────────
