@@ -74,11 +74,15 @@ enum Flags : uint8_t {
     FLAG_AUTOFIRE = 0x02,  // autofire_mask is active
 };
 
-// ── HMAC authentication tag (truncated HMAC-SHA256) ─────────────────────────
+// ── HMAC authentication (always active, key compiled in) ────────────────────
+// Each UDP packet includes a truncated HMAC-SHA256 tag. The key is derived from
+// the DEFAULT_SECRET string below. Change it in source and recompile if you want
+// a different key — no runtime configuration needed.
+static constexpr const char* DEFAULT_SECRET = "nintendo-switch-pc-control-v1";
 static constexpr std::size_t HMAC_TAG_SIZE = 16;
 
 // ── UDP wire packet (frontend -> backend) ─────────────────────────────────────
-// If --secret is set on both sides, the HMAC tag covers all fields *before* hmac[].
+// HMAC tag covers all fields *before* hmac[].
 struct Packet {
     uint32_t  magic;         // PROTO_MAGIC
     uint8_t   version;       // PROTO_VERSION

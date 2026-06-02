@@ -205,32 +205,22 @@ For the lowest possible latency:
 
 ---
 
-## 🔐 Secure Remote Access (Internet / Port Forwarding)
+## 🔒 Security
 
-To safely expose the Raspberry Pi to the internet (outside your home network), you can enable **packet authentication** using a shared secret:
+Each UDP datagram is authenticated with a truncated **HMAC-SHA256** tag derived from a compiled-in default key. The backend silently drops any packet with an invalid tag — preventing network attackers from injecting controller inputs.
 
-**Backend (Raspberry Pi):**
-```bash
-sudo chrt -f 99 ./ns-backend -s "your-shared-secret"
-```
+**No configuration needed.** The HMAC is always active on both sides. If you want a different key, edit `DEFAULT_SECRET` in `backend/rpi/include/protocol.hpp` and recompile.
 
-**Frontend (PC):**
-```bash
-# Windows
-./ns-gamepad.exe <PI_IP> --secret "your-shared-secret"
+### Additional protection layers:
+| Layer | Purpose |
+|---|---|
+| Magic/version check | Rejects random internet noise on first read |
+| Per-IP rate limiter (2000 pkts/sec) | Prevents UDP flood from saturating the Pi |
+| IP pinning | Only the first valid client is accepted mid-session |
+| HMAC-SHA256 (16-byte truncated) | Cryptographically authenticates every packet |
+| Sequence counter | Prevents replay of old captured packets |
 
-# Linux
-./ns-gamepad <PI_IP> --secret "your-shared-secret"
-
-# macOS
-./ns-gamepad <PI_IP> --secret "your-shared-secret"
-```
-
-Each UDP datagram is authenticated with a truncated **HMAC-SHA256** tag using the shared secret. The backend silently drops any packet with an invalid or missing tag — preventing remote attackers from injecting controller inputs over the internet.
-
-**Latency impact:** Negligible (~1 µs per packet). No encryption overhead — the payload remains visible on the wire (button states), which is acceptable for a game controller use case.
-
-> **Without `--secret` / `-s`**, behavior is identical to the original — no authentication, suitable only for trusted local networks.
+**Latency impact:** ~1 µs per packet. No encryption — button states are visible on the wire, which is acceptable for a game controller.
 
 ---
 

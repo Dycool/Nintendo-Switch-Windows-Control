@@ -225,27 +225,16 @@ ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
 }
 
 int main(int argc, char** argv) {
-    // Parse arguments (positional: IP [device], optional: --secret KEY)
-    std::string host;
-    std::string device = "/dev/input/js0";
-    uint8_t  hmac_key[32];
-    bool     have_secret = false;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string a(argv[i]);
-        if (a == "--secret" && i + 1 < argc) {
-            derive_key(argv[++i], hmac_key);
-            have_secret = true;
-        } else if (host.empty()) {
-            host = a;
-        } else if (device == "/dev/input/js0") {
-            device = a;
-        }
-    }
-    if (host.empty()) {
-        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP> [device_path] [--secret KEY]\n";
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP> [device_path]\n";
         return 1;
     }
+    std::string host   = argv[1];
+    std::string device = (argc >= 3) ? argv[2] : "/dev/input/js0";
+
+    // Derive HMAC key from compiled-in default secret (always active)
+    uint8_t hmac_key[32];
+    derive_key(ns::DEFAULT_SECRET, hmac_key);
 
     // Open Linux joystick device for reading raw input events
     int js_fd = open(device.c_str(), O_RDONLY);
@@ -308,7 +297,7 @@ int main(int argc, char** argv) {
             pkt.seq           = packet_seq++;
             pkt.ts_us         = ns::now_us();                    // Current timestamp for latency measurement
             pkt.report        = map_linux_js_to_switch(state);   // Convert state to Switch format
-            if (have_secret) {
+            {
                 uint8_t full_hmac[32];
                 hmac_sha256(hmac_key, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
                 memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);

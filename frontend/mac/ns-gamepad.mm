@@ -337,23 +337,15 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
 //  Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
-    std::string host;
-    uint8_t  hmac_key[32];
-    bool     have_secret = false;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string a(argv[i]);
-        if (a == "--secret" && i + 1 < argc) {
-            derive_key(argv[++i], hmac_key);
-            have_secret = true;
-        } else if (host.empty()) {
-            host = a;
-        }
-    }
-    if (host.empty()) {
-        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP> [--secret KEY]\n";
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP>\n";
         return 1;
     }
+    std::string host = argv[1];
+
+    // Derive HMAC key from compiled-in default secret (always active)
+    uint8_t hmac_key[32];
+    derive_key(ns::DEFAULT_SECRET, hmac_key);
 
     // Install signal handlers for graceful Ctrl+C / SIGTERM shutdown
     signal(SIGINT,  on_signal);
@@ -412,7 +404,7 @@ int main(int argc, char** argv) {
             pkt.seq           = seq++;
             pkt.ts_us         = ns::now_us();
             pkt.report        = map_gc_to_switch(state);
-            if (have_secret) {
+            {
                 uint8_t full_hmac[32];
                 hmac_sha256(hmac_key, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
                 memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);

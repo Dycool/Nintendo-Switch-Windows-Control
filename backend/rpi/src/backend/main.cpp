@@ -30,9 +30,8 @@ using ms    = std::chrono::milliseconds;
 static std::atomic<bool> g_running{true};
 static bool g_verbose = false;
 
-// HMAC authentication (empty = disabled)
+// HMAC authentication (key derived from DEFAULT_SECRET at startup)
 static uint8_t  g_hmac_key[32];
-static bool     g_have_secret = false;
 
 // IP pinning: once a valid sender is seen, only accept packets from it
 // until the watchdog timer releases the lock.
@@ -210,17 +209,16 @@ int main(int argc, char** argv) {
         else if (a == "-d" && i+1 < argc) device    = argv[++i];
         else if (a == "-r" && i+1 < argc) rate_hz   = std::atoi(argv[++i]);
         else if (a == "-b" && i+1 < argc) bind_addr = argv[++i];
-        else if (a == "-s" && i+1 < argc) {
-            derive_key(argv[++i], g_hmac_key);
-            g_have_secret = true;
-        }
         else if (a == "-v")               g_verbose  = true;
         else if (a == "-h") {
-            puts("ns-backend  [-p PORT] [-d /dev/hidg0] [-r HZ] [-b ADDR] [-s SECRET] [-v]");
+            puts("ns-backend  [-p PORT] [-d /dev/hidg0] [-r HZ] [-b ADDR] [-v]");
             return 0;
         }
     }
     rate_hz = std::clamp(rate_hz, 1, 1000);
+
+    // Derive HMAC key from the compiled-in default secret
+    derive_key(DEFAULT_SECRET, g_hmac_key);
 
     // Warn if HID device missing (common on first boot before setup_gadget.sh)
     struct stat dev_st{};
@@ -250,9 +248,8 @@ int main(int argc, char** argv) {
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind"); close(sock); return 1;
     }
-    std::printf("[backend] UDP %s:%u  device=%s  writer=%d Hz  auth=%s\n",
-                bind_addr.c_str(), port, device.c_str(), rate_hz,
-                g_have_secret ? "yes" : "no");
+    std::printf("[backend] UDP %s:%u  device=%s  writer=%d Hz  HMAC=always\n",
+                bind_addr.c_str(), port, device.c_str(), rate_hz);
 
     // ── Threads ───────────────────────────────────────────────────────────────
     std::thread wt(writer_thread, device, rate_hz);
@@ -309,14 +306,12 @@ int main(int argc, char** argv) {
             }
         }
 
-        // ── 4. HMAC authentication ───────────────────────────────────────────────
-        if (g_have_secret) {
-            if (hmac_verify(g_hmac_key, 32,
-                            (const uint8_t *)&pkt, PACKET_AUTH_SIZE,
-                            pkt.hmac, HMAC_TAG_SIZE) != 0) {
-                if (g_verbose) puts("[backend] bad HMAC, dropped");
-                continue;
-            }
+        // ── 4. HMAC authentication (always active) ───────────────────────────────
+        if (hmac_verify(g_hmac_key, 32,
+                        (const uint8_t *)&pkt, PACKET_AUTH_SIZE,
+                        pkt.hmac, HMAC_TAG_SIZE) != 0) {
+            if (g_verbose) puts("[backend] bad HMAC, dropped");
+            continue;
         }
 
         // ── 5. Pin the sender (if not already pinned) ────────────────────────────
