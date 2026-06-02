@@ -1,10 +1,11 @@
-name: Test Build Windows
+name: Build Windows
 
 on:
   push:
     paths:
       - 'frontend/windows/**'
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   build-windows:

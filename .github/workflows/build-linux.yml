@@ -1,10 +1,11 @@
-name: Test Build Linux
+name: Build Linux
 
 on:
   push:
     paths:
       - 'frontend/linux/**'
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   build-linux:

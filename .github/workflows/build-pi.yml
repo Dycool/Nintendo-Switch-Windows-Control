@@ -1,10 +1,11 @@
-name: Test Build Pi Backend
+name: Build Pi Backend
 
 on:
   push:
     paths:
       - 'backend/rpi/**'
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   build-pi-backend:
