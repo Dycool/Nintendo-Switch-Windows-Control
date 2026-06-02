@@ -57,4 +57,7 @@ cat > ns-gui.app/Contents/Info.plist <<EOF
 </plist>
 EOF
 
+# Sign the app bundle (ad-hoc signing for local builds)
+codesign --force --deep --sign - ns-gui.app 2>/dev/null && echo "Signed ns-gui.app" || echo "Warning: codesign failed (run manually: codesign --force --deep --sign - ns-gui.app)"
+
 echo "Created ns-gui.app bundle"

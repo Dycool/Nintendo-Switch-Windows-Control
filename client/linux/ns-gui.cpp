@@ -84,18 +84,16 @@ static std::string load_saved_config() {
     return buf;
 }
 
-static void save_config(const char* ip, const char* port) {
+static void save_config(const char* full) {
     std::string dir = get_config_dir();
     if (g_mkdir_with_parents(dir.c_str(), 0755) != 0) return;
     std::string path = dir + "/config";
-    std::string content = std::string(ip) + "\n" + port + "\n";
     FILE* f = fopen(path.c_str(), "w");
-    if (f) { fputs(content.c_str(), f); fclose(f); }
+    if (f) { fputs(full, f); fputc('\n', f); fclose(f); }
 }
 
 // ── Global state ──
 static GtkWidget* ipEntry = nullptr;
-static GtkWidget* portEntry = nullptr;
 static GtkWidget* ctrlCombo = nullptr;
 static GtkWidget* connectBtn = nullptr;
 static GtkWidget* statusLabel = nullptr;
@@ -195,8 +193,8 @@ static ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
 }
 
 // ── Sender thread ──
-static void SenderThread(const char* device, const char* host, uint16_t port) {
-    int js_fd = open(device, O_RDONLY);
+static void SenderThread(std::string device, std::string host, uint16_t port) {
+    int js_fd = open(device.c_str(), O_RDONLY);
     if (js_fd < 0) return;
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -277,39 +275,45 @@ extern "C" void on_connect_clicked(GtkWidget*, gpointer) {
         if (g_senderThread.joinable()) g_senderThread.join();
         gtk_button_set_label(GTK_BUTTON(connectBtn), "Connect");
         gtk_widget_set_sensitive(ipEntry, TRUE);
-        gtk_widget_set_sensitive(portEntry, TRUE);
         gtk_widget_set_sensitive(ctrlCombo, TRUE);
         gtk_label_set_text(GTK_LABEL(statusLabel), "Disconnected");
         gtk_label_set_text(GTK_LABEL(pktLabel), "Packets sent: 0");
         return;
     }
 
-    const char* ip = gtk_entry_get_text(GTK_ENTRY(ipEntry));
-    if (strlen(ip) == 0) return;
+    const char* ipStr = gtk_entry_get_text(GTK_ENTRY(ipEntry));
+    if (strlen(ipStr) == 0) return;
 
-    const char* portStr = gtk_entry_get_text(GTK_ENTRY(portEntry));
-    int port = atoi(portStr);
-    if (port <= 0 || port > 65535) port = ns::DEFAULT_PORT;
+    // Parse ip:port (same as Windows client)
+    char ipBuf[64];
+    strncpy(ipBuf, ipStr, sizeof(ipBuf) - 1);
+    ipBuf[sizeof(ipBuf) - 1] = '\0';
+    int port = ns::DEFAULT_PORT;
+    char* colon = strchr(ipBuf, ':');
+    if (colon) {
+        *colon = '\0';
+        port = atoi(colon + 1);
+        if (port <= 0 || port > 65535) port = ns::DEFAULT_PORT;
+    }
 
     int sel = gtk_combo_box_get_active(GTK_COMBO_BOX(ctrlCombo));
     if (sel < 0 || g_joysticks.empty()) return;
 
-    save_config(ip, portStr);
+    save_config(ipStr);
 
     derive_key(ns::DEFAULT_SECRET, g_hmacKey);
     g_packetCount = 0;
     g_connected = true;
 
     std::string device = g_joysticks[sel].device;
-    g_senderThread = std::thread(SenderThread, device.c_str(), ip, (uint16_t)port);
+    g_senderThread = std::thread(SenderThread, device, std::string(ipBuf), (uint16_t)port);
 
     gtk_button_set_label(GTK_BUTTON(connectBtn), "Disconnect");
     gtk_widget_set_sensitive(ipEntry, FALSE);
-    gtk_widget_set_sensitive(portEntry, FALSE);
     gtk_widget_set_sensitive(ctrlCombo, FALSE);
 
     char status[128];
-    snprintf(status, sizeof(status), "Connected to %s:%d", ip, port);
+    snprintf(status, sizeof(status), "Connected to %s:%d", ipBuf, port);
     gtk_label_set_text(GTK_LABEL(statusLabel), status);
 }
 
@@ -369,7 +373,7 @@ int main(int argc, char* argv[]) {
     gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
     gtk_container_set_border_width(GTK_CONTAINER(grid), 12);
 
-    // Row 0: IP
+    // Row 0: IP (supports ip:port format like Windows client)
     GtkWidget* ipLabel = gtk_label_new("Raspberry Pi IP:");
     gtk_widget_set_halign(ipLabel, GTK_ALIGN_END);
     gtk_grid_attach(GTK_GRID(grid), ipLabel, 0, 0, 1, 1);
@@ -379,17 +383,7 @@ int main(int argc, char* argv[]) {
         std::string saved = load_saved_config();
         gtk_entry_set_text(GTK_ENTRY(ipEntry), saved.empty() ? "192.168.1.100" : saved.c_str());
     }
-    gtk_grid_attach(GTK_GRID(grid), ipEntry, 1, 0, 3, 1);
-
-    GtkWidget* portLabel = gtk_label_new("Port:");
-    gtk_widget_set_halign(portLabel, GTK_ALIGN_END);
-    gtk_grid_attach(GTK_GRID(grid), portLabel, 4, 0, 1, 1);
-
-    portEntry = gtk_entry_new();
-    gtk_entry_set_text(GTK_ENTRY(portEntry), "7331");
-    gtk_entry_set_max_length(GTK_ENTRY(portEntry), 5);
-    gtk_widget_set_size_request(portEntry, 60, -1);
-    gtk_grid_attach(GTK_GRID(grid), portEntry, 5, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), ipEntry, 1, 0, 5, 1);
 
     // Row 1: Controller
     GtkWidget* ctrlLabel2 = gtk_label_new("Controller:");
