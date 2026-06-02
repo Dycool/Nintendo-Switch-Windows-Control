@@ -12,7 +12,7 @@ For the lowest possible latency in competitive or timing-strict games:
 ## 🔒 Security
 Each UDP datagram is authenticated with a truncated **HMAC-SHA256** tag derived from a compiled-in default key. The backend silently drops any packet with an invalid tag — preventing network attackers from injecting malicious controller inputs.
 
-**No configuration needed.** The HMAC is always active on both sides. If you want a different key, edit `DEFAULT_SECRET` in `backend/rpi/include/protocol.hpp` and recompile both the client and the server.
+**No configuration needed.** The HMAC is always active on both sides. If you want a different key, edit `DEFAULT_SECRET` in `server/rpi/include/protocol.hpp` and in the `client/<OS>/ns-gamepad.cpp` or `client/<OS>/ns-gui.cpp` and recompile both the client and the server.
 
 ### Additional protection layers:
 | Layer | Purpose |
