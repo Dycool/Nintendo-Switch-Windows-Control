@@ -318,7 +318,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
         port = atoi(colon + 1);
         if (port <= 0 || port > 65535) port = ns::DEFAULT_PORT;
     }
-    NSString* ip = [NSString stringWithUTF8String:ipBuf];
+    std::string stdIp(ipBuf);
 
     int sel = (int)[ctrlPopUp indexOfSelectedItem];
     if (sel < 0) {
@@ -351,7 +351,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     }
 
     // Start sender thread (same approach as CLI version)
-    senderThread = std::thread([self, ip, port] {
+    senderThread = std::thread([self, stdIp, port] {
         self->sock = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (self->sock < 0) return;
 
@@ -370,7 +370,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
         hints.ai_socktype = SOCK_DGRAM;
         char portStr[8];
         snprintf(portStr, sizeof(portStr), "%u", port);
-        if (getaddrinfo([ip UTF8String], portStr, &hints, &res) != 0 || !res) {
+        if (getaddrinfo(stdIp.c_str(), portStr, &hints, &res) != 0 || !res) {
             close(self->sock);
             return;
         }
@@ -424,7 +424,6 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     senderRunning = false;
     if (senderThread.joinable()) senderThread.join();
     [self resetGamepadState];
-    self->seq = 0;
 
     [connectBtn setTitle:@"Connect"];
     [ipField setEnabled:YES];
