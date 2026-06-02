@@ -16,7 +16,7 @@ This project was built from scratch in **C++** and uses **UDP** to guarantee the
 #### ⚙️ Prerequisite: Enable USB Gadget Mode (Boot Settings)
 Before the Raspberry Pi can emulate a USB controller, you must enable the USB OTG drivers at the system level. You can do this quickly by running the following commands in your Pi's terminal:
 
-```bash
+bash
 # 1. Enable the dwc2 driver in config.txt
 echo "dtoverlay=dwc2" | sudo tee -a /boot/firmware/config.txt
 
@@ -25,42 +25,43 @@ sudo sed -i 's/rootwait/rootwait modules-load=dwc2,libcomposite/' /boot/firmware
 
 # 3. Reboot the system to apply changes
 sudo reboot
-```
+
 
 #### Clone the backend
 
 Once rebooted, clone only the backend portion of the repository:
 
-```bash
+bash
 git clone --depth 1 --filter=blob:none --sparse https://github.com/Dycool/Nintendo-Switch-PC-Control.git
 cd Nintendo-Switch-PC-Control
 git sparse-checkout set backend
-```
+
 
 #### Compile the backend
 
-```bash
+bash
 cd backend/rpi
 mkdir build && cd build
 cmake ..
 make
-```
+
 
 #### Run the USB Gadget Script
 
 This script sets up the `libcomposite` gadget to make the Pi emulate a HORI Pokken Controller. Run it **before** connecting the Pi to the Switch and **before** starting the backend.
 
-```bash
+bash
 cd .. # Return to backend/rpi
+chmod +x setup_gadget.sh
 sudo bash setup_gadget.sh
-```
+
 
 #### Start the Backend
 
-```bash
+bash
 cd build
 sudo chrt -f 99 ./ns-backend
-```
+
 
 *(`chrt -f 99` gives the process maximum real-time priority for the lowest possible latency.)*
 
@@ -71,17 +72,52 @@ Connect the Raspberry Pi to the Switch dock:
 * **Raspberry Pi 4:** USB-C port
 * **Raspberry Pi Zero / Zero 2 W:** Inner Micro-USB data port
 
+#### 🔄 Automate on Boot (Optional Systemd Service)
+
+If you want the Raspberry Pi to automatically set up the USB gadget and start the backend every time you turn it on, you can create a systemd service.
+
+1. Create a new service file:
+bash
+sudo nano /etc/systemd/system/ns-control.service
+
+
+2. Paste the following configuration. **Important:** Adjust the `/home/pi/...` paths to match the exact location where you cloned the repository!
+ini
+[Unit]
+Description=Nintendo Switch PC Control Backend
+After=network.target
+
+[Service]
+# Run the gadget script before starting the backend
+ExecStartPre=/bin/bash /home/YOUR_USER/Nintendo-Switch-PC-Control/backend/rpi/setup_gadget.sh
+# Start the backend with real-time priority
+ExecStart=/usr/bin/chrt -f 99 /home/YOUR_USER/Nintendo-Switch-PC-Control/backend/rpi/build/ns-backend
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+
+
+3. Enable and start the service:
+bash
+sudo systemctl daemon-reload
+sudo systemctl enable ns-control.service
+sudo systemctl start ns-control.service
+
+
 ---
 
 ### Part 2: PC (Frontend Only)
 
 Clone only the frontend portion of the repository:
 
-```bash
+bash
 git clone --depth 1 --filter=blob:none --sparse https://github.com/Dycool/Nintendo-Switch-PC-Control.git
 cd Nintendo-Switch-PC-Control
 git sparse-checkout set frontend
-```
+
 
 ---
 
@@ -94,9 +130,9 @@ git sparse-checkout set frontend
 
 2. Build the frontend by running:
 
-```bash
+bash
 g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput
-```
+
 
 ---
 
@@ -106,23 +142,23 @@ g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -
 
 2. Compile the frontend:
 
-```bash
+bash
 g++ -O3 -pthread ns-gamepad.cpp -o ns-gamepad
-```
+
 
 *(Requires `build-essential` or an equivalent GCC toolchain.)*
 
 3. Run the application:
 
-```bash
+bash
 ./ns-gamepad 192.168.1.X [/dev/input/jsY]
-```
+
 💡 **Tip:** To find out which `jsY` index to use, install `jstest-gtk` or `joystick` to find the correct device name by tracking real-time inputs:
-```bash
+bash
 sudo apt install joystick
 # Test which device reacts to your buttons (e.g., js0, js1, etc.)
 jstest /dev/input/js0
-```
+
 
 *You may need to run with `sudo` or add your user to the `input` group if the application cannot access controller events.*
 
@@ -136,16 +172,16 @@ The macOS frontend uses Apple's **GameController framework**, which natively sup
 
 If you don't have them installed yet, run the following and click **Install** in the dialog that appears:
 
-```bash
+bash
 xcode-select --install
-```
+
 
 Verify the installation completed:
 
-```bash
+bash
 clang++ --version
 # Expected output: Apple clang version 15.x.x (or similar)
-```
+
 
 #### Build the frontend
 
@@ -153,17 +189,17 @@ clang++ --version
 
 2. Compile the frontend:
 
-```bash
+bash
 clang++ -std=c++17 -ObjC++ \
         -framework GameController -framework Foundation \
         ns-gamepad.mm -o ns-gamepad
-```
+
 
 #### Run the application
 
-```bash
+bash
 ./ns-gamepad 192.168.1.X
-```
+
 
 #### 🎮 Controller support
 
@@ -220,18 +256,12 @@ Each UDP datagram is authenticated with a truncated **HMAC-SHA256** tag derived 
 | HMAC-SHA256 (16-byte truncated) | Cryptographically authenticates every packet |
 | Sequence counter | Prevents replay of old captured packets |
 
-**Latency impact:** ~1 µs per packet. No encryption — button states are visible on the wire, which is acceptable for a game controller.
-
 ---
 
 ## Planned
 
 * UI for clients
----
-## Planned
 
-* UI for clients
-* Server-side Encryption
 ---
 
 ## 📄 License
