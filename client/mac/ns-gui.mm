@@ -171,6 +171,13 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification*)aNotification {
+    // Keep receiving gamepad input when the window loses focus (macOS 11.3+)
+    GCController.shouldMonitorBackgroundEvents = YES;
+
+    // Trigger the Input Monitoring permission prompt if needed (macOS 10.15+)
+    if (!CGPreflightListenEventAccess())
+        CGRequestListenEventAccess();
+
     // Register for controller notifications (same pattern as CLI: queue:nil for immediate handler attachment)
     [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidConnectNotification
         object:nil queue:nil usingBlock:^(NSNotification* note) {
