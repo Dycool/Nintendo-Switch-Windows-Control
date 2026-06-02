@@ -1,0 +1,26 @@
+name: Test Build Windows
+
+on:
+  push:
+    paths:
+      - 'frontend/windows/**'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build and Zip Windows
+        shell: bash
+        run: |
+          cd frontend/windows/
+          g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput
+          # 7z is pre-installed on windows-latest runners
+          7z a ns-pc-control-windows.zip ns-gamepad.exe
+          
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifact
+          path: frontend/windows/ns-pc-control-windows.zip
