@@ -369,15 +369,16 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
         freeaddrinfo(res);
 
         auto next_tick = std::chrono::steady_clock::now();
+        bool first_packet = true;
 
         while (self->senderRunning) {
-            while (std::chrono::steady_clock::now() < next_tick)
-                std::atomic_thread_fence(std::memory_order_relaxed);
+            std::this_thread::sleep_until(next_tick);
 
             ns::Packet pkt{};
             pkt.magic = ns::PROTO_MAGIC;
             pkt.version = ns::PROTO_VERSION;
-            pkt.flags = ns::FLAG_NONE;
+            pkt.flags = first_packet ? ns::FLAG_RESET : ns::FLAG_NONE;
+            first_packet = false;
             pkt.seq = self->seq++;
             pkt.ts_us = ns::now_us();
             pkt.report = map_gc_to_switch(self->state);
@@ -413,6 +414,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     senderRunning = false;
     if (senderThread.joinable()) senderThread.join();
     [self resetGamepadState];
+    self->seq = 0;
 
     [connectBtn setTitle:@"Connect"];
     [ipField setEnabled:YES];
