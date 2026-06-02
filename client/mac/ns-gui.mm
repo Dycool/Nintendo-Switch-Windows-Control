@@ -173,11 +173,13 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
 - (void)applicationDidFinishLaunching:(NSNotification*)aNotification {
     // Register for controller notifications
     [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidConnectNotification
-        object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification*) {
+        object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification* note) {
+            GCController* ctrl = (GCController*)note.object;
+            if (ctrl.extendedGamepad)
+                attach_handlers(ctrl.extendedGamepad, &state);
             [self refreshControllerList];
-            if (!connected) {
+            if (!connected)
                 [ctrlNameField setStringValue:@""];
-            }
     }];
     [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidDisconnectNotification
         object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification*) {
@@ -254,12 +256,6 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     [ctrlNameField setSelectable:NO];
     [ctrlNameField setTextColor:[NSColor grayColor]];
     [view addSubview:ctrlNameField];
-
-    // Attach handlers to already-connected controllers (on main thread)
-    for (GCController* ctrl in [GCController controllers]) {
-        if (ctrl.extendedGamepad)
-            attach_handlers(ctrl.extendedGamepad, &state);
-    }
 
     [self refreshControllerList];
     [window makeKeyAndOrderFront:nil];
