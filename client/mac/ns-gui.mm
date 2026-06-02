@@ -153,8 +153,8 @@ static void attach_handlers(GCExtendedGamepad* gp, GamepadState* st) {
 
     GamepadState state;
     std::thread senderThread;
-    std::atomic<bool> connected{false};
-    std::atomic<bool> senderRunning{false};
+    std::atomic<bool> connected = false;
+    std::atomic<bool> senderRunning = false;
     int sock;
     uint8_t hmacKey[32];
     uint32_t packetCount;
@@ -334,10 +334,10 @@ static void attach_handlers(GCExtendedGamepad* gp, GamepadState* st) {
     seq = 0;
 
     // Start sender thread
-    senderThread = std::thread([this, ip, port, sel] {
+    senderThread = std::thread([self, ip, port, sel] {
         // Create socket
-        sock = ::socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock < 0) return;
+        self->sock = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (self->sock < 0) return;
 
         struct addrinfo hints{}, *res = nullptr;
         hints.ai_family = AF_INET;
@@ -345,7 +345,7 @@ static void attach_handlers(GCExtendedGamepad* gp, GamepadState* st) {
         char portStr[8];
         snprintf(portStr, sizeof(portStr), "%u", port);
         if (getaddrinfo([ip UTF8String], portStr, &hints, &res) != 0 || !res) {
-            close(sock);
+            close(self->sock);
             return;
         }
         sockaddr_in dest{};
@@ -358,31 +358,31 @@ static void attach_handlers(GCExtendedGamepad* gp, GamepadState* st) {
         for (GCController* ctrl in controllers) {
             if (ctrl.extendedGamepad) {
                 if (idx == sel) {
-                    attach_handlers(ctrl.extendedGamepad, &state);
+                    attach_handlers(ctrl.extendedGamepad, &self->state);
                     break;
                 }
                 idx++;
             }
         }
 
-        while (senderRunning) {
+        while (self->senderRunning) {
             ns::Packet pkt{};
             pkt.magic = ns::PROTO_MAGIC;
             pkt.version = ns::PROTO_VERSION;
             pkt.flags = ns::FLAG_NONE;
-            pkt.seq = seq++;
+            pkt.seq = self->seq++;
             pkt.ts_us = ns::now_us();
-            pkt.report = map_gc_to_switch(state);
+            pkt.report = map_gc_to_switch(self->state);
             {
                 uint8_t fullHmac[32];
-                hmac_sha256(hmacKey, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, fullHmac);
+                hmac_sha256(self->hmacKey, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, fullHmac);
                 memcpy(pkt.hmac, fullHmac, ns::HMAC_TAG_SIZE);
             }
-            sendto(sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
-            packetCount++;
+            sendto(self->sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
+            self->packetCount++;
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        close(sock);
+        close(self->sock);
     });
 
     [connectBtn setTitle:@"Disconnect"];
