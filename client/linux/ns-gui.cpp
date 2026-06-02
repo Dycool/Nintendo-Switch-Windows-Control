@@ -22,6 +22,7 @@
 #include <linux/joystick.h>
 #include <sys/resource.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 // linux/joystick.h defines macro BTN_A/BTN_B/BTN_X/BTN_Y which collide with our enum
 #undef BTN_A
 #undef BTN_B
@@ -104,7 +105,7 @@ static std::atomic<bool> g_connected{false};
 static std::atomic<bool> g_senderRunning{false};
 static std::thread g_senderThread;
 static uint8_t g_hmacKey[32]{};
-static uint32_t g_packetCount = 0;
+static std::atomic<uint32_t> g_packetCount{0};
 
 struct JoyInfo {
     std::string device;
@@ -194,7 +195,7 @@ static ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
 
 // ── Sender thread ──
 static void SenderThread(std::string device, std::string host, uint16_t port) {
-    int js_fd = open(device.c_str(), O_RDONLY);
+    int js_fd = open(device.c_str(), O_RDONLY | O_NONBLOCK);
     if (js_fd < 0) return;
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -203,7 +204,7 @@ static void SenderThread(std::string device, std::string host, uint16_t port) {
     struct sockaddr_in dest{};
     dest.sin_family = AF_INET;
     dest.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &dest.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, host.c_str(), &dest.sin_addr) <= 0) {
         close(js_fd); close(sock);
         return;
     }
@@ -236,14 +237,19 @@ static void SenderThread(std::string device, std::string host, uint16_t port) {
         }
     });
 
-    // Main read loop
-    struct js_event event;
-    while (g_senderRunning && read(js_fd, &event, sizeof(event)) > 0) {
-        uint8_t type = event.type & ~JS_EVENT_INIT;
-        if (type == JS_EVENT_BUTTON && event.number < 16)
-            state.buttons[event.number].store(event.value, std::memory_order_relaxed);
-        else if (type == JS_EVENT_AXIS && event.number < 8)
-            state.axes[event.number].store(event.value, std::memory_order_relaxed);
+    // Read loop with poll so we can exit promptly on disconnect
+    struct pollfd pfd = {js_fd, POLLIN, 0};
+    while (g_senderRunning) {
+        if (poll(&pfd, 1, 100) > 0) {
+            struct js_event event;
+            while (read(js_fd, &event, sizeof(event)) > 0) {
+                uint8_t type = event.type & ~JS_EVENT_INIT;
+                if (type == JS_EVENT_BUTTON && event.number < 16)
+                    state.buttons[event.number].store(event.value, std::memory_order_relaxed);
+                else if (type == JS_EVENT_AXIS && event.number < 8)
+                    state.axes[event.number].store(event.value, std::memory_order_relaxed);
+            }
+        }
     }
 
     running = false;
@@ -273,6 +279,7 @@ extern "C" void on_connect_clicked(GtkWidget*, gpointer) {
         g_connected = false;
         g_senderRunning = false;
         if (g_senderThread.joinable()) g_senderThread.join();
+        g_packetCount = 0;
         gtk_button_set_label(GTK_BUTTON(connectBtn), "Connect");
         gtk_widget_set_sensitive(ipEntry, TRUE);
         gtk_widget_set_sensitive(ctrlCombo, TRUE);
@@ -320,7 +327,7 @@ extern "C" void on_connect_clicked(GtkWidget*, gpointer) {
 extern "C" gboolean on_timer(gpointer) {
     if (g_connected) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "Packets sent: %u", g_packetCount);
+        snprintf(buf, sizeof(buf), "Packets sent: %u", g_packetCount.load());
         gtk_label_set_text(GTK_LABEL(pktLabel), buf);
     } else {
         // Refresh joystick list periodically
@@ -356,6 +363,15 @@ static std::string get_exe_dir() {
     return ".";
 }
 
+extern "C" void on_window_destroy(GtkWidget*, gpointer) {
+    if (g_connected) {
+        g_senderRunning = false;
+        if (g_senderThread.joinable())
+            g_senderThread.join();
+    }
+    gtk_main_quit();
+}
+
 // ── Entry point ──
 int main(int argc, char* argv[]) {
     gtk_init(&argc, &argv);
@@ -364,7 +380,7 @@ int main(int argc, char* argv[]) {
     gtk_window_set_title(GTK_WINDOW(window), "Nintendo Switch PC Control");
     gtk_window_set_default_size(GTK_WINDOW(window), 400, 240);
     gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
-    g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), nullptr);
+    g_signal_connect(window, "destroy", G_CALLBACK(on_window_destroy), nullptr);
     gtk_window_set_icon_from_file(GTK_WINDOW(window), (get_exe_dir() + "/icon.png").c_str(), nullptr);
 
     GtkWidget* grid = gtk_grid_new();
