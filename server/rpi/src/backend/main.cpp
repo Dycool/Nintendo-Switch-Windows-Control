@@ -177,7 +177,7 @@ static void writer_thread(const std::string& dev, int hz) {
         neutral.buttons = 0; 
         neutral.hat = 8;
         neutral.lx = 128; neutral.ly = 128; neutral.rx = 128; neutral.ry = 128;
-        write(fd, &neutral, sizeof(neutral));
+        (void)write(fd, &neutral, sizeof(neutral));
         close(fd);
     }
 }
@@ -229,7 +229,7 @@ static bool upnp_add_mapping(uint16_t port) {
     }
     
     // This populates g_upnp_lan_addr with your LOCAL IP (e.g. 192.168.1.50)
-    int igd = UPNP_GetValidIGD(devlist, &g_upnp_urls, &g_upnp_data, g_upnp_lan_addr, sizeof(g_upnp_lan_addr));
+    int igd = UPNP_GetValidIGD(devlist, &g_upnp_urls, &g_upnp_data, g_upnp_lan_addr, sizeof(g_upnp_lan_addr), nullptr, 0);
     freeUPNPDevlist(devlist);
     
     if (igd != 1 && igd != 2) {
