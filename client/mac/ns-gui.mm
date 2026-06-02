@@ -336,7 +336,6 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
 
     connected = true;
     senderRunning = true;
-    seq = 0;
 
     // Attach handlers to the selected controller (on main thread)
     NSArray* controllers = [GCController controllers];
@@ -369,7 +368,6 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
         memcpy(&dest, res->ai_addr, sizeof(dest));
         freeaddrinfo(res);
 
-        uint32_t seq = 0;
         auto next_tick = std::chrono::steady_clock::now();
 
         while (self->senderRunning) {
@@ -380,7 +378,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
             pkt.magic = ns::PROTO_MAGIC;
             pkt.version = ns::PROTO_VERSION;
             pkt.flags = ns::FLAG_NONE;
-            pkt.seq = seq++;
+            pkt.seq = self->seq++;
             pkt.ts_us = ns::now_us();
             pkt.report = map_gc_to_switch(self->state);
             {
@@ -400,10 +398,21 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     [statusField setStringValue:[NSString stringWithFormat:@"Connected to %s:%d", ipBuf, port]];
 }
 
+- (void)resetGamepadState {
+    state.btn_a = false; state.btn_b = false; state.btn_x = false; state.btn_y = false;
+    state.btn_l = false; state.btn_r = false;
+    state.zl = 0.0f; state.zr = 0.0f;
+    state.btn_menu = false; state.btn_options = false;
+    state.btn_lstick = false; state.btn_rstick = false;
+    state.dpad_up = false; state.dpad_down = false; state.dpad_left = false; state.dpad_right = false;
+    state.lx = 0.0f; state.ly = 0.0f; state.rx = 0.0f; state.ry = 0.0f;
+}
+
 - (void)disconnect {
     connected = false;
     senderRunning = false;
     if (senderThread.joinable()) senderThread.join();
+    [self resetGamepadState];
 
     [connectBtn setTitle:@"Connect"];
     [ipField setEnabled:YES];
