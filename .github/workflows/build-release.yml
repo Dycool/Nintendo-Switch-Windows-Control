@@ -44,10 +44,13 @@ jobs:
             artifacts/linux-gamepad/ns-gamepad \
             artifacts/linux-gui/ns-gui
 
-          # macOS (app bundle needs -r to preserve directory structure)
+          # macOS GUI zip (already packaged as zip by build-mac.yml)
+          cp artifacts/macos-gui/ns-pc-control-mac-gui.zip _zips/
+
+          # macOS CLI + GUI (combined) - extract GUI zip, add CLI, re-zip
           mkdir -p _zips/_mac
           cp artifacts/macos-gamepad/ns-gamepad _zips/_mac/
-          cp -r artifacts/macos-gui/ns-gui.app _zips/_mac/
+          unzip -q _zips/ns-pc-control-mac-gui.zip -d _zips/_mac/
           cd _zips/_mac && zip -r ../ns-pc-control-mac.zip . && cd ../..
           rm -rf _zips/_mac
 
@@ -63,6 +66,7 @@ jobs:
             _zips/ns-pc-control-windows.zip
             _zips/ns-pc-control-linux.zip
             _zips/ns-pc-control-mac.zip
+            _zips/ns-pc-control-mac-gui.zip
             _zips/ns-pc-control-raspberry-pi.zip
           draft: true
           generate_release_notes: true

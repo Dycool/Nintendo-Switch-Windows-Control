@@ -28,7 +28,12 @@ jobs:
           name: macos-gamepad
           path: client/mac/ns-gamepad
 
+      - name: Package GUI App Bundle
+        run: |
+          cd client/mac/
+          zip -r ns-pc-control-mac-gui.zip ns-gui.app
+
       - uses: actions/upload-artifact@v6
         with:
           name: macos-gui
-          path: client/mac/ns-gui.app
+          path: client/mac/ns-pc-control-mac-gui.zip
