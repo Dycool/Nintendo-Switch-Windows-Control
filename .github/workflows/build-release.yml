@@ -17,15 +17,15 @@ jobs:
   build-linux:
     uses: ./.github/workflows/build-linux.yml
     
-  build-macos:
-    uses: ./.github/workflows/build-macos.yml
+  build-mac:
+    uses: ./.github/workflows/build-mac.yml
     
   build-pi-backend:
     uses: ./.github/workflows/build-pi.yml
 
   # 2. Gather artifacts and create the release
   release:
-    needs: [build-windows, build-linux, build-macos, build-pi-backend]
+    needs: [build-windows, build-linux, build-mac, build-pi-backend]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
