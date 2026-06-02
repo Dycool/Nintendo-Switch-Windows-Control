@@ -201,13 +201,19 @@ static void SenderThread(std::string device, std::string host, uint16_t port) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) { close(js_fd); return; }
 
-    struct sockaddr_in dest{};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(port);
-    if (inet_pton(AF_INET, host.c_str(), &dest.sin_addr) <= 0) {
+    struct addrinfo hints{}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0) {
         close(js_fd); close(sock);
         return;
     }
+
+    struct sockaddr_in dest{};
+    memcpy(&dest, res->ai_addr, sizeof(dest));
+    dest.sin_port = htons(port);
+    freeaddrinfo(res);
 
     GamepadState state;
     std::atomic<bool> running{true};

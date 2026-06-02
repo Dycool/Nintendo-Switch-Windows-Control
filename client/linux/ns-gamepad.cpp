@@ -260,17 +260,21 @@ int main(int argc, char** argv) {
     }
 
     // Configure destination address (Raspberry Pi backend)
-    struct sockaddr_in dest{};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(ns::DEFAULT_PORT);
-    
-    // Convert IP address string to binary form
-    if (inet_pton(AF_INET, host.c_str(), &dest.sin_addr) <= 0) {
-        std::cerr << "Invalid IP address: " << host << "\n";
+    struct addrinfo hints{}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0) {
+        std::cerr << "Failed to resolve host: " << host << "\n";
         close(js_fd);
         close(sock);
         return 1;
     }
+
+    struct sockaddr_in dest{};
+    memcpy(&dest, res->ai_addr, sizeof(dest));
+    dest.sin_port = htons(ns::DEFAULT_PORT);
+    freeaddrinfo(res);
 
     std::cout << "Streaming data to " << host << ":" << ns::DEFAULT_PORT << "... Press CTRL+C to exit.\n";
 
