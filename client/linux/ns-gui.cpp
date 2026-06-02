@@ -22,6 +22,11 @@
 #include <linux/joystick.h>
 #include <sys/resource.h>
 #include <sys/ioctl.h>
+// linux/joystick.h defines macro BTN_A/BTN_B/BTN_X/BTN_Y which collide with our enum
+#undef BTN_A
+#undef BTN_B
+#undef BTN_X
+#undef BTN_Y
 #include "sha256.h"
 
 // ── Protocol ──
