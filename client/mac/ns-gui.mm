@@ -153,8 +153,8 @@ static void attach_handlers(GCExtendedGamepad* gp, GamepadState* st) {
 
     GamepadState state;
     std::thread senderThread;
-    std::atomic<bool> connected = false;
-    std::atomic<bool> senderRunning = false;
+    std::atomic<bool> connected;
+    std::atomic<bool> senderRunning;
     int sock;
     uint8_t hmacKey[32];
     uint32_t packetCount;
