@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icon.png" alt="Icon" width="128" height="128">
+</p>
+
 # 🎮 Nintendo Switch PC Control (Windows & Linux & macOS)
 
 **Control your Nintendo Switch from a PC (Windows, Linux or macOS) with low latency using a Raspberry Pi.**
@@ -11,7 +15,7 @@ This project was built from scratch in **C++** and uses **UDP** to guarantee the
 
 ## 🛠️ Build and Run Tutorial
 
-### Part 1: Raspberry Pi (Backend Only)
+### Part 1: Raspberry Pi (Server Only)
 
 #### ⚙️ Prerequisite: Enable USB Gadget Mode (Boot Settings)
 Before the Raspberry Pi can emulate a USB controller, you must enable the USB OTG drivers at the system level. You can do this quickly by running the following commands in your Pi's terminal:
@@ -34,13 +38,13 @@ Once rebooted, clone only the backend portion of the repository:
 ```bash
 git clone --depth 1 --filter=blob:none --sparse https://github.com/Dycool/Nintendo-Switch-PC-Control.git
 cd Nintendo-Switch-PC-Control
-git sparse-checkout set backend
+git sparse-checkout set server
 ```
 
-#### Compile the backend
+#### Compile the server
 
 ```bash
-cd backend/rpi
+cd server/rpi
 mkdir build && cd build
 cmake ..
 make
@@ -56,7 +60,7 @@ chmod +x setup_gadget.sh
 sudo bash setup_gadget.sh
 ```
 
-#### Start the Backend
+#### Start the server
 
 ```bash
 cd build
@@ -186,7 +190,7 @@ clang++ --version
 
 #### Build the client
 
-1. Navigate to the `client/macos/` folder.
+1. Navigate to the `client/mac/` folder.
 
 2. Compile the client:
 
@@ -262,7 +266,8 @@ Each UDP datagram is authenticated with a truncated **HMAC-SHA256** tag derived 
 ## Planned
 
 * UI for clients
-
+* Multiple Controllers?? (With emulation of a gamecube adapter)
+* Upnp
 ---
 
 ## 📄 License
