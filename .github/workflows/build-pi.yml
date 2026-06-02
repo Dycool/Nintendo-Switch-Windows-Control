@@ -11,7 +11,7 @@ jobs:
   build-pi-server:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       
       - name: Install ARM Cross-Compiler and deps
         run: |
@@ -44,7 +44,7 @@ jobs:
           cp ../setup_gadget.sh .
           zip ns-pc-control-raspberry-pi.zip ns-backend setup_gadget.sh
           
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: rpi-artifact
           path: server/rpi/build/ns-pc-control-raspberry-pi.zip

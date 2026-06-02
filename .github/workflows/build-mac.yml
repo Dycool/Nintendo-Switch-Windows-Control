@@ -11,7 +11,7 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build Terminal Client
         run: |
@@ -28,7 +28,7 @@ jobs:
           cd client/mac/
           zip -r ns-pc-control-mac.zip ns-gamepad ns-gui.app
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: macos-artifact
           path: client/mac/ns-pc-control-mac.zip
