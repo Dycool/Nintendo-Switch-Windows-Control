@@ -25,7 +25,7 @@ jobs:
 
   # 2. Gather artifacts and create the release
   release:
-    needs: [build-windows, build-linux, build-mac, build-pi-backend]
+    needs: [build-windows, build-linux, build-mac, build-pi-server]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts

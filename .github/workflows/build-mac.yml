@@ -3,7 +3,7 @@ name: Build macOS
 on:
   push:
     paths:
-      - 'frontend/mac/**'
+      - 'client/mac/**'
   workflow_dispatch:
   workflow_call:
 
@@ -15,11 +15,11 @@ jobs:
       
       - name: Build macOS
         run: |
-          cd frontend/mac/
+          cd client/mac/
           clang++ -std=c++17 -ObjC++ -framework GameController -framework Foundation ns-gamepad.mm -o ns-gamepad
           zip ns-pc-control-mac.zip ns-gamepad
           
       - uses: actions/upload-artifact@v4
         with:
           name: macos-artifact
-          path: frontend/mac/ns-pc-control-mac.zip
+          path: client/mac/ns-pc-control-mac.zip

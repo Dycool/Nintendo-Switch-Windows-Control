@@ -3,12 +3,12 @@ name: Build Pi Backend
 on:
   push:
     paths:
-      - 'backend/rpi/**'
+      - 'server/rpi/**'
   workflow_dispatch:
   workflow_call:
 
 jobs:
-  build-pi-backend:
+  build-pi-server:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,16 +16,16 @@ jobs:
       - name: Install ARM Cross-Compiler and zip
         run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu cmake zip
         
-      - name: Build Pi Backend
+      - name: Build Pi Server
         run: |
-          cd backend/rpi
+          cd server/rpi
           mkdir build && cd build
           cmake .. -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++
           make
           cp ../setup_gadget.sh .
-          zip ns-pc-control-raspberry-pi.zip ns-backend setup_gadget.sh
+          zip ns-pc-control-raspberry-pi.zip ns-server setup_gadget.sh
           
       - uses: actions/upload-artifact@v4
         with:
           name: rpi-artifact
-          path: backend/rpi/build/ns-pc-control-raspberry-pi.zip
+          path: server/rpi/build/ns-pc-control-raspberry-pi.zip

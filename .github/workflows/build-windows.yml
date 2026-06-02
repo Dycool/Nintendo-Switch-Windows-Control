@@ -3,7 +3,7 @@ name: Build Windows
 on:
   push:
     paths:
-      - 'frontend/windows/**'
+      - 'client/windows/**'
   workflow_dispatch:
   workflow_call:
 
@@ -16,7 +16,7 @@ jobs:
       - name: Build and Zip Windows
         shell: bash
         run: |
-          cd frontend/windows/
+          cd client/windows/
           g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput
           # 7z is pre-installed on windows-latest runners
           7z a ns-pc-control-windows.zip ns-gamepad.exe
@@ -24,4 +24,4 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows-artifact
-          path: frontend/windows/ns-pc-control-windows.zip
+          path: client/windows/ns-pc-control-windows.zip
