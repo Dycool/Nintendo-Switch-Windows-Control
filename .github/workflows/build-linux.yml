@@ -29,7 +29,7 @@ jobs:
       - name: Package
         run: |
           cd client/linux/
-          zip ns-pc-control-linux.zip ns-gamepad ns-gui icon.png
+           zip ns-pc-control-linux.zip ns-gamepad ns-gui
 
       - uses: actions/upload-artifact@v4
         with:

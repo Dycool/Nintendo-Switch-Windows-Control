@@ -27,12 +27,12 @@ jobs:
         run: |
           cd client/windows
           rc /nologo ns-gui.rc
-          cl /std:c++17 /O2 /EHsc /W3 ns-gui.cpp ns-gui.res /link ws2_32.lib xinput.lib setupapi.lib comctl32.lib gdiplus.lib user32.lib kernel32.lib gdi32.lib advapi32.lib /out:ns-gui.exe
+           cl /std:c++17 /O2 /EHsc /W3 ns-gui.cpp ns-gui.res /link ws2_32.lib xinput.lib setupapi.lib comctl32.lib user32.lib kernel32.lib gdi32.lib advapi32.lib /out:ns-gui.exe
 
       - name: Package
         shell: pwsh
         run: |
-          Compress-Archive -Path client/windows/ns-gamepad.exe, client/windows/ns-gui.exe, client/windows/icon.png -DestinationPath client/windows/ns-pc-control-windows.zip -Force
+           Compress-Archive -Path client/windows/ns-gamepad.exe, client/windows/ns-gui.exe -DestinationPath client/windows/ns-pc-control-windows.zip -Force
 
       - uses: actions/upload-artifact@v4
         with:
