@@ -2,6 +2,9 @@
 #  error "macOS only"
 #endif
 
+// On macOS 10.15+, Bluetooth controllers may require the
+// "Input Monitoring" permission under System Settings → Privacy & Security.
+
 #import <Cocoa/Cocoa.h>
 #import <GameController/GameController.h>
 
@@ -55,6 +58,17 @@ inline uint64_t now_us() noexcept {
 }
 }
 
+// ── Gamepad state struct (same as CLI version) ──
+struct GamepadState {
+    std::atomic<bool>  btn_a{false}, btn_b{false}, btn_x{false}, btn_y{false};
+    std::atomic<bool>  btn_l{false}, btn_r{false};
+    std::atomic<float> zl{0.0f}, zr{0.0f};
+    std::atomic<bool>  btn_menu{false}, btn_options{false};
+    std::atomic<bool>  btn_lstick{false}, btn_rstick{false};
+    std::atomic<bool>  dpad_up{false}, dpad_down{false}, dpad_left{false}, dpad_right{false};
+    std::atomic<float> lx{0.0f}, ly{0.0f}, rx{0.0f}, ry{0.0f};
+};
+
 static uint8_t float_to_byte(float val, bool invert = false, float dz = 0.15f) {
     if (std::abs(val) < dz) return 128;
     int scaled;
@@ -65,28 +79,58 @@ static uint8_t float_to_byte(float val, bool invert = false, float dz = 0.15f) {
     return (uint8_t)(invert ? 255 - scaled : scaled);
 }
 
-static ns::HIDReport read_gamepad(GCExtendedGamepad* gp) {
+// Attach value-change handlers (identical to CLI version)
+static void attach_handlers(GCExtendedGamepad* gp, GamepadState* st) {
+    gp.buttonA.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_a.store((bool)p, std::memory_order_relaxed); };
+    gp.buttonB.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_b.store((bool)p, std::memory_order_relaxed); };
+    gp.buttonX.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_x.store((bool)p, std::memory_order_relaxed); };
+    gp.buttonY.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_y.store((bool)p, std::memory_order_relaxed); };
+    gp.leftShoulder.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_l.store((bool)p, std::memory_order_relaxed); };
+    gp.rightShoulder.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_r.store((bool)p, std::memory_order_relaxed); };
+    gp.leftTrigger.valueChangedHandler = ^(GCControllerButtonInput*, float v, BOOL) { st->zl.store(v, std::memory_order_relaxed); };
+    gp.rightTrigger.valueChangedHandler = ^(GCControllerButtonInput*, float v, BOOL) { st->zr.store(v, std::memory_order_relaxed); };
+    gp.buttonMenu.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_menu.store((bool)p, std::memory_order_relaxed); };
+    if (gp.buttonOptions) {
+        gp.buttonOptions.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_options.store((bool)p, std::memory_order_relaxed); };
+    }
+    if (gp.leftThumbstickButton) {
+        gp.leftThumbstickButton.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_lstick.store((bool)p, std::memory_order_relaxed); };
+    }
+    if (gp.rightThumbstickButton) {
+        gp.rightThumbstickButton.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_rstick.store((bool)p, std::memory_order_relaxed); };
+    }
+    gp.dpad.up.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->dpad_up.store((bool)p, std::memory_order_relaxed); };
+    gp.dpad.down.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->dpad_down.store((bool)p, std::memory_order_relaxed); };
+    gp.dpad.left.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->dpad_left.store((bool)p, std::memory_order_relaxed); };
+    gp.dpad.right.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->dpad_right.store((bool)p, std::memory_order_relaxed); };
+    gp.leftThumbstick.xAxis.valueChangedHandler = ^(GCControllerAxisInput*, float v) { st->lx.store(v, std::memory_order_relaxed); };
+    gp.leftThumbstick.yAxis.valueChangedHandler = ^(GCControllerAxisInput*, float v) { st->ly.store(v, std::memory_order_relaxed); };
+    gp.rightThumbstick.xAxis.valueChangedHandler = ^(GCControllerAxisInput*, float v) { st->rx.store(v, std::memory_order_relaxed); };
+    gp.rightThumbstick.yAxis.valueChangedHandler = ^(GCControllerAxisInput*, float v) { st->ry.store(v, std::memory_order_relaxed); };
+}
+
+static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     ns::HIDReport r; r.reset();
-    if (gp.buttonA.pressed) r.buttons |= ns::BTN_B;
-    if (gp.buttonB.pressed) r.buttons |= ns::BTN_A;
-    if (gp.buttonX.pressed) r.buttons |= ns::BTN_Y;
-    if (gp.buttonY.pressed) r.buttons |= ns::BTN_X;
-    if (gp.leftShoulder.pressed) r.buttons |= ns::BTN_L;
-    if (gp.rightShoulder.pressed) r.buttons |= ns::BTN_R;
-    if (gp.leftTrigger.value > 0.5f) r.buttons |= ns::BTN_ZL;
-    if (gp.rightTrigger.value > 0.5f) r.buttons |= ns::BTN_ZR;
-    bool plus = gp.buttonMenu.pressed;
-    bool minus = gp.buttonOptions ? gp.buttonOptions.pressed : false;
+    if (st.btn_a.load(std::memory_order_relaxed)) r.buttons |= ns::BTN_B;
+    if (st.btn_b.load(std::memory_order_relaxed)) r.buttons |= ns::BTN_A;
+    if (st.btn_x.load(std::memory_order_relaxed)) r.buttons |= ns::BTN_Y;
+    if (st.btn_y.load(std::memory_order_relaxed)) r.buttons |= ns::BTN_X;
+    if (st.btn_l.load(std::memory_order_relaxed)) r.buttons |= ns::BTN_L;
+    if (st.btn_r.load(std::memory_order_relaxed)) r.buttons |= ns::BTN_R;
+    if (st.zl.load(std::memory_order_relaxed) > 0.5f) r.buttons |= ns::BTN_ZL;
+    if (st.zr.load(std::memory_order_relaxed) > 0.5f) r.buttons |= ns::BTN_ZR;
+    bool plus = st.btn_menu.load(std::memory_order_relaxed);
+    bool minus = st.btn_options.load(std::memory_order_relaxed);
     if (plus) r.buttons |= ns::BTN_PLUS;
     if (minus) r.buttons |= ns::BTN_MINUS;
-    bool ls = gp.leftThumbstickButton ? gp.leftThumbstickButton.pressed : false;
-    bool rs = gp.rightThumbstickButton ? gp.rightThumbstickButton.pressed : false;
+    bool ls = st.btn_lstick.load(std::memory_order_relaxed);
+    bool rs = st.btn_rstick.load(std::memory_order_relaxed);
     if (ls) r.buttons |= ns::BTN_LSTICK;
     if (rs) r.buttons |= ns::BTN_RSTICK;
     if (ls && rs) { r.buttons |= ns::BTN_HOME; r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK); }
     if (plus && minus) { r.buttons |= ns::BTN_CAPTURE; r.buttons &= ~(ns::BTN_PLUS | ns::BTN_MINUS); }
-    bool up = gp.dpad.up.pressed, down = gp.dpad.down.pressed;
-    bool left = gp.dpad.left.pressed, right = gp.dpad.right.pressed;
+    bool up = st.dpad_up.load(std::memory_order_relaxed), down = st.dpad_down.load(std::memory_order_relaxed);
+    bool left = st.dpad_left.load(std::memory_order_relaxed), right = st.dpad_right.load(std::memory_order_relaxed);
     if (up && right) r.hat = ns::HAT_NE;
     else if (up && left) r.hat = ns::HAT_NW;
     else if (down && right) r.hat = ns::HAT_SE;
@@ -95,10 +139,10 @@ static ns::HIDReport read_gamepad(GCExtendedGamepad* gp) {
     else if (down) r.hat = ns::HAT_S;
     else if (left) r.hat = ns::HAT_W;
     else if (right) r.hat = ns::HAT_E;
-    r.lx = float_to_byte(gp.leftThumbstick.xAxis.value, false);
-    r.ly = float_to_byte(gp.leftThumbstick.yAxis.value, true);
-    r.rx = float_to_byte(gp.rightThumbstick.xAxis.value, false);
-    r.ry = float_to_byte(gp.rightThumbstick.yAxis.value, true);
+    r.lx = float_to_byte(st.lx.load(std::memory_order_relaxed), false);
+    r.ly = float_to_byte(st.ly.load(std::memory_order_relaxed), true);
+    r.rx = float_to_byte(st.rx.load(std::memory_order_relaxed), false);
+    r.ry = float_to_byte(st.ry.load(std::memory_order_relaxed), true);
     return r;
 }
 
@@ -110,6 +154,7 @@ static ns::HIDReport read_gamepad(GCExtendedGamepad* gp) {
     NSTextField* statusField;
     NSTextField* ctrlNameField;
 
+    GamepadState state;
     std::thread senderThread;
     std::atomic<bool> connected;
     std::atomic<bool> senderRunning;
@@ -210,7 +255,11 @@ static ns::HIDReport read_gamepad(GCExtendedGamepad* gp) {
     [ctrlNameField setTextColor:[NSColor grayColor]];
     [view addSubview:ctrlNameField];
 
-    // Attach to existing controllers is handled by polling in sender thread
+    // Attach handlers to already-connected controllers (on main thread)
+    for (GCController* ctrl in [GCController controllers]) {
+        if (ctrl.extendedGamepad)
+            attach_handlers(ctrl.extendedGamepad, &state);
+    }
 
     [self refreshControllerList];
     [window makeKeyAndOrderFront:nil];
@@ -278,9 +327,21 @@ static ns::HIDReport read_gamepad(GCExtendedGamepad* gp) {
     senderRunning = true;
     seq = 0;
 
-    // Start sender thread
-    senderThread = std::thread([self, ip, port, sel] {
-        // Create socket
+    // Attach handlers to the selected controller (on main thread)
+    NSArray* controllers = [GCController controllers];
+    int idx = 0;
+    for (GCController* ctrl in controllers) {
+        if (ctrl.extendedGamepad) {
+            if (idx == sel) {
+                attach_handlers(ctrl.extendedGamepad, &state);
+                break;
+            }
+            idx++;
+        }
+    }
+
+    // Start sender thread (same approach as CLI version)
+    senderThread = std::thread([self, ip, port] {
         self->sock = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (self->sock < 0) return;
 
@@ -297,30 +358,27 @@ static ns::HIDReport read_gamepad(GCExtendedGamepad* gp) {
         memcpy(&dest, res->ai_addr, sizeof(dest));
         freeaddrinfo(res);
 
+        uint32_t seq = 0;
+        auto next_tick = std::chrono::steady_clock::now();
+
         while (self->senderRunning) {
+            while (std::chrono::steady_clock::now() < next_tick)
+                std::atomic_thread_fence(std::memory_order_relaxed);
+
             ns::Packet pkt{};
             pkt.magic = ns::PROTO_MAGIC;
             pkt.version = ns::PROTO_VERSION;
             pkt.flags = ns::FLAG_NONE;
-            pkt.seq = self->seq++;
+            pkt.seq = seq++;
             pkt.ts_us = ns::now_us();
-
-            // Poll controller state directly (works even in background)
-            pkt.report.reset();
-            NSArray* controllers = [GCController controllers];
-            if (sel < (int)[controllers count]) {
-                GCController* ctrl = controllers[sel];
-                if (ctrl.extendedGamepad)
-                    pkt.report = read_gamepad(ctrl.extendedGamepad);
-            }
-
+            pkt.report = map_gc_to_switch(self->state);
             {
                 uint8_t fullHmac[32];
                 hmac_sha256(self->hmacKey, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, fullHmac);
                 memcpy(pkt.hmac, fullHmac, ns::HMAC_TAG_SIZE);
             }
             sendto(self->sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            next_tick += std::chrono::milliseconds(2);
         }
         close(self->sock);
     });

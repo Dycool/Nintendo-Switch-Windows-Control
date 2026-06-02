@@ -53,6 +53,14 @@ cat > ns-gui.app/Contents/Info.plist <<EOF
     <string>10.15</string>
     <key>CFBundleIconFile</key>
     <string>icon</string>
+    <!-- Required on macOS 14+ for GameController framework background access -->
+    <key>NSGameControllerUsageDescription</key>
+    <string>This app uses game controllers to send inputs to your Nintendo Switch.</string>
+    <!-- Required for Bluetooth controllers (wireless Xbox/PlayStation/Switch Pro) -->
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>This app uses Bluetooth to communicate with wireless game controllers.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>This app uses Bluetooth to communicate with wireless game controllers.</string>
 </dict>
 </plist>
 EOF
