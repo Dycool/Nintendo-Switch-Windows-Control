@@ -67,7 +67,6 @@ static void hori_thread(const std::string& dev, int hz) {
     const int af_period = std::max(1, hz / (AUTOFIRE_HZ * 2));
     int af_tick = 0;
     uint16_t af_state = 0;
-
     int fd = -1;
     bool was_connected = false;
 
@@ -90,7 +89,6 @@ static void hori_thread(const std::string& dev, int hz) {
             next = std::max(next + tick, now + tick);
 
             uint64_t last = g_last_rx_us.load(std::memory_order_acquire);
-            // CORREÇÃO: Utilizar a constante do WATCHDOG em vez de um valor fixo.
             bool silent = (last != 0) && (now_us() - last > (WATCHDOG_MS * 1000ULL));
 
             HIDReport r;
@@ -142,7 +140,7 @@ static void gc_hub_thread(const std::string& dev) {
 
     while (g_running.load(std::memory_order_relaxed)) {
         if (fd < 0) {
-            fd = open(dev.c_str(), O_RDWR | O_NONBLOCK); // Requires RDWR to drain
+            fd = open(dev.c_str(), O_RDWR | O_NONBLOCK); 
             if (fd < 0) { std::this_thread::sleep_for(ms(500)); continue; }
             if (g_verbose || was_connected) std::puts("[backend] /dev/hidg0 opened (GC Hub Mode)");
             was_connected = true;
@@ -159,10 +157,9 @@ static void gc_hub_thread(const std::string& dev) {
             next = std::max(next + tick, now + tick);
 
             uint8_t discard[64];
-            while (read(fd, discard, sizeof(discard)) > 0) {} // Drain Rumble
+            while (read(fd, discard, sizeof(discard)) > 0) {} 
 
             uint64_t last = g_last_rx_us.load(std::memory_order_acquire);
-            // CORREÇÃO: Utilizar a constante do WATCHDOG.
             bool silent = (last != 0) && (now_us() - last > (WATCHDOG_MS * 1000ULL));
 
             GCHubReport r;
@@ -189,7 +186,7 @@ static void gc_hub_thread(const std::string& dev) {
     if (fd >= 0) close(fd);
 }
 
-// ── Network / UPnP Utilities ──────────────────────────────────────────────────
+// ── Rate limiter & UPnP ───────────────────────────────────────────────────────
 static void stats_thread() {
     while (g_running.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(ms(5000));
@@ -285,13 +282,9 @@ int main(int argc, char** argv) {
     std::printf("[backend] Mode: %s | UDP %s:%u | HMAC=always\n", 
                 g_multiplayer ? "GameCube 4-Player Hub" : "HORI 1-Player", bind_addr.c_str(), port);
 
-    // CORREÇÃO: Utilização de uma Lambda function para inicializar as threads com segurança (Evitar UB).
     std::thread wt([&]() {
-        if (g_multiplayer) {
-            gc_hub_thread(device);
-        } else {
-            hori_thread(device, WRITER_HZ);
-        }
+        if (g_multiplayer) gc_hub_thread(device);
+        else               hori_thread(device, WRITER_HZ);
     });
     
     std::thread st(stats_thread);
@@ -324,9 +317,6 @@ int main(int argc, char** argv) {
         if (!g_have_auth) { g_auth_addr = sender; g_have_auth = true; }
 
         bool is_reset = (pkt.flags & FLAG_RESET);
-        
-        // CORREÇÃO: Matemática de inteiros assinados (int32_t) lida perfeitamente com os "wrap-arounds" 
-        // e overflow do Packet Sequence Number após chegar ao limite.
         int32_t seq_diff = (int32_t)(pkt.seq - expected_seq);
         bool is_old = seq_diff < 0;
         bool sequence_jump = seq_diff > 100;
