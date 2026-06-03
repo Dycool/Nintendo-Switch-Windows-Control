@@ -1,3 +1,15 @@
+/// ns-gamepad.cpp  —  Linux frontend for the Switch wireless gamepad bridge
+///
+/// Uses the standard Linux Joystick API (/dev/input/jsX).
+/// Now features Smart Discovery: Automatically scans js0-js15, interrogates
+/// hardware via ioctl, ignores mice/keyboards, and seamlessly hot-plugs real gamepads.
+///
+/// Build:
+///   g++ -O3 -std=c++17 ns-gamepad.cpp -o ns-gamepad -lpthread
+///
+/// Usage:
+///   ./ns-gamepad <RASPBERRY_PI_IP> [-p PORT]
+
 #include <iostream>
 #include <chrono>
 #include <cstdint>
@@ -7,6 +19,8 @@
 #include <cstring>
 #include <cmath>
 #include <atomic>
+#include <csignal>
+#include <string>
 
 // Linux specific headers
 #include <sys/socket.h>
@@ -15,12 +29,12 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>      // Required to query hardware specs
 #include <linux/joystick.h>
 #include <sys/resource.h>
-#include "sha256.h"
+#include "../../server/rpi/include/sha256.h"
 
 // Undefine conflicting button macros from linux/joystick.h to avoid naming conflicts
-// with the custom Button enum defined in the ns namespace
 #undef BTN_A
 #undef BTN_B
 #undef BTN_X
@@ -35,318 +49,345 @@
 #undef BTN_THUMBL
 #undef BTN_THUMBR
 
-namespace ns {
+// Import external protocol structures (Version 4 with MultiReport)
+#include "../../server/rpi/include/protocol.hpp"
 
-// Protocol constants for communication with Raspberry Pi backend
-static constexpr uint32_t PROTO_MAGIC   = 0x4E535743u;  // 'NSWC' magic number for packet validation
-static constexpr uint8_t  PROTO_VERSION = 1;             // Protocol version for compatibility checking
-static constexpr uint16_t DEFAULT_PORT  = 7331;          // UDP port for sending gamepad data
-static constexpr const char* DEFAULT_SECRET = "nsc-R2xvCy7Eyw2nfbZIOGyKZPnostpaRY";
+// ─────────────────────────────────────────────────────────────────────────────
+//  Shared gamepad state
+// ─────────────────────────────────────────────────────────────────────────────
 
-/// Nintendo Switch Pro Controller button bitmask layout
-/// Bits correspond to specific buttons, allowing multiple buttons to be represented in a single uint16_t
-enum Button : uint16_t {
-    BTN_Y=1<<0, BTN_B=1<<1, BTN_A=1<<2, BTN_X=1<<3,      // Face buttons
-    BTN_L=1<<4, BTN_R=1<<5, BTN_ZL=1<<6, BTN_ZR=1<<7,    // Shoulder buttons
-    BTN_MINUS=1<<8, BTN_PLUS=1<<9, BTN_LSTICK=1<<10, BTN_RSTICK=1<<11,  // Special buttons
-    BTN_HOME=1<<12, BTN_CAPTURE=1<<13,                    // System buttons
-};
-
-/// D-pad (hat switch) direction values
-/// Represents the 8 cardinal directions plus neutral state
-enum Hat : uint8_t {
-    HAT_N=0, HAT_NE=1, HAT_E=2, HAT_SE=3,
-    HAT_S=4, HAT_SW=5, HAT_W=6, HAT_NW=7, HAT_NEUTRAL=8,
-};
-
-/// Packed 8-byte HID input report structure
-/// Layout must exactly match the USB gadget HID descriptor on the Raspberry Pi backend
-#pragma pack(push, 1)
-struct HIDReport {
-    uint16_t buttons = 0;   // Bitmask of pressed buttons (Button enum values)
-    uint8_t  hat     = HAT_NEUTRAL;  // D-pad direction (Hat enum value)
-    uint8_t  lx      = 128; // Left stick X axis (0-255, 128 = center)
-    uint8_t  ly      = 128; // Left stick Y axis (0-255, 128 = center)
-    uint8_t  rx      = 128; // Right stick X axis (0-255, 128 = center)
-    uint8_t  ry      = 128; // Right stick Y axis (0-255, 128 = center)
-    uint8_t  vendor  = 0;   // Vendor-specific data (unused)
-    
-    /// Reset all fields to default neutral state
-    void reset() noexcept { buttons = 0; hat = HAT_NEUTRAL; lx = ly = rx = ry = 128; vendor = 0; }
-};
-
-/// Packet flag bits for controlling backend behavior
-enum Flags : uint8_t { 
-    FLAG_NONE=0x00,         // No special flags
-    FLAG_RESET=0x01,        // Reset all inputs to neutral
-    FLAG_AUTOFIRE=0x02      // Enable autofire for specified buttons
-};
-
-/// HMAC authentication tag (truncated HMAC-SHA256)
-static constexpr size_t HMAC_TAG_SIZE = 16;
-
-/// UDP wire packet structure sent from PC frontend to Raspberry Pi backend (~44 bytes with HMAC)
-struct Packet {
-    uint32_t  magic;         // PROTO_MAGIC for validation
-    uint8_t   version;       // PROTO_VERSION for compatibility
-    uint8_t   flags;         // Flags bitmask (Flags enum)
-    uint16_t  autofire_mask; // Button bitmask for autofire (valid when FLAG_AUTOFIRE is set)
-    uint32_t  seq;           // Monotonic sequence counter for packet ordering
-    uint64_t  ts_us;         // Sender's steady_clock timestamp in microseconds (for latency calculation)
-    HIDReport report;        // The actual gamepad input report
-    uint8_t   hmac[HMAC_TAG_SIZE];
-};
-#pragma pack(pop)
-
-/// Cached packet size for efficiency (avoids repeated sizeof calculations)
-static constexpr size_t PACKET_SIZE      = sizeof(Packet);
-static constexpr size_t PACKET_AUTH_SIZE = PACKET_SIZE - HMAC_TAG_SIZE;
-
-/// Get current time in microseconds using steady_clock (high precision, monotonic)
-inline uint64_t now_us() noexcept {
-    using namespace std::chrono;
-    return (uint64_t)duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
-}
-
-}
-
-/// Thread-safe gamepad state container using atomic operations
-/// Allows main thread and sender thread to share input state without explicit locking
+/// Holds the raw state of a Linux joystick
 struct GamepadState {
-    std::atomic<bool> buttons[16];     // Array of 16 button states (atomic for thread safety)
-    std::atomic<int16_t> axes[8];      // Array of 8 analog axes (typically 2 sticks = 4 axes)
+    bool    buttons[16] = {false};
+    int16_t axes[8]     = {0};
 
-    GamepadState() {
-        // Initialize all buttons as unpressed
-        for(int i=0; i<16; ++i) buttons[i].store(false, std::memory_order_relaxed);
-        // Initialize all axes to neutral (0)
-        for(int i=0; i<8; ++i) axes[i].store(0, std::memory_order_relaxed);
-    }
-
-    /// Atomically copy current gamepad state to output arrays (relaxed memory ordering for performance)
-    void copy_to(bool* dest_buttons, int16_t* dest_axes) const {
-        for(int i=0; i<16; ++i) dest_buttons[i] = buttons[i].load(std::memory_order_relaxed);
-        for(int i=0; i<8; ++i) dest_axes[i] = axes[i].load(std::memory_order_relaxed);
+    void clear_inputs() {
+        std::memset(buttons, 0, sizeof(buttons));
+        std::memset(axes, 0, sizeof(axes));
     }
 };
+
+static GamepadState g_states[4];
+static int          g_fds[4] = {-1, -1, -1, -1};
+static std::string  g_dev_paths[4] = {"", "", "", ""};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Signal handling
+// ─────────────────────────────────────────────────────────────────────────────
+static std::atomic<bool> g_running{true};
+static void on_signal(int) { g_running.store(false, std::memory_order_relaxed); }
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Axis conversion
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Convert raw analog stick value to normalized 0-255 range with deadzone applied
-/// @param val Raw axis value from joystick (-32768 to 32767)
-/// @param invert If true, inverts the output (255 - scaled)
-/// @param deadzone Threshold below which values are considered neutral (default 8000 for ~24% deadzone)
-/// @return Normalized axis value (0-255, 128 = center/neutral)
 uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8000) {
-    // If within deadzone, return center position
     if (val > -deadzone && val < deadzone) return 128;
 
     int scaled;
     if (val >= deadzone) {
-        // Positive direction: scale from deadzone to max value (32767)
         scaled = 128 + ((val - deadzone) * 127) / (32767 - deadzone);
     } else {
-        // Negative direction: scale from deadzone to min value (-32768)
         scaled = 128 - ((std::abs(val) - deadzone) * 128) / (32768 - deadzone);
     }
     
-    // Clamp to valid range and optionally invert
     scaled = std::clamp(scaled, 0, 255);
     return (uint8_t)(invert ? (255 - scaled) : scaled);
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Input Mapping
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Convert Linux joystick state to Switch Pro Controller HID report format
-/// Maps Linux device input indices to Switch button/axis conventions
-/// @param pad GamepadState containing Linux joystick input data
-/// @return HIDReport formatted for USB transmission to Raspberry Pi
 ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
     ns::HIDReport r;
     r.reset();
 
-    // Copy atomic values to local arrays for safe access during mapping
-    bool b[16];
-    int16_t a[8];
-    pad.copy_to(b, a);
-
-    // Map face buttons (indices 0-3 typically correspond to B, A, Y, X on most Linux gamepads)
-    if (b[0]) r.buttons |= ns::BTN_B; 
-    if (b[1]) r.buttons |= ns::BTN_A; 
-    if (b[2]) r.buttons |= ns::BTN_Y; 
-    if (b[3]) r.buttons |= ns::BTN_X; 
+    // Map face buttons (indices 0-3 typically correspond to B, A, Y, X)
+    if (pad.buttons[0]) r.buttons |= ns::BTN_B; 
+    if (pad.buttons[1]) r.buttons |= ns::BTN_A; 
+    if (pad.buttons[2]) r.buttons |= ns::BTN_Y; 
+    if (pad.buttons[3]) r.buttons |= ns::BTN_X; 
 
     // Map shoulder buttons (indices 4-5)
-    if (b[4]) r.buttons |= ns::BTN_L; 
-    if (b[5]) r.buttons |= ns::BTN_R; 
+    if (pad.buttons[4]) r.buttons |= ns::BTN_L; 
+    if (pad.buttons[5]) r.buttons |= ns::BTN_R; 
     
     // Map trigger buttons via analog axes (axes 2 and 5 on many gamepads)
-    if (a[2] > 0) r.buttons |= ns::BTN_ZL;
-    if (a[5] > 0) r.buttons |= ns::BTN_ZR;
+    if (pad.axes[2] > 0) r.buttons |= ns::BTN_ZL;
+    if (pad.axes[5] > 0) r.buttons |= ns::BTN_ZR;
 
     // Map menu/select buttons (indices 6-7)
-    if (b[6]) r.buttons |= ns::BTN_MINUS;  
-    if (b[7]) r.buttons |= ns::BTN_PLUS;   
+    if (pad.buttons[6]) r.buttons |= ns::BTN_MINUS;  
+    if (pad.buttons[7]) r.buttons |= ns::BTN_PLUS;   
     
     // Map stick button presses (indices 9-10)
-    if (b[9]) r.buttons |= ns::BTN_LSTICK; 
-    if (b[10])r.buttons |= ns::BTN_RSTICK; 
+    if (pad.buttons[9])  r.buttons |= ns::BTN_LSTICK; 
+    if (pad.buttons[10]) r.buttons |= ns::BTN_RSTICK; 
 
-    // Special: Both sticks pressed simultaneously = HOME button
-    if (b[9] && b[10]) {
+    // Emulate HOME and CAPTURE using button combos
+    if (pad.buttons[9] && pad.buttons[10]) {
         r.buttons |= ns::BTN_HOME;
-        r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK);  // Remove individual stick presses
+        r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK); 
     }
-
-    // Special: MINUS + PLUS simultaneously = CAPTURE button
-    if (b[6] && b[7]) {
+    if (pad.buttons[6] && pad.buttons[7]) {
         r.buttons |= ns::BTN_CAPTURE;
-        r.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS);     // Remove individual menu presses
+        r.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS); 
     }
 
-    // Map D-pad via analog axes (axes 6-7 typically for Linux gamepads)
-    // Threshold of 16000 out of 32767 range detects cardinal directions
-    bool up    = (a[7] < -16000);
-    bool down  = (a[7] >  16000);
-    bool left  = (a[6] < -16000);
-    bool right = (a[6] >  16000);
+    // Map D-pad via analog axes (axes 6-7 typically)
+    bool up    = (pad.axes[7] < -16000);
+    bool down  = (pad.axes[7] >  16000);
+    bool left  = (pad.axes[6] < -16000);
+    bool right = (pad.axes[6] >  16000);
 
-    // Set hat value based on combination of directional inputs
-    if (up && right)       r.hat = ns::HAT_NE;
-    else if (up && left)   r.hat = ns::HAT_NW;
-    else if (down && right)r.hat = ns::HAT_SE;
-    else if (down && left) r.hat = ns::HAT_SW;
-    else if (up)           r.hat = ns::HAT_N;
-    else if (down)         r.hat = ns::HAT_S;
-    else if (left)         r.hat = ns::HAT_W;
-    else if (right)        r.hat = ns::HAT_E;
+    if      (up && right)   r.hat = ns::HAT_NE;
+    else if (up && left)    r.hat = ns::HAT_NW;
+    else if (down && right) r.hat = ns::HAT_SE;
+    else if (down && left)  r.hat = ns::HAT_SW;
+    else if (up)            r.hat = ns::HAT_N;
+    else if (down)          r.hat = ns::HAT_S;
+    else if (left)          r.hat = ns::HAT_W;
+    else if (right)         r.hat = ns::HAT_E;
 
-    // Map analog sticks (axes 0-1 for left stick, 3-4 for right stick) with deadzone
-    r.lx = apply_deadzone(a[0], false);
-    r.ly = apply_deadzone(a[1], false);  
-    r.rx = apply_deadzone(a[3], false);
-    r.ry = apply_deadzone(a[4], false);  
+    // Map analog sticks (axes 0-1 for left stick, 3-4 for right stick)
+    r.lx = apply_deadzone(pad.axes[0], false);
+    r.ly = apply_deadzone(pad.axes[1], false);  
+    r.rx = apply_deadzone(pad.axes[3], false);
+    r.ry = apply_deadzone(pad.axes[4], false);  
 
     return r;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Hardware Discovery (Ignores Mice/Keyboards)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Interrogates the Linux kernel to check if a device is a legitimate gamepad
+bool is_valid_gamepad(int fd, std::string& out_name) {
+    char name[128];
+    if (ioctl(fd, JSIOCGNAME(sizeof(name)), name) < 0) {
+        strncpy(name, "Unknown Device", sizeof(name));
+    }
+    
+    char axes = 0, buttons = 0;
+    ioctl(fd, JSIOCGAXES, &axes);
+    ioctl(fd, JSIOCGBUTTONS, &buttons);
+    
+    out_name = name;
+    
+    // Heuristic: A real modern gamepad has at least 2 axes (sticks/dpad) and 4 buttons.
+    // This perfectly filters out 3D mice, laptop accelerometers, and weird keyboards.
+    return (axes >= 2 && buttons >= 4);
+}
+
+/// Periodically scans /dev/input/jsX and assigns valid gamepads to free P1-P4 slots
+void scan_for_gamepads() {
+    static uint64_t last_scan = 0;
+    uint64_t now = ns::now_us();
+    
+    // Only scan once per second to save CPU
+    if (now - last_scan < 1'000'000) return;
+    last_scan = now;
+
+    for (int i = 0; i < 16; ++i) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/input/js%d", i);
+        
+        // Skip if this specific device is already mapped to one of our 4 players
+        bool already_mapped = false;
+        for (int p = 0; p < 4; ++p) {
+            if (g_dev_paths[p] == path) { already_mapped = true; break; }
+        }
+        if (already_mapped) continue;
+
+        // Attempt to open the device
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+
+        std::string hw_name;
+        if (is_valid_gamepad(fd, hw_name)) {
+            // It's a real gamepad! Find a free player slot (0 to 3)
+            bool assigned = false;
+            for (int p = 0; p < 4; ++p) {
+                if (g_fds[p] < 0) {
+                    g_fds[p] = fd;
+                    g_dev_paths[p] = path;
+                    g_states[p].clear_inputs();
+                    std::cout << "🎮 [P" << (p + 1) << "] Connected: " << hw_name << " (" << path << ")\n";
+                    assigned = true;
+                    break;
+                }
+            }
+            if (!assigned) {
+                // We already have 4 controllers connected, drop the extra one
+                close(fd);
+            }
+        } else {
+            // It's a mouse or garbage device, close immediately
+            close(fd);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Device Polling
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Drains events from a connected gamepad and builds the HID report
+void read_pad(int index, ns::HIDReport& rep, bool& conn) {
+    rep.reset();
+    
+    if (g_fds[index] < 0) {
+        conn = false;
+        return;
+    }
+
+    struct js_event event;
+    while (true) {
+        ssize_t bytes = read(g_fds[index], &event, sizeof(event));
+        
+        if (bytes > 0) {
+            uint8_t type = event.type & ~JS_EVENT_INIT;
+            if (type == JS_EVENT_BUTTON && event.number < 16) {
+                g_states[index].buttons[event.number] = event.value;
+            } else if (type == JS_EVENT_AXIS && event.number < 8) {
+                g_states[index].axes[event.number] = event.value;
+            }
+        } else {
+            // Error handling: if not EAGAIN, the device was physically unplugged
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                std::cout << "❌ [P" << (index + 1) << "] Disconnected: " << g_dev_paths[index] << "\n";
+                close(g_fds[index]);
+                g_fds[index] = -1;
+                g_dev_paths[index] = "";
+                conn = false;
+                return;
+            }
+            break; // No more events in buffer, break the read loop
+        }
+    }
+
+    conn = true;
+    rep = map_linux_js_to_switch(g_states[index]);
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Entry point
+// ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP> [device_path]\n"
-                  << "       e.g. " << argv[0] << " 192.168.1.100 /dev/input/js1\n";
+    std::string host = ""; 
+    uint16_t port = ns::DEFAULT_PORT;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-p" && i+1 < argc) port = (uint16_t)std::atoi(argv[++i]);
+        else if (host.empty()) host = arg;
+    }
+
+    if (host.empty()) {
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP> [-p PORT]\n";
         return 1;
     }
-    std::string host   = argv[1];
-    std::string device = (argc >= 3) ? argv[2] : "/dev/input/js0";
 
-    // Derive HMAC key from compiled-in default secret (always active)
     uint8_t hmac_key[32];
     derive_key(ns::DEFAULT_SECRET, hmac_key);
 
-    // Open Linux joystick device for reading raw input events
-    int js_fd = open(device.c_str(), O_RDONLY);
-    if (js_fd < 0) {
-        std::cerr << "Error opening gamepad device: " << device << "\n";
-        return 1;
-    }
-    std::cout << "Gamepad successfully opened at: " << device << "\n";
+    signal(SIGINT,  on_signal);
+    signal(SIGTERM, on_signal);
 
-    // Set process priority to maximum (for low-latency input handling)
-    // -20 is the highest priority (requires appropriate permissions)
-    setpriority(PRIO_PROCESS, 0, -20);
-
-    // Create UDP socket for sending packets to Raspberry Pi
+    // Create UDP socket
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         std::cerr << "Failed to create UDP socket.\n";
-        close(js_fd);
         return 1;
     }
 
-    // Configure destination address (Raspberry Pi backend)
-    struct addrinfo hints{}, *res;
+    // Resolve address
+    struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
-
-    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0) {
-        std::cerr << "Failed to resolve host: " << host << "\n";
-        close(js_fd);
-        close(sock);
-        return 1;
+    
+    char port_str[8]; snprintf(port_str, sizeof(port_str), "%u", port);
+    
+    if (getaddrinfo(host.c_str(), port_str, &hints, &res) != 0 || !res) {
+        std::cerr << "Cannot resolve address: " << host << "\n";
+        close(sock); return 1;
     }
-
-    struct sockaddr_in dest{};
-    memcpy(&dest, res->ai_addr, sizeof(dest));
-    dest.sin_port = htons(ns::DEFAULT_PORT);
+    
+    sockaddr_in dest{};
+    std::memcpy(&dest, res->ai_addr, sizeof(dest));
     freeaddrinfo(res);
 
-    std::cout << "Streaming data to " << host << ":" << ns::DEFAULT_PORT << "... Press CTRL+C to exit.\n";
+    std::cout << "Started as a Multi-Client Node... Connect gamepads and enjoy!\n";
 
-    // Shared gamepad state between main thread (reader) and sender thread (transmitter)
-    GamepadState state;
-    std::atomic<bool> running{true};
+    // Elevate process priority for low-latency input reading
+    setpriority(PRIO_PROCESS, 0, -20);
 
-    // Spawn dedicated thread for transmitting UDP packets at fixed rate (2ms interval = 500 Hz)
-    // This thread runs independently from the main event reading loop
-    std::thread sender_thread([&]() {
-        uint32_t packet_seq = 0;
-        auto next_tick = std::chrono::steady_clock::now();
+    uint32_t seq = 0;
+    auto next_tick = std::chrono::steady_clock::now();
 
-        while (running.load(std::memory_order_relaxed)) {
-            // Busy-wait until next transmission time (high precision, no sleep overhead)
-            // Uses atomic fence for minimal overhead
-            while (std::chrono::steady_clock::now() < next_tick) {
-                std::atomic_thread_fence(std::memory_order_relaxed);
-            }
-
-            // Construct UDP packet with current gamepad state
-            ns::Packet pkt{};
-            pkt.magic         = ns::PROTO_MAGIC;
-            pkt.version       = ns::PROTO_VERSION;
-            pkt.flags         = ns::FLAG_NONE;
-            pkt.autofire_mask = 0;
-            pkt.seq           = packet_seq++;
-            pkt.ts_us         = ns::now_us();                    // Current timestamp for latency measurement
-            pkt.report        = map_linux_js_to_switch(state);   // Convert state to Switch format
-            {
-                uint8_t full_hmac[32];
-                hmac_sha256(hmac_key, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
-                memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
-            }
-
-            // Send packet to Raspberry Pi via UDP
-            sendto(sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
-
-            // Schedule next transmission in 2ms
-            next_tick += std::chrono::milliseconds(2);
+    // ── Main Loop (Input Polling & UDP Networking) ────────────────────────────
+    while (g_running.load(std::memory_order_relaxed)) {
+        
+        // Busy-wait for 2ms precision timing
+        while (std::chrono::steady_clock::now() < next_tick) {
+            std::atomic_thread_fence(std::memory_order_relaxed);
         }
-    });
 
-    // Main event loop: read joystick input events from Linux device
-    // Processes both button presses and analog stick movements
-    struct js_event event;
-    while (read(js_fd, &event, sizeof(event)) > 0) {
-        // Mask off the init flag to get the actual event type
-        // JS_EVENT_INIT is set on first read to reflect current state
-        uint8_t type = event.type & ~JS_EVENT_INIT;
+        // 1. Scan for newly plugged controllers
+        scan_for_gamepads();
 
-        if (type == JS_EVENT_BUTTON) {
-            // Button event: store button state (0=released, 1=pressed)
-            if (event.number < 16) {
-                state.buttons[event.number].store(event.value, std::memory_order_relaxed);
-            }
-        } else if (type == JS_EVENT_AXIS) {
-            // Analog axis event: store axis value (-32768 to 32767)
-            if (event.number < 8) {
-                state.axes[event.number].store(event.value, std::memory_order_relaxed);
+        // 2. Prepare network packet
+        ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet)); 
+        pkt.magic         = ns::PROTO_MAGIC;
+        pkt.version       = ns::PROTO_VERSION;
+        pkt.flags         = ns::FLAG_NONE;
+        pkt.seq           = seq++;
+        pkt.ts_us         = ns::now_us();
+        
+        pkt.report.reset(); // Hardware-neutral init
+
+        ns::HIDReport* out_reports[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
+        int active_count = 0;
+
+        // 3. Read active controllers and pack sequentially
+        for (int i = 0; i < 4; ++i) {
+            ns::HIDReport temp_rep;
+            bool is_conn = false;
+            read_pad(i, temp_rep, is_conn);
+            
+            if (is_conn && active_count < 4) {
+                *out_reports[active_count] = temp_rep;
+                active_count++;
             }
         }
+
+        // 4. Sign packet
+        {
+            uint8_t full_hmac[32];
+            hmac_sha256(hmac_key, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
+            memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+        }
+
+        // 5. Transmit to Server
+        sendto(sock, (const char*)&pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
+        
+        // Dynamic throttling: 500Hz when active, 2Hz when idle (saves network/CPU)
+        if (active_count > 0) next_tick += std::chrono::milliseconds(2);
+        else next_tick += std::chrono::milliseconds(500);
     }
 
-    // Graceful shutdown: signal sender thread to stop
-    running = false;
-    if (sender_thread.joinable()) {
-        sender_thread.join();  // Wait for sender thread to complete
+    // ── Graceful shutdown ──────────────────────────────────────────────────────
+    std::cout << "\nShutting down...\n";
+    for(int i=0; i<4; ++i) {
+        if(g_fds[i] >= 0) close(g_fds[i]);
     }
-
-    // Clean up resources
-    close(js_fd);
     close(sock);
     return 0;
 }

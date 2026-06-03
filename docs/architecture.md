@@ -19,6 +19,6 @@ Each UDP datagram is authenticated with a truncated **HMAC-SHA256** tag derived 
 |---|---|
 | **Magic/version check** | Rejects random internet noise on the very first read |
 | **Per-IP rate limiter** | Limits to 2000 pkts/sec to prevent UDP floods from saturating the Pi |
-| **IP pinning** | Only the first valid client is accepted mid-session |
+| **Multi-client** | Up to 4 PCs can connect simultaneously, each contributing up to 4 controllers |
 | **HMAC-SHA256** | Cryptographically authenticates every packet using a 16-byte truncated hash |
 | **Sequence counter** | Prevents replay attacks of old, captured packets |

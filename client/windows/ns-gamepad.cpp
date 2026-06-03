@@ -14,7 +14,7 @@
 #include <thread>              
 #include <algorithm>           
 #include <string>
-#include "sha256.h"            
+#include "../../server/rpi/include/sha256.h"
 
 // Import external protocol structures
 #include "../../server/rpi/include/protocol.hpp"
@@ -117,7 +117,7 @@ int main(int argc, char** argv) {
 
     char port_buf[8]; snprintf(port_buf, sizeof(port_buf), "%u", port);
     if (getaddrinfo(host.c_str(), port_buf, &hints, &res) != 0 || res == nullptr) {
-        std::cerr << "ERRO: Unable to resolve IP: " << host << "\n";
+        std::cerr << "ERROR: Unable to resolve IP: " << host << "\n";
         WSACleanup(); return 1;
     }
     
