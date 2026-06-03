@@ -219,16 +219,23 @@ static bool rate_allow(uint32_t ip) {
 static bool g_upnp_active = false;
 static UPNPUrls g_upnp_urls{};
 static IGDdatas g_upnp_data{};
-static char g_upnp_lan_addr[64]{}; // Renamed to reflect what this actually holds
+static char g_upnp_lan_addr[64]{};
 
 static bool upnp_add_mapping(uint16_t port) {
+    // Prevent re-initialization if UPnP is already active.
+    // If you need to forward multiple ports, you should separate the 
+    // IGD discovery phase from the AddPortMapping phase.
+    if (g_upnp_active) {
+        std::fprintf(stderr, "[backend] UPnP: Already active. Remove mapping first.\n");
+        return false; 
+    }
+
     struct UPNPDev* devlist = upnpDiscover(2000, nullptr, nullptr, 0, 0, 2, nullptr);
     if (!devlist) {
         std::fprintf(stderr, "[backend] UPnP: no IGD (router) found\n");
         return false;
     }
     
-    // This populates g_upnp_lan_addr with your LOCAL IP (e.g. 192.168.1.50)
     int igd = UPNP_GetValidIGD(devlist, &g_upnp_urls, &g_upnp_data, g_upnp_lan_addr, sizeof(g_upnp_lan_addr), nullptr, 0);
     freeUPNPDevlist(devlist);
     
@@ -240,17 +247,17 @@ static bool upnp_add_mapping(uint16_t port) {
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
     
-    // Request the port mapping using the LAN IP
+    // Consider changing "0" to something like "3600" (1 hour) for safety
     int r = UPNP_AddPortMapping(g_upnp_urls.controlURL, g_upnp_data.first.servicetype,
                                 port_str, port_str, g_upnp_lan_addr, "ns-backend", "UDP", nullptr, "0");
     if (r != 0) {
         std::fprintf(stderr, "[backend] UPnP: AddPortMapping failed: %s (code %d)\n", strupnperror(r), r);
+        FreeUPNPUrls(&g_upnp_urls); // FIX: Prevent memory leak on mapping failure
         return false;
     }
     
     g_upnp_active = true;
 
-    // Fetch and display the actual Public/External IP for the user
     char external_ip[40];
     if (UPNP_GetExternalIPAddress(g_upnp_urls.controlURL, g_upnp_data.first.servicetype, external_ip) == 0) {
         std::printf("[backend] UPnP: UDP port %u successfully forwarded!\n", port);
@@ -264,9 +271,11 @@ static bool upnp_add_mapping(uint16_t port) {
 
 static void upnp_remove_mapping(uint16_t port) {
     if (!g_upnp_active) return;
+    
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
     UPNP_DeletePortMapping(g_upnp_urls.controlURL, g_upnp_data.first.servicetype, port_str, "UDP", nullptr);
+    
     std::puts("[backend] UPnP: port mapping removed cleanly");
     FreeUPNPUrls(&g_upnp_urls);
     g_upnp_active = false;
