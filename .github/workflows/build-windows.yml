@@ -17,7 +17,7 @@ jobs:
         shell: bash
         run: |
           cd client/windows/
-          g++ -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput
+          g++ -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput -lwinmm
 
       - name: Setup MSVC
         uses: TheMrMilchmann/setup-msvc-dev@v4
@@ -29,7 +29,7 @@ jobs:
         run: |
           cd client/windows
           rc /nologo ns-gui.rc
-          cl /std:c++17 /O2 /EHsc /W3 ns-gui.cpp ns-gui.res /link ws2_32.lib xinput.lib setupapi.lib comctl32.lib user32.lib kernel32.lib gdi32.lib advapi32.lib /out:ns-gui.exe
+          cl /std:c++17 /O2 /EHsc /W3 ns-gui.cpp ns-gui.res /link ws2_32.lib xinput.lib setupapi.lib comctl32.lib user32.lib kernel32.lib gdi32.lib advapi32.lib winmm.lib /out:ns-gui.exe
 
       - uses: actions/upload-artifact@v6
         with:
