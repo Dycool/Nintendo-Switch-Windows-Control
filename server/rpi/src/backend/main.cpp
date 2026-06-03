@@ -247,12 +247,11 @@ static bool upnp_add_mapping(uint16_t port) {
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
     
-    // Consider changing "0" to something like "3600" (1 hour) for safety
     int r = UPNP_AddPortMapping(g_upnp_urls.controlURL, g_upnp_data.first.servicetype,
                                 port_str, port_str, g_upnp_lan_addr, "ns-backend", "UDP", nullptr, "0");
     if (r != 0) {
         std::fprintf(stderr, "[backend] UPnP: AddPortMapping failed: %s (code %d)\n", strupnperror(r), r);
-        FreeUPNPUrls(&g_upnp_urls); // FIX: Prevent memory leak on mapping failure
+        FreeUPNPUrls(&g_upnp_urls);
         return false;
     }
     
