@@ -157,11 +157,11 @@ ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
     else if (right)         r.hat = ns::HAT_E;
 
     // Map analog sticks (axes 0-1 for left stick, 3-4 for right stick)
-    // Y axes are inverted: Linux UP = negative, Switch UP = positive
+    // Linux UP = negative (-32767), Switch UP = positive (255). No invert needed.
     r.lx = apply_deadzone(pad.axes[0], false);
-    r.ly = apply_deadzone(pad.axes[1], true);
+    r.ly = apply_deadzone(pad.axes[1], false);
     r.rx = apply_deadzone(pad.axes[3], false);
-    r.ry = apply_deadzone(pad.axes[4], true);
+    r.ry = apply_deadzone(pad.axes[4], false);
 
     return r;
 }

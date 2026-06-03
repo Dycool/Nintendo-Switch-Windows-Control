@@ -142,14 +142,14 @@ int main(int argc, char** argv) {
         ns::HIDReport* out_reports[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
         int active_count = 0;
         
-        // Scan all 4 XInput slots and pack ONLY the connected ones sequentially to the front
+        // Scan all 4 XInput slots and assign to fixed physical slot
         for (DWORD i = 0; i < 4; ++i) {
             ns::HIDReport temp_rep;
             bool is_conn = false;
             fetch_pad_throttled(i, temp_rep, is_conn);
             
-            if (is_conn && active_count < 4) {
-                *out_reports[active_count] = temp_rep;
+            if (is_conn) {
+                *out_reports[i] = temp_rep; // Slot matches physical controller
                 active_count++;
             }
         }

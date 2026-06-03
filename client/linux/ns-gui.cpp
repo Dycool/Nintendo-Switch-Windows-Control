@@ -150,9 +150,9 @@ static ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
     else if (up) r.hat = ns::HAT_N; else if (down) r.hat = ns::HAT_S;
     else if (left) r.hat = ns::HAT_W; else if (right) r.hat = ns::HAT_E;
 
-    // Y axes are inverted: Linux UP = negative, Switch UP = positive
-    r.lx = apply_deadzone(pad.axes[0], false); r.ly = apply_deadzone(pad.axes[1], true);
-    r.rx = apply_deadzone(pad.axes[3], false); r.ry = apply_deadzone(pad.axes[4], true);
+    // Linux UP = negative (-32767), Switch UP = positive (255). No invert needed.
+    r.lx = apply_deadzone(pad.axes[0], false); r.ly = apply_deadzone(pad.axes[1], false);
+    r.rx = apply_deadzone(pad.axes[3], false); r.ry = apply_deadzone(pad.axes[4], false);
     return r;
 }
 

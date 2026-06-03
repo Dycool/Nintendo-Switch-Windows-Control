@@ -6,6 +6,14 @@
 #include <cstring>
 #include <chrono>
 
+// Portable packing: GCC/Clang use __attribute__, MSVC uses #pragma pack
+#ifdef _MSC_VER
+  #define NS_PACKED_ATTR
+  __pragma(pack(push, 1))
+#else
+  #define NS_PACKED_ATTR __attribute__((packed))
+#endif
+
 namespace ns {
 
 // ── Tuning Constants ──────────────────────────────────────────────────────────
@@ -55,7 +63,7 @@ struct HIDReport {
 
     bool operator==(const HIDReport& o) const noexcept { return std::memcmp(this, &o, sizeof(*this)) == 0; }
     bool operator!=(const HIDReport& o) const noexcept { return !(*this == o); }
-} __attribute__((packed));
+} NS_PACKED_ATTR;
 
 // 4-Player Composite Report
 struct MultiReport {
@@ -64,7 +72,7 @@ struct MultiReport {
     void reset() noexcept {
         p1.reset(); p2.reset(); p3.reset(); p4.reset();
     }
-} __attribute__((packed));
+} NS_PACKED_ATTR;
 
 
 // ── UDP Wire Packet ───────────────────────────────────────────────────────────
@@ -80,7 +88,7 @@ struct Packet {
     uint64_t    ts_us;         // Sender timestamp
     MultiReport report;        // Contains states for all 4 controllers
     uint8_t     hmac[HMAC_TAG_SIZE]; // Signature
-} __attribute__((packed));
+} NS_PACKED_ATTR;
 
 static constexpr std::size_t PACKET_SIZE      = sizeof(Packet);
 static constexpr std::size_t PACKET_AUTH_SIZE = PACKET_SIZE - HMAC_TAG_SIZE;
@@ -96,3 +104,7 @@ inline bool packet_ok(const Packet& p) noexcept {
 }
 
 } // namespace ns
+
+#ifdef _MSC_VER
+__pragma(pack(pop))
+#endif
