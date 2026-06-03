@@ -233,13 +233,13 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     };
 
     [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidConnectNotification
-        object:nil queue:nil usingBlock:^(NSNotification* note) {
+        object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification* note) {
             GCController* ctrl = (GCController*)note.object;
             assign_controller(ctrl);
     }];
 
     [NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidDisconnectNotification
-        object:nil queue:nil usingBlock:^(NSNotification* note) {
+        object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification* note) {
             GCController* ctrl = (GCController*)note.object;
             for (int i = 0; i < 4; ++i) {
                 if (self->controllers[i] == ctrl) {
@@ -323,13 +323,15 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     NSString* ipStr = [ipField stringValue];
     if ([ipStr length] == 0) return;
 
-    // Parse ip:port
-    char ipBuf[64];
-    [ipStr getCString:ipBuf maxLength:sizeof(ipBuf) encoding:NSUTF8StringEncoding];
+    // Parse ip:port safely
+    NSArray<NSString*> *parts = [ipStr componentsSeparatedByString:@":"];
+    NSString *host = parts.firstObject;
     int port = ns::DEFAULT_PORT;
-    char* colon = strchr(ipBuf, ':');
-    if (colon) { *colon = '\0'; port = atoi(colon + 1); if (port <= 0 || port > 65535) port = ns::DEFAULT_PORT; }
-    std::string stdIp(ipBuf);
+    if (parts.count > 1) {
+        port = [parts.lastObject intValue];
+        if (port <= 0 || port > 65535) port = ns::DEFAULT_PORT;
+    }
+    std::string stdIp([host UTF8String]);
 
     [[NSUserDefaults standardUserDefaults] setObject:ipStr forKey:@"lastIP"];
     derive_key(ns::DEFAULT_SECRET, hmacKey);
@@ -412,14 +414,14 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
 
     [connectBtn setTitle:@"Disconnect"];
     [ipField setEnabled:NO];
-    [statusField setStringValue:[NSString stringWithFormat:@"Connected to %s:%d", ipBuf, port]];
+    [statusField setStringValue:[NSString stringWithFormat:@"Connected to %@:%d", host, port]];
     [statusField setTextColor:[NSColor systemGreenColor]];
 }
 
 - (void)disconnect {
     connected = false;
     senderRunning = false;
-    if (senderThread.joinable()) senderThread.join();
+    if (senderThread.joinable()) senderThread.detach();
 
     [connectBtn setTitle:@"Connect"];
     [ipField setEnabled:YES];
