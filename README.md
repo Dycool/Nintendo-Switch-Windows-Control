@@ -13,6 +13,7 @@ This project was built from scratch in **C++** and uses **UDP** to get the lowes
 > **📦 Pre-compiled Binaries Available!**
 > You can download ready-to-use GUI/CLI clients and the Raspberry Pi server directly from the **[Releases](https://github.com/Dycool/NS-PC-Control/releases)** page.
 
+<video src="docs/demo.mp4" width="100%" controls autoplay muted loop></video>
 ---
 
 ## 🚀 Quick Start (Pre-compiled)
