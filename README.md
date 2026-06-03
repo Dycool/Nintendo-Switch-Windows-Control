@@ -8,7 +8,7 @@
 
 This project was built from scratch in **C++** and uses **UDP** to get the lowest possible latency. It's the ideal setup for playing NS games using your PC controller, avoiding the typical lag of Bluetooth or heavy script-based solutions.
 
-**🎮 Up to 4 players simultaneously** — Connect multiple controllers to a single PC and each gets its own physical slot (P1–P4).
+**🎮 Up to 4 players simultaneously** — Works with a single raspberry pi and a single PC.
 
 > **📦 Pre-compiled Binaries Available!**
 > You can download ready-to-use GUI/CLI clients and the Raspberry Pi server directly from the **[Releases](https://github.com/Dycool/NS-PC-Control/releases)** page.
