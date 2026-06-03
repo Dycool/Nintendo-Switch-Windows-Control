@@ -1,7 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-GADGET_DIR=/sys/kernel/config/usb_gadget/ns_procon
+MODE="HORI"
+if [[ "${1:-}" == "-m" ]]; then
+    MODE="GC"
+    echo "[gadget] Multiplayer flag detected. Building GameCube Hub..."
+else
+    echo "[gadget] Default mode. Building HORI Pokken Controller..."
+fi
+
+GADGET_DIR=/sys/kernel/config/usb_gadget/ns_ctrl
 STRINGS_DIR="$GADGET_DIR/strings/0x409"
 CONFIG_DIR="$GADGET_DIR/configs/c.1"
 CONFIG_STR="$CONFIG_DIR/strings/0x409"
@@ -30,38 +38,47 @@ fi
 
 # ── Create gadget ─────────────────────────────────────────────
 mkdir -p "$GADGET_DIR"
+mkdir -p "$STRINGS_DIR"
+mkdir -p "$CONFIG_DIR"
+mkdir -p "$CONFIG_STR"
+mkdir -p "$HID_FUNC"
 
-# HORI Pokken Tournament Controller USB IDs
-echo 0x0F0D > "$GADGET_DIR/idVendor"
-echo 0x0092 > "$GADGET_DIR/idProduct"
 echo 0x0200 > "$GADGET_DIR/bcdDevice"
 echo 0x0200 > "$GADGET_DIR/bcdUSB"
 echo 0xFF   > "$GADGET_DIR/bDeviceClass"
 echo 0xFF   > "$GADGET_DIR/bDeviceSubClass"
 echo 0xFF   > "$GADGET_DIR/bDeviceProtocol"
+echo 500    > "$CONFIG_DIR/MaxPower"
 
-mkdir -p "$STRINGS_DIR"
-echo "000000000001"      > "$STRINGS_DIR/serialnumber"
-echo "HORI CO., LTD." > "$STRINGS_DIR/manufacturer"
-echo "POKKEN CONTROLLER" > "$STRINGS_DIR/product"
-
-mkdir -p "$CONFIG_DIR"
-echo 500 > "$CONFIG_DIR/MaxPower"
-mkdir -p "$CONFIG_STR"
-echo "HORI Pokken Tournament Controller" > "$CONFIG_STR/configuration"
-
-# ── HID function ──────────────────────────────────────────────
-mkdir -p "$HID_FUNC"
-echo 0 > "$HID_FUNC/protocol"
-echo 0 > "$HID_FUNC/subclass"
-echo 8 > "$HID_FUNC/report_length"
-
-# HID Report Descriptor (HORI Pokken - EXACTLY 8 BYTES FORMAT)
-echo -ne '\x05\x01\x09\x05\xa1\x01\x15\x00\x25\x01\x35\x00\x45\x01\x75\x01\x95\x0d\x05\x09\x19\x01\x29\x0d\x81\x02\x95\x03\x81\x01\x05\x01\x25\x07\x46\x3b\x01\x75\x04\x95\x01\x65\x14\x09\x39\x81\x42\x65\x00\x95\x01\x81\x01\x26\xff\x00\x46\xff\x00\x09\x30\x09\x31\x09\x32\x09\x35\x75\x08\x95\x04\x81\x02\x06\x00\xff\x09\x20\x75\x08\x95\x01\x81\x02\xc0' > "$HID_FUNC/report_desc"
+if [[ "$MODE" == "GC" ]]; then
+    # GameCube Adapter IDs & Descriptor
+    echo 0x057E > "$GADGET_DIR/idVendor"
+    echo 0x0337 > "$GADGET_DIR/idProduct"
+    echo "Nintendo" > "$STRINGS_DIR/manufacturer"
+    echo "GameCube Controller Adapter" > "$STRINGS_DIR/product"
+    echo "GC Adapter Config" > "$CONFIG_STR/configuration"
+    
+    echo 0 > "$HID_FUNC/protocol"
+    echo 0 > "$HID_FUNC/subclass"
+    echo 37 > "$HID_FUNC/report_length"
+    echo -ne '\x06\x00\xFF\x09\x01\xA1\x01\x09\x01\x15\x00\x26\xFF\x00\x75\x08\x95\x25\x81\x02\x09\x02\x95\x05\x91\x02\xC0' > "$HID_FUNC/report_desc"
+else
+    # HORI Pokken IDs & Descriptor
+    echo 0x0F0D > "$GADGET_DIR/idVendor"
+    echo 0x0092 > "$GADGET_DIR/idProduct"
+    echo "000000000001"      > "$STRINGS_DIR/serialnumber"
+    echo "HORI CO., LTD." > "$STRINGS_DIR/manufacturer"
+    echo "POKKEN CONTROLLER" > "$STRINGS_DIR/product"
+    echo "HORI Pokken Tournament Controller" > "$CONFIG_STR/configuration"
+    
+    echo 0 > "$HID_FUNC/protocol"
+    echo 0 > "$HID_FUNC/subclass"
+    echo 8 > "$HID_FUNC/report_length"
+    echo -ne '\x05\x01\x09\x05\xa1\x01\x15\x00\x25\x01\x35\x00\x45\x01\x75\x01\x95\x0d\x05\x09\x19\x01\x29\x0d\x81\x02\x95\x03\x81\x01\x05\x01\x25\x07\x46\x3b\x01\x75\x04\x95\x01\x65\x14\x09\x39\x81\x42\x65\x00\x95\x01\x81\x01\x26\xff\x00\x46\xff\x00\x09\x30\x09\x31\x09\x32\x09\x35\x75\x08\x95\x04\x81\x02\x06\x00\xff\x09\x20\x75\x08\x95\x01\x81\x02\xc0' > "$HID_FUNC/report_desc"
+fi
 
 ln -sf "$HID_FUNC" "$CONFIG_DIR/"
 
-# ── Bind to UDC ───────────────────────────────────────────────
 UDC=$(ls /sys/class/udc/ 2>/dev/null | head -1)
 if [[ -z "$UDC" ]]; then
     echo "ERROR: No UDC found. Check dtoverlay=dwc2 in /boot/config.txt" >&2
