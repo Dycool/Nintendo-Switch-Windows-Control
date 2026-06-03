@@ -342,6 +342,16 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
         self->sock = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (self->sock < 0) return;
 
+        // Bind to a fixed local port so the backend identifies reconnects as the same PC
+        int opt = 1;
+        setsockopt(self->sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(self->sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+        struct sockaddr_in local_bind{};
+        local_bind.sin_family = AF_INET;
+        local_bind.sin_addr.s_addr = INADDR_ANY;
+        local_bind.sin_port = htons(42069);
+        ::bind(self->sock, (struct sockaddr*)&local_bind, sizeof(local_bind));
+
         struct addrinfo hints{}, *res = nullptr;
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_DGRAM;
@@ -356,12 +366,14 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
         freeaddrinfo(res);
 
         uint32_t seqCounter = 0;
+        bool first_packet = true;
 
         while (self->senderRunning.load(std::memory_order_relaxed)) {
             ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet)); 
             pkt.magic         = ns::PROTO_MAGIC;
             pkt.version       = ns::PROTO_VERSION;
-            pkt.flags         = ns::FLAG_NONE;
+            pkt.flags         = first_packet ? ns::FLAG_RESET : ns::FLAG_NONE;
+            first_packet      = false;
             pkt.seq           = seqCounter++;
             pkt.ts_us         = ns::now_us();
 
@@ -391,8 +403,8 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
 
             // FIX 3: Sleep instead of busy-waiting so we don't burn a full CPU core.
             auto interval = (active_count > 0)
-                ? std::chrono::milliseconds(2)
-                : std::chrono::milliseconds(500);
+        ? std::chrono::milliseconds(2)
+            : std::chrono::milliseconds(50); // keep connection alive below watchdog timeout
             std::this_thread::sleep_for(interval);
         }
         close(self->sock);
