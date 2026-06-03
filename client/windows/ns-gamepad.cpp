@@ -38,32 +38,40 @@ enum Hat : uint8_t {
 };
 
 #pragma pack(push, 1)
+
+// REMOVIDOS OS INLINE INITIALIZERS PARA TORNAR A ESTRUTURA "POD"
 struct HIDReport {
-    uint16_t buttons = 0;
-    uint8_t  hat     = HAT_NEUTRAL;
-    uint8_t  lx      = 128;
-    uint8_t  ly      = 128;
-    uint8_t  rx      = 128;
-    uint8_t  ry      = 128;
-    uint8_t  vendor  = 0;
+    uint16_t buttons;
+    uint8_t  hat;
+    uint8_t  lx;
+    uint8_t  ly;
+    uint8_t  rx;
+    uint8_t  ry;
+    uint8_t  vendor;
     
     void reset() noexcept { buttons = 0; hat = HAT_NEUTRAL; lx = ly = rx = ry = 128; vendor = 0; }
 };
 
 // ── 2. GameCube Structs ──
 struct GCController {
-    uint8_t status = 0x00, btn1 = 0, btn2 = 0;
-    uint8_t stick_x = 128, stick_y = 128, cstick_x = 128, cstick_y = 128;
-    uint8_t l_analog = 0, r_analog = 0;
+    uint8_t status, btn1, btn2;
+    uint8_t stick_x, stick_y, cstick_x, cstick_y;
+    uint8_t l_analog, r_analog;
+
+    void reset() noexcept {
+        status = 0x00; btn1 = 0; btn2 = 0;
+        stick_x = 128; stick_y = 128; cstick_x = 128; cstick_y = 128;
+        l_analog = 0; r_analog = 0;
+    }
 };
 
 struct GCHubReport {
-    uint8_t      id = 0x21;
+    uint8_t      id;
     GCController p1, p2, p3, p4;
 
     void reset() noexcept { 
         id = 0x21;
-        p1 = GCController{}; p2 = GCController{}; p3 = GCController{}; p4 = GCController{};
+        p1.reset(); p2.reset(); p3.reset(); p4.reset();
     }
 };
 
@@ -111,7 +119,9 @@ uint8_t apply_deadzone(SHORT val, bool invert = false, int deadzone = 8000) {
 }
 
 ns::HIDReport map_xinput_to_switch(const XINPUT_GAMEPAD& pad) {
-    ns::HIDReport r; r.reset();
+    ns::HIDReport r; 
+    r.reset(); // Garante a inicialização correta
+    
     if (pad.wButtons & XINPUT_GAMEPAD_A) r.buttons |= ns::BTN_B; 
     if (pad.wButtons & XINPUT_GAMEPAD_B) r.buttons |= ns::BTN_A;
     if (pad.wButtons & XINPUT_GAMEPAD_X) r.buttons |= ns::BTN_Y;
@@ -145,21 +155,16 @@ ns::HIDReport map_xinput_to_switch(const XINPUT_GAMEPAD& pad) {
     return r;
 }
 
-// ── XInput Throttling (PREVENTS WINDOWS CRASHES) ──
+// ── XInput Throttling ──
 static uint64_t g_last_check_us[4] = {0, 0, 0, 0};
 static bool g_is_connected[4] = {false, false, false, false};
 
 ns::GCController map_xinput_to_gc(DWORD index, bool& connected_out) {
     ns::GCController gc;
-    // Valores neutros seguros
-    gc.status = 0x00; gc.btn1 = 0; gc.btn2 = 0;
-    gc.stick_x = 128; gc.stick_y = 128; gc.cstick_x = 128; gc.cstick_y = 128;
-    gc.l_analog = 0;  gc.r_analog = 0;
+    gc.reset(); // Garante a inicialização neutra correta!
 
     uint64_t now = ns::now_us();
 
-    // BLOQUEIO: Se não estava conectado, testa apenas de 1 em 1 segundo!
-    // Isto impede que o Driver USB do Windows crash a aplicação devido a Spam.
     if (!g_is_connected[index] && (now - g_last_check_us[index] < 1'000'000)) {
         connected_out = false;
         return gc; 
@@ -177,7 +182,7 @@ ns::GCController map_xinput_to_gc(DWORD index, bool& connected_out) {
 
     g_is_connected[index] = true;
     connected_out = true;
-    gc.status = 0x10; // Conectado!
+    gc.status = 0x10; 
 
     const XINPUT_GAMEPAD& pad = state.Gamepad;
     if (pad.wButtons & XINPUT_GAMEPAD_A) gc.btn1 |= (1 << 0);
@@ -243,7 +248,6 @@ int main(int argc, char** argv) {
 
     char port_buf[8]; snprintf(port_buf, sizeof(port_buf), "%u", port);
     
-    // Safety check para evitar crashes se o IP for inválido
     if (getaddrinfo(host.c_str(), port_buf, &hints, &res) != 0 || res == nullptr) {
         std::cerr << "ERRO: Nao foi possivel resolver o IP: " << host << "\n";
         WSACleanup();
@@ -260,8 +264,8 @@ int main(int argc, char** argv) {
 
     while (true) {
         ns::Packet pkt;
-        // IMPORTANTE: Limpa TODO o lixo de memória da struct/union
-        // Sem isto o Windows mistura lixo com a password HMAC e a rede falha!
+        
+        // O memset agora é perfeitamente legal porque convertemos as tuas structs em "POD"
         memset(&pkt, 0, sizeof(ns::Packet)); 
 
         pkt.magic   = ns::PROTO_MAGIC;
