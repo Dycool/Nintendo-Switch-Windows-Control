@@ -82,11 +82,15 @@ void fetch_pad_throttled(DWORD index, ns::HIDReport& rep, bool& conn) {
 
     XINPUT_STATE state; ZeroMemory(&state, sizeof(XINPUT_STATE));
     if (XInputGetState(index, &state) != ERROR_SUCCESS) {
+        if (g_is_connected[index])
+            std::cout << "Controller in slot P" << (index + 1) << " disconnected.\n";
         g_is_connected[index] = false;
         g_last_check_us[index] = now;
         conn = false; return;
     }
     
+    if (!g_is_connected[index])
+        std::cout << "Mapped 'Xbox controller' to local slot P" << (index + 1) << "\n";
     g_is_connected[index] = true; conn = true;
     rep = map_xinput_to_switch(state.Gamepad);
 }
@@ -142,6 +146,8 @@ int main(int argc, char** argv) {
         ns::HIDReport* out_reports[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
         int active_count = 0;
         
+        static bool no_controllers_printed = false;
+        
         // Scan all 4 XInput slots and assign to fixed physical slot
         for (DWORD i = 0; i < 4; ++i) {
             ns::HIDReport temp_rep;
@@ -164,10 +170,19 @@ int main(int argc, char** argv) {
         sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));
         
         // Sleep to throttle transmission (~500Hz when active, 2Hz when idle)
-        if (active_count > 0) std::this_thread::sleep_for(std::chrono::milliseconds(2)); 
-        else std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (active_count > 0) {
+            no_controllers_printed = false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        } else {
+            if (!no_controllers_printed) {
+                std::cout << "No controllers detected — waiting for connections...\n";
+                no_controllers_printed = true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
     }
 
+    std::cout << "\nShutting down...\n";
     closesocket(sock); WSACleanup(); 
     return 0;
 }

@@ -81,6 +81,7 @@ void scan_for_gamepads() {
     if (now - last_scan < 1'000'000) return;
     last_scan = now;
 
+    static bool no_controllers_printed = false;
     int num = SDL_NumJoysticks();
     for (int i = 0; i < num; ++i) {
         if (!SDL_IsGameController(i)) continue;
@@ -104,10 +105,18 @@ void scan_for_gamepads() {
                 if (!pad) break;
                 g_pads[p] = pad;
                 const char* name = SDL_GameControllerName(pad);
-                std::cout << "🎮 [P" << (p + 1) << "] Connected: " << (name ? name : "Unknown") << "\n";
+                std::cout << "Mapped '" << (name ? name : "Unknown") << "' to local slot P" << (p + 1) << "\n";
                 break;
             }
         }
+    }
+    if (num == 0) {
+        if (!no_controllers_printed) {
+            std::cout << "No controllers detected — waiting for connections...\n";
+            no_controllers_printed = true;
+        }
+    } else {
+        no_controllers_printed = false;
     }
 }
 
@@ -117,7 +126,7 @@ void read_pad(int index, ns::HIDReport& rep, bool& conn) {
     if (!pad) { conn = false; return; }
 
     if (!SDL_GameControllerGetAttached(pad)) {
-        std::cout << "❌ [P" << (index + 1) << "] Disconnected\n";
+        std::cout << "Controller in slot P" << (index + 1) << " disconnected.\n";
         SDL_GameControllerClose(pad);
         g_pads[index] = nullptr;
         conn = false;
