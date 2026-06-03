@@ -49,8 +49,6 @@
 
 /// Thread-safe container for controller input state.
 struct GamepadState {
-    std::atomic<bool>  active{false};
-
     std::atomic<bool>  btn_a{false}, btn_b{false}, btn_x{false}, btn_y{false};
     std::atomic<bool>  btn_l{false}, btn_r{false};
     std::atomic<float> zl{0.0f}, zr{0.0f};
@@ -66,6 +64,7 @@ struct GamepadState {
         btn_lstick = false; btn_rstick = false;
         dpad_up = false; dpad_down = false; dpad_left = false; dpad_right = false;
         lx = 0.0f; ly = 0.0f; rx = 0.0f; ry = 0.0f;
+        // note: does not clear slotActive (managed separately)
     }
 };
 
@@ -184,6 +183,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     GamepadState  states[4];
     GCController* controllers[4];
     NSString* hwNames[4];
+    std::atomic<bool> slotActive[4];
 
     std::thread senderThread;
     std::atomic<bool> connected;
@@ -212,6 +212,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     for (int i = 0; i < 4; ++i) {
         controllers[i] = nil;
         hwNames[i] = @"";
+        slotActive[i] = false;
     }
 
     auto assign_controller = ^(GCController* ctrl) {
@@ -223,7 +224,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
         for (int i = 0; i < 4; ++i) {
             if (self->controllers[i] == nil) {
                 self->controllers[i] = ctrl;
-                self->states[i].active.store(true, std::memory_order_relaxed);
+                self->slotActive[i].store(true, std::memory_order_relaxed); // FIX 1
                 self->hwNames[i] = ctrl.vendorName ?: @"Unknown Controller";
                 attach_handlers(ctrl.extendedGamepad, &self->states[i]);
                 break;
@@ -243,7 +244,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
             for (int i = 0; i < 4; ++i) {
                 if (self->controllers[i] == ctrl) {
                     self->controllers[i] = nil;
-                    self->states[i].active.store(false, std::memory_order_relaxed);
+                    self->slotActive[i].store(false, std::memory_order_relaxed); // FIX 1
                     self->states[i].clear_inputs();
                     self->hwNames[i] = @"";
                     break;
@@ -355,29 +356,28 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
         freeaddrinfo(res);
 
         uint32_t seqCounter = 0;
-        auto next_tick = std::chrono::steady_clock::now();
 
         while (self->senderRunning.load(std::memory_order_relaxed)) {
-            while (std::chrono::steady_clock::now() < next_tick)
-                std::atomic_thread_fence(std::memory_order_relaxed);
-
             ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet)); 
             pkt.magic         = ns::PROTO_MAGIC;
             pkt.version       = ns::PROTO_VERSION;
             pkt.flags         = ns::FLAG_NONE;
             pkt.seq           = seqCounter++;
             pkt.ts_us         = ns::now_us();
-            
+
             pkt.report.reset(); // Hardware-neutral init
 
             ns::HIDReport* out_reports[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
             int active_count = 0;
 
             for (int i = 0; i < 4; ++i) {
-                if (self->states[i].active.load(std::memory_order_relaxed)) {
-                    *out_reports[active_count] = map_gc_to_switch(self->states[i]);
-                    active_count++;
-                }
+                // FIX 1: Read the atomic flag instead of the bare ObjC pointer.
+                if (!self->slotActive[i].load(std::memory_order_relaxed)) continue;
+
+                // FIX 2: Use slot index i directly so P2's data goes to report.p2,
+                // not remapped to p1 just because p1 is empty.
+                *out_reports[i] = map_gc_to_switch(self->states[i]);
+                active_count++;
             }
 
             {
@@ -388,9 +388,12 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
 
             sendto(self->sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
             self->packetCount++;
-            
-            if (active_count > 0) next_tick += std::chrono::milliseconds(2);
-            else next_tick += std::chrono::milliseconds(500);
+
+            // FIX 3: Sleep instead of busy-waiting so we don't burn a full CPU core.
+            auto interval = (active_count > 0)
+                ? std::chrono::milliseconds(2)
+                : std::chrono::milliseconds(500);
+            std::this_thread::sleep_for(interval);
         }
         close(self->sock);
     });
@@ -419,7 +422,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     
     // Always update gamepad connectivity status (whether connected to RPi or not)
     for (int i = 0; i < 4; ++i) {
-        if (states[i].active.load(std::memory_order_relaxed)) {
+        if (slotActive[i].load(std::memory_order_relaxed)) {
             [ctrlLabels[i] setStringValue:[NSString stringWithFormat:@"🎮 P%d: %@", i+1, hwNames[i]]];
             [ctrlLabels[i] setTextColor:[NSColor textColor]];
         } else {

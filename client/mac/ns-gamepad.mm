@@ -61,6 +61,12 @@ static constexpr int MAX_SLOTS = 4;
 static GamepadState  g_states[MAX_SLOTS];
 static GCController* g_controllers[MAX_SLOTS] = {};
 
+// FIX 1: Separate atomic flags so the sender thread can safely check slot
+// occupancy without touching the ObjC pointer (which is not atomic-safe with ARC).
+// Only the main thread reads/writes g_controllers[]; the sender thread only
+// reads g_slot_active[].
+static std::atomic<bool> g_slot_active[MAX_SLOTS] = {};
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Signal handling
 // ─────────────────────────────────────────────────────────────────────────────
@@ -256,12 +262,8 @@ int main(int argc, char** argv) {
     // ── Dedicated UDP sender thread ───────────────────────────────────────────
     std::thread sender([&]() {
         uint32_t seq = 0;
-        auto next_tick = std::chrono::steady_clock::now();
 
         while (g_running.load(std::memory_order_relaxed)) {
-            while (std::chrono::steady_clock::now() < next_tick)
-                std::atomic_thread_fence(std::memory_order_relaxed);
-
             ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet));
             pkt.magic   = ns::PROTO_MAGIC;
             pkt.version = ns::PROTO_VERSION;
@@ -275,8 +277,12 @@ int main(int argc, char** argv) {
             int active_count = 0;
 
             for (int i = 0; i < MAX_SLOTS; ++i) {
-                if (g_controllers[i] == nullptr) continue;
-                *out_reports[active_count] = map_gc_to_switch(g_states[i]);
+                // FIX 1: Read the atomic flag instead of the bare ObjC pointer.
+                if (!g_slot_active[i].load(std::memory_order_relaxed)) continue;
+
+                // FIX 2: Use slot index i directly so P2's data goes to report.p2,
+                // not remapped to p1 just because p1 is empty.
+                *out_reports[i] = map_gc_to_switch(g_states[i]);
                 active_count++;
             }
 
@@ -288,8 +294,11 @@ int main(int argc, char** argv) {
 
             sendto(sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
 
-            if (active_count > 0) next_tick += std::chrono::milliseconds(2);
-            else next_tick += std::chrono::milliseconds(500);
+            // FIX 3: Sleep instead of busy-waiting so we don't burn a full CPU core.
+            auto interval = (active_count > 0)
+                ? std::chrono::milliseconds(2)
+                : std::chrono::milliseconds(500);
+            std::this_thread::sleep_for(interval);
         }
     });
 
@@ -311,6 +320,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < MAX_SLOTS; ++i) {
             if (g_controllers[i] == nullptr) {
                 g_controllers[i] = ctrl;
+                g_slot_active[i].store(true, std::memory_order_relaxed); // FIX 1
                 NSString* name = ctrl.vendorName ?: @"Unknown Controller";
                 std::cout << "Mapped '" << name.UTF8String << "' to local slot P" << (i + 1) << "\n";
                 attach_handlers(ctrl.extendedGamepad, &g_states[i]);
@@ -326,6 +336,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < MAX_SLOTS; ++i) {
             if (g_controllers[i] == ctrl) {
                 g_controllers[i] = nullptr;
+                g_slot_active[i].store(false, std::memory_order_relaxed); // FIX 1
                 std::cout << "Controller in slot P" << (i + 1) << " disconnected.\n";
                 break;
             }
@@ -345,6 +356,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < MAX_SLOTS; ++i) {
             if (g_controllers[i] == nullptr) {
                 g_controllers[i] = ctrl;
+                g_slot_active[i].store(true, std::memory_order_relaxed); // FIX 1
                 NSString* name = ctrl.vendorName ?: @"Unknown Controller";
                 std::cout << "Mapped '" << name.UTF8String << "' to local slot P" << (i + 1) << "\n";
                 attach_handlers(ctrl.extendedGamepad, &g_states[i]);
