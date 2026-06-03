@@ -23,6 +23,7 @@
 #include <cstring>
 #include <atomic>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <mutex>
 
@@ -125,7 +126,7 @@ static uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8
 }
 
 // ── Input Mapping ──
-static ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
+static ns::HIDReport map_linux_js_to_switch(const GamepadState& pad, const char* hw_name) {
     ns::HIDReport r; r.reset();
     if (pad.buttons[0]) r.buttons |= ns::BTN_B; 
     if (pad.buttons[1]) r.buttons |= ns::BTN_A; 
@@ -144,15 +145,22 @@ static ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
 
     bool up = (pad.axes[7] < -16000), down = (pad.axes[7] > 16000);
     bool left = (pad.axes[6] < -16000), right = (pad.axes[6] > 16000);
-    r.hat = ns::HAT_NEUTRAL; // default neutral when D-pad is not pressed
+    r.hat = ns::HAT_NEUTRAL;
     if (up && right) r.hat = ns::HAT_NE; else if (up && left) r.hat = ns::HAT_NW;
     else if (down && right) r.hat = ns::HAT_SE; else if (down && left) r.hat = ns::HAT_SW;
     else if (up) r.hat = ns::HAT_N; else if (down) r.hat = ns::HAT_S;
     else if (left) r.hat = ns::HAT_W; else if (right) r.hat = ns::HAT_E;
 
-    // Linux UP = negative (-32767), Switch UP = positive (255). No invert needed.
+    // Detect Bluetooth/wireless axis layout — shifts right stick from 3/4 to 2/3
+    std::string name = hw_name;
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    bool wireless = (name.find("wireless") != std::string::npos ||
+                     name.find("bluetooth") != std::string::npos);
+    int rx_axis = wireless ? 2 : 3;
+    int ry_axis = wireless ? 3 : 4;
+
     r.lx = apply_deadzone(pad.axes[0], false); r.ly = apply_deadzone(pad.axes[1], false);
-    r.rx = apply_deadzone(pad.axes[3], false); r.ry = apply_deadzone(pad.axes[4], false);
+    r.rx = apply_deadzone(pad.axes[rx_axis], false); r.ry = apply_deadzone(pad.axes[ry_axis], false);
     return r;
 }
 
@@ -234,7 +242,7 @@ static void read_pad(int index, ns::HIDReport& rep, bool& conn) {
         }
     }
     conn = true;
-    rep = map_linux_js_to_switch(g_states[index]);
+    rep = map_linux_js_to_switch(g_states[index], g_hw_names[index]);
 }
 
 // ── Network Sender Thread ──

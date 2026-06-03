@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cmath>
+#include <cctype>
 #include <atomic>
 #include <csignal>
 #include <string>
@@ -70,6 +71,7 @@ struct GamepadState {
 static GamepadState g_states[4];
 static int          g_fds[4] = {-1, -1, -1, -1};
 static std::string  g_dev_paths[4] = {"", "", "", ""};
+static char         g_hw_names[4][128] = {{0}};
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Signal handling
@@ -103,7 +105,7 @@ uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8000) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Convert Linux joystick state to Switch Pro Controller HID report format
-ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
+ns::HIDReport map_linux_js_to_switch(const GamepadState& pad, const char* hw_name) {
     ns::HIDReport r;
     r.reset();
 
@@ -117,7 +119,7 @@ ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
     if (pad.buttons[4]) r.buttons |= ns::BTN_L; 
     if (pad.buttons[5]) r.buttons |= ns::BTN_R; 
     
-    // Map trigger buttons via analog axes (axes 2 and 5 on many gamepads)
+    // Map trigger buttons via analog axes
     if (pad.axes[2] > 0) r.buttons |= ns::BTN_ZL;
     if (pad.axes[5] > 0) r.buttons |= ns::BTN_ZR;
 
@@ -145,7 +147,7 @@ ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
     bool left  = (pad.axes[6] < -16000);
     bool right = (pad.axes[6] >  16000);
 
-    r.hat = ns::HAT_NEUTRAL; // default neutral when D-pad is not pressed
+    r.hat = ns::HAT_NEUTRAL;
 
     if      (up && right)   r.hat = ns::HAT_NE;
     else if (up && left)    r.hat = ns::HAT_NW;
@@ -156,12 +158,19 @@ ns::HIDReport map_linux_js_to_switch(const GamepadState& pad) {
     else if (left)          r.hat = ns::HAT_W;
     else if (right)         r.hat = ns::HAT_E;
 
-    // Map analog sticks (axes 0-1 for left stick, 3-4 for right stick)
-    // Linux UP = negative (-32767), Switch UP = positive (255). No invert needed.
+    // Detect Bluetooth/wireless axis layout — shifts right stick from 3/4 to 2/3
+    std::string name = hw_name;
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    bool wireless = (name.find("wireless") != std::string::npos ||
+                     name.find("bluetooth") != std::string::npos);
+    int rx_axis = wireless ? 2 : 3;
+    int ry_axis = wireless ? 3 : 4;
+
+    // Map analog sticks
     r.lx = apply_deadzone(pad.axes[0], false);
     r.ly = apply_deadzone(pad.axes[1], false);
-    r.rx = apply_deadzone(pad.axes[3], false);
-    r.ry = apply_deadzone(pad.axes[4], false);
+    r.rx = apply_deadzone(pad.axes[rx_axis], false);
+    r.ry = apply_deadzone(pad.axes[ry_axis], false);
 
     return r;
 }
@@ -220,6 +229,7 @@ void scan_for_gamepads() {
                 if (g_fds[p] < 0) {
                     g_fds[p] = fd;
                     g_dev_paths[p] = path;
+                    strncpy(g_hw_names[p], hw_name.c_str(), sizeof(g_hw_names[p]) - 1);
                     g_states[p].clear_inputs();
                     std::cout << "🎮 [P" << (p + 1) << "] Connected: " << hw_name << " (" << path << ")\n";
                     assigned = true;
@@ -268,6 +278,7 @@ void read_pad(int index, ns::HIDReport& rep, bool& conn) {
                 close(g_fds[index]);
                 g_fds[index] = -1;
                 g_dev_paths[index] = "";
+                g_hw_names[index][0] = '\0';
                 conn = false;
                 return;
             }
@@ -276,7 +287,7 @@ void read_pad(int index, ns::HIDReport& rep, bool& conn) {
     }
 
     conn = true;
-    rep = map_linux_js_to_switch(g_states[index]);
+    rep = map_linux_js_to_switch(g_states[index], g_hw_names[index]);
 }
 
 
