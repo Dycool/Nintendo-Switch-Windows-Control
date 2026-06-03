@@ -17,8 +17,9 @@
 #include "sha256.h"            
 
 // Import external protocol structures
-#include "../../server/rpi/include/protocol.hpp"
+#include "protocol.hpp"
 
+// Applies deadzone to an analog stick axis
 uint8_t apply_deadzone(SHORT val, bool invert = false, int deadzone = 8000) {
     if (val > -deadzone && val < deadzone) return 128;
     int scaled;
@@ -28,6 +29,7 @@ uint8_t apply_deadzone(SHORT val, bool invert = false, int deadzone = 8000) {
     return (uint8_t)(invert ? (255 - scaled) : scaled);
 }
 
+// Maps XInput layout to Switch Pro Controller layout
 ns::HIDReport map_xinput_to_switch(const XINPUT_GAMEPAD& pad) {
     ns::HIDReport r; r.reset();
     if (pad.wButtons & XINPUT_GAMEPAD_A) r.buttons |= ns::BTN_B; 
@@ -43,6 +45,7 @@ ns::HIDReport map_xinput_to_switch(const XINPUT_GAMEPAD& pad) {
     if (pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB)  r.buttons |= ns::BTN_LSTICK;
     if (pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) r.buttons |= ns::BTN_RSTICK;
 
+    // Emulate HOME and CAPTURE buttons using button combos
     if ((pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) && (pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB)) {
         r.buttons |= ns::BTN_HOME; r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK);
     }
@@ -63,13 +66,16 @@ ns::HIDReport map_xinput_to_switch(const XINPUT_GAMEPAD& pad) {
     return r;
 }
 
-// ── XInput Throttling (Prevents USB driver crash) ──
+// ── XInput Throttling (Prevents USB driver crash on Windows) ──
 static uint64_t g_last_check_us[4] = {0, 0, 0, 0};
 static bool g_is_connected[4] = {false, false, false, false};
 
+// Checks for controller status efficiently and maps its inputs
 void fetch_pad_throttled(DWORD index, ns::HIDReport& rep, bool& conn) {
     rep.reset();
     uint64_t now = ns::now_us();
+    
+    // Only poll disconnected controllers once per second to save CPU and USB bandwidth
     if (!g_is_connected[index] && (now - g_last_check_us[index] < 1'000'000)) {
         conn = false; return; 
     }
@@ -80,24 +86,22 @@ void fetch_pad_throttled(DWORD index, ns::HIDReport& rep, bool& conn) {
         g_last_check_us[index] = now;
         conn = false; return;
     }
+    
     g_is_connected[index] = true; conn = true;
     rep = map_xinput_to_switch(state.Gamepad);
 }
 
-
 int main(int argc, char** argv) {
     std::string host = ""; uint16_t port = ns::DEFAULT_PORT;
-    bool multiplayer = false; DWORD ctrl_index = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-m") multiplayer = true;
+        if (arg == "-p" && i+1 < argc) port = (uint16_t)std::atoi(argv[++i]);
         else if (host.empty()) host = arg;
-        else ctrl_index = (DWORD)std::clamp(std::atoi(arg.c_str()), 0, 3);
     }
 
     if (host.empty()) {
-        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP> [-m] [controller_index]\n";
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP> [-p PORT]\n";
         return 1;
     }
 
@@ -120,7 +124,7 @@ int main(int argc, char** argv) {
     sockaddr_in dest{}; memcpy(&dest, res->ai_addr, sizeof(dest));
     freeaddrinfo(res);
 
-    std::cout << "Started in " << (multiplayer ? "MULTI (4x HORI)" : "SINGLE (HORI)") << " Mode...\n";
+    std::cout << "Started in 4-Player Hub Mode... Connect Xbox controllers and enjoy!\n";
     uint32_t seq = 0;
 
     while (true) {
@@ -131,21 +135,18 @@ int main(int argc, char** argv) {
         pkt.seq     = seq++;
         pkt.ts_us   = ns::now_us();
 
-        bool any_connected = false;
+        bool c1, c2, c3, c4;
+        
+        // Scan all 4 XInput slots
+        fetch_pad_throttled(0, pkt.report.p1, c1);
+        fetch_pad_throttled(1, pkt.report.p2, c2);
+        fetch_pad_throttled(2, pkt.report.p3, c3);
+        fetch_pad_throttled(3, pkt.report.p4, c4);
+        
+        bool any_connected = (c1 || c2 || c3 || c4);
+        if (!any_connected) pkt.report.reset();
 
-        if (multiplayer) {
-            bool c1, c2, c3, c4;
-            fetch_pad_throttled(0, pkt.payload.multi.p1, c1);
-            fetch_pad_throttled(1, pkt.payload.multi.p2, c2);
-            fetch_pad_throttled(2, pkt.payload.multi.p3, c3);
-            fetch_pad_throttled(3, pkt.payload.multi.p4, c4);
-            any_connected = (c1 || c2 || c3 || c4);
-            if (!any_connected) pkt.payload.multi.reset();
-        } else {
-            fetch_pad_throttled(ctrl_index, pkt.payload.single, any_connected);
-            if (!any_connected) pkt.payload.single.reset();
-        }
-
+        // Sign packet
         {
             uint8_t full_hmac[32];
             hmac_sha256(hmac_key, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
@@ -154,6 +155,7 @@ int main(int argc, char** argv) {
 
         sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));
         
+        // Sleep to throttle transmission (~500Hz when active, 2Hz when idle)
         if (any_connected) std::this_thread::sleep_for(std::chrono::milliseconds(2)); 
         else std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
