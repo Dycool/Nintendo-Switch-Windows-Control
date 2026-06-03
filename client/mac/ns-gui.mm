@@ -216,6 +216,10 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
 
     auto assign_controller = ^(GCController* ctrl) {
         if (!ctrl.extendedGamepad) return;
+        // Prevent double-assignment (notification may fire for already-connected controllers)
+        for (int i = 0; i < 4; ++i) {
+            if (self->controllers[i] == ctrl) return;
+        }
         for (int i = 0; i < 4; ++i) {
             if (self->controllers[i] == nil) {
                 self->controllers[i] = ctrl;
