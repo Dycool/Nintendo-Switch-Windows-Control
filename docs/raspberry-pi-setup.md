@@ -55,14 +55,14 @@ sudo nano /etc/systemd/system/ns-control.service
 2. Paste the following configuration. **Important:** Adjust the `/home/YOUR_USER/...` paths to match the exact location of your downloaded or cloned repository files!
 ```ini
 [Unit]
-Description=Nintendo Switch PC Control Backend
+Description=NS PC Control Backend
 After=network.target
 
 [Service]
 # Run the gadget script before starting the backend
-ExecStartPre=/bin/bash /home/YOUR_USER/Nintendo-Switch-PC-Control/backend/rpi/setup_gadget.sh
+ExecStartPre=/bin/bash /home/YOUR_USER/NS-PC-Control/backend/rpi/setup_gadget.sh
 # Start the backend with real-time priority
-ExecStart=/usr/bin/chrt -f 99 /home/YOUR_USER/Nintendo-Switch-PC-Control/backend/rpi/ns-backend
+ExecStart=/usr/bin/chrt -f 99 /home/YOUR_USER/NS-PC-Control/backend/rpi/ns-backend
 Restart=always
 RestartSec=5
 User=root
