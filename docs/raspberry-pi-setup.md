@@ -60,9 +60,9 @@ After=network.target
 
 [Service]
 # Run the gadget script before starting the backend
-ExecStartPre=/bin/bash /home/YOUR_USER/NS-PC-Control/backend/rpi/setup_gadget.sh
+ExecStartPre=/bin/bash /home/YOUR_USER/NS-PC-Control/server/rpi/setup_gadget.sh
 # Start the backend with real-time priority
-ExecStart=/usr/bin/chrt -f 99 /home/YOUR_USER/NS-PC-Control/backend/rpi/ns-backend
+ExecStart=/usr/bin/chrt -f 99 /home/YOUR_USER/NS-PC-Control/server/rpi/ns-backend
 Restart=always
 RestartSec=5
 User=root

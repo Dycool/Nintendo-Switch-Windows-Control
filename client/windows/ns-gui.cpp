@@ -6,6 +6,7 @@
 #define _UNICODE
 
 #include <windows.h>
+#include <mmsystem.h>
 #include <windowsx.h>
 #include <commctrl.h>
 #include <winsock2.h>
@@ -39,7 +40,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 // ── Protocol ──
 namespace ns {
 static constexpr uint32_t PROTO_MAGIC   = 0x4E535743u;
-static constexpr uint8_t  PROTO_VERSION = 1;
+static constexpr uint8_t  PROTO_VERSION = 4;
 static constexpr uint16_t DEFAULT_PORT  = 7331;
 static constexpr const char* DEFAULT_SECRET = "nsc-R2xvCy7Eyw2nfbZIOGyKZPnostpaRY";
 static constexpr size_t HMAC_TAG_SIZE = 16;
@@ -51,16 +52,20 @@ enum Button : uint16_t {
     BTN_HOME=1<<12, BTN_CAPTURE=1<<13,
 };
 enum Hat : uint8_t { HAT_N=0, HAT_NE=1, HAT_E=2, HAT_SE=3, HAT_S=4, HAT_SW=5, HAT_W=6, HAT_NW=7, HAT_NEUTRAL=8 };
+enum Flags : uint8_t { FLAG_NONE=0x00, FLAG_RESET=0x01, FLAG_AUTOFIRE=0x02 };
 #pragma pack(push, 1)
 struct HIDReport {
     uint16_t buttons = 0; uint8_t hat = HAT_NEUTRAL;
     uint8_t lx=128, ly=128, rx=128, ry=128, vendor=0;
     void reset() noexcept { *this = HIDReport{}; }
 };
-enum Flags : uint8_t { FLAG_NONE=0x00, FLAG_RESET=0x01, FLAG_AUTOFIRE=0x02 };
+struct MultiReport {
+    HIDReport p1, p2, p3, p4;
+    void reset() noexcept { p1.reset(); p2.reset(); p3.reset(); p4.reset(); }
+};
 struct Packet {
     uint32_t magic; uint8_t version; uint8_t flags; uint16_t autofire_mask;
-    uint32_t seq; uint64_t ts_us; HIDReport report; uint8_t hmac[HMAC_TAG_SIZE];
+    uint32_t seq; uint64_t ts_us; MultiReport report; uint8_t hmac[HMAC_TAG_SIZE];
 };
 #pragma pack(pop)
 static constexpr size_t PACKET_SIZE = sizeof(Packet);
@@ -73,140 +78,76 @@ inline uint64_t now_us() noexcept {
 
 #include "../../server/rpi/include/sha256.h"
 
-// ── Controller info ──
-struct ControllerEntry {
-    int id;
-    std::wstring name;
-    DWORD xinputSlot;
-    bool connected;
-};
+// ── Throttled XInput polling (4-Player) ──
+static uint64_t g_last_check_us[4] = {0, 0, 0, 0};
+static bool     g_is_connected[4]  = {false, false, false, false};
 
-// ── Scan controllers via XInput ──
-static std::vector<ControllerEntry> ScanControllers() {
-    std::vector<ControllerEntry> entries;
-    int nextId = 0;
-
-    for (DWORD i = 0; i < 4; i++) {
-        XINPUT_CAPABILITIES caps{};
-        if (XInputGetCapabilities(i, 0, &caps) != ERROR_SUCCESS) continue;
-
-        std::wstring name = L"Controller " + std::to_wstring(i + 1);
-        // Try to get a friendly name from HID enumeration
-        HDEVINFO hDevInfo = SetupDiGetClassDevs(&GUID_DEVCLASS_HIDCLASS, nullptr, nullptr, DIGCF_PRESENT);
-        if (hDevInfo != INVALID_HANDLE_VALUE) {
-            int xinputIdx = 0;
-            for (DWORD j = 0; ; j++) {
-                SP_DEVINFO_DATA devInfo{ sizeof(SP_DEVINFO_DATA) };
-                if (!SetupDiEnumDeviceInfo(hDevInfo, j, &devInfo)) break;
-                BYTE hwIdBuf[512]{};
-                if (!SetupDiGetDeviceRegistryProperty(hDevInfo, &devInfo, SPDRP_HARDWAREID,
-                    nullptr, hwIdBuf, sizeof(hwIdBuf), nullptr))
-                    continue;
-                std::string hwId((const char*)hwIdBuf);
-                if (hwId.find("IG_") == std::string::npos && hwId.find("VID_045E") == std::string::npos)
-                    continue;
-                if (xinputIdx++ != (int)i) continue;
-                WCHAR friendlyName[256]{};
-                if (SetupDiGetDeviceRegistryProperty(hDevInfo, &devInfo, SPDRP_FRIENDLYNAME,
-                    nullptr, (PBYTE)friendlyName, sizeof(friendlyName), nullptr)) {
-                    name = friendlyName;
-                }
-                break;
-            }
-            SetupDiDestroyDeviceInfoList(hDevInfo);
-        }
-
-        ControllerEntry entry;
-        entry.id = nextId++;
-        entry.name = name;
-        entry.xinputSlot = i;
-        entry.connected = true;
-        entries.push_back(entry);
-    }
-    return entries;
+static uint8_t apply_deadzone(SHORT val, bool invert = false, int deadzone = 8000) {
+    if (val > -deadzone && val < deadzone) return 128;
+    int scaled;
+    if (val >= deadzone) scaled = 128 + ((val - deadzone) * 127) / (32767 - deadzone);
+    else                 scaled = 128 - ((abs(val) - deadzone) * 128) / (32768 - deadzone);
+    scaled = std::clamp(scaled, 0, 255);
+    return (uint8_t)(invert ? (255 - scaled) : scaled);
 }
 
-// ── Abstract controller reader ──
-class ControllerReader {
-public:
-    virtual ~ControllerReader() = default;
-    virtual bool Read(ns::HIDReport& report) = 0;
-    virtual std::wstring GetName() = 0;
-};
-
-// ── XInput reader ──
-class XInputReader : public ControllerReader {
-    DWORD slot;
-    std::wstring name;
-public:
-    XInputReader(DWORD slot, const std::wstring& name) : slot(slot), name(name) {}
-    bool Read(ns::HIDReport& report) override {
-        XINPUT_STATE state{};
-        if (XInputGetState(slot, &state) != ERROR_SUCCESS)
-            return false;
-
-        report.reset();
-        auto& pad = state.Gamepad;
-        if (pad.wButtons & XINPUT_GAMEPAD_A) report.buttons |= ns::BTN_B;
-        if (pad.wButtons & XINPUT_GAMEPAD_B) report.buttons |= ns::BTN_A;
-        if (pad.wButtons & XINPUT_GAMEPAD_X) report.buttons |= ns::BTN_Y;
-        if (pad.wButtons & XINPUT_GAMEPAD_Y) report.buttons |= ns::BTN_X;
-        if (pad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER)  report.buttons |= ns::BTN_L;
-        if (pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) report.buttons |= ns::BTN_R;
-        if (pad.bLeftTrigger > 128)  report.buttons |= ns::BTN_ZL;
-        if (pad.bRightTrigger > 128) report.buttons |= ns::BTN_ZR;
-        if (pad.wButtons & XINPUT_GAMEPAD_BACK)  report.buttons |= ns::BTN_MINUS;
-        if (pad.wButtons & XINPUT_GAMEPAD_START) report.buttons |= ns::BTN_PLUS;
-        if (pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB)  report.buttons |= ns::BTN_LSTICK;
-        if (pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) report.buttons |= ns::BTN_RSTICK;
-        if ((pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) && (pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB)) {
-            report.buttons |= ns::BTN_HOME;
-            report.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK);
-        }
-        if ((pad.wButtons & XINPUT_GAMEPAD_BACK) && (pad.wButtons & XINPUT_GAMEPAD_START)) {
-            report.buttons |= ns::BTN_CAPTURE;
-            report.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS);
-        }
-        bool up = (pad.wButtons & XINPUT_GAMEPAD_DPAD_UP);
-        bool down = (pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN);
-        bool left = (pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT);
-        bool right = (pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT);
-        if (up && right)       report.hat = ns::HAT_NE;
-        else if (up && left)   report.hat = ns::HAT_NW;
-        else if (down && right)report.hat = ns::HAT_SE;
-        else if (down && left) report.hat = ns::HAT_SW;
-        else if (up)           report.hat = ns::HAT_N;
-        else if (down)         report.hat = ns::HAT_S;
-        else if (left)         report.hat = ns::HAT_W;
-        else if (right)        report.hat = ns::HAT_E;
-
-        auto apply = [](SHORT val, bool inv, int dz = 8000) -> uint8_t {
-            if (val > -dz && val < dz) return 128;
-            int s;
-            if (val >= dz) s = 128 + ((val - dz) * 127) / (32767 - dz);
-            else s = 128 - ((abs(val) - dz) * 128) / (32768 - dz);
-            s = std::clamp(s, 0, 255);
-            return (uint8_t)(inv ? (255 - s) : s);
-        };
-        report.lx = apply(pad.sThumbLX, false);
-        report.ly = apply(pad.sThumbLY, true);
-        report.rx = apply(pad.sThumbRX, false);
-        report.ry = apply(pad.sThumbRY, true);
-        return true;
+static ns::HIDReport map_xinput_to_switch(const XINPUT_GAMEPAD& pad) {
+    ns::HIDReport r; r.reset();
+    if (pad.wButtons & XINPUT_GAMEPAD_A) r.buttons |= ns::BTN_B;
+    if (pad.wButtons & XINPUT_GAMEPAD_B) r.buttons |= ns::BTN_A;
+    if (pad.wButtons & XINPUT_GAMEPAD_X) r.buttons |= ns::BTN_Y;
+    if (pad.wButtons & XINPUT_GAMEPAD_Y) r.buttons |= ns::BTN_X;
+    if (pad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER)  r.buttons |= ns::BTN_L;
+    if (pad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) r.buttons |= ns::BTN_R;
+    if (pad.bLeftTrigger > 128)  r.buttons |= ns::BTN_ZL;
+    if (pad.bRightTrigger > 128) r.buttons |= ns::BTN_ZR;
+    if (pad.wButtons & XINPUT_GAMEPAD_BACK)  r.buttons |= ns::BTN_MINUS;
+    if (pad.wButtons & XINPUT_GAMEPAD_START) r.buttons |= ns::BTN_PLUS;
+    if (pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB)  r.buttons |= ns::BTN_LSTICK;
+    if (pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) r.buttons |= ns::BTN_RSTICK;
+    if ((pad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) && (pad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB)) {
+        r.buttons |= ns::BTN_HOME; r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK);
     }
-    std::wstring GetName() override { return name; }
-};
+    if ((pad.wButtons & XINPUT_GAMEPAD_BACK) && (pad.wButtons & XINPUT_GAMEPAD_START)) {
+        r.buttons |= ns::BTN_CAPTURE; r.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS);
+    }
+    bool up = (pad.wButtons & XINPUT_GAMEPAD_DPAD_UP), down = (pad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN);
+    bool left = (pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT), right = (pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT);
+    if (up && right) r.hat = ns::HAT_NE; else if (up && left) r.hat = ns::HAT_NW;
+    else if (down && right) r.hat = ns::HAT_SE; else if (down && left) r.hat = ns::HAT_SW;
+    else if (up) r.hat = ns::HAT_N; else if (down) r.hat = ns::HAT_S;
+    else if (left) r.hat = ns::HAT_W; else if (right) r.hat = ns::HAT_E;
+    r.lx = apply_deadzone(pad.sThumbLX, false); r.ly = apply_deadzone(pad.sThumbLY, true);
+    r.rx = apply_deadzone(pad.sThumbRX, false); r.ry = apply_deadzone(pad.sThumbRY, true);
+    return r;
+}
+
+static void fetch_pad_throttled(DWORD index, ns::HIDReport& rep, bool& conn) {
+    rep.reset();
+    uint64_t now = ns::now_us();
+    if (!g_is_connected[index] && (now - g_last_check_us[index] < 1'000'000)) {
+        conn = false; return;
+    }
+    XINPUT_STATE state; ZeroMemory(&state, sizeof(XINPUT_STATE));
+    if (XInputGetState(index, &state) != ERROR_SUCCESS) {
+        g_is_connected[index] = false;
+        g_last_check_us[index] = now;
+        conn = false; return;
+    }
+    g_is_connected[index] = true; conn = true;
+    rep = map_xinput_to_switch(state.Gamepad);
+}
 
 // ── Global UI state ──
 static HINSTANCE g_hInst = nullptr;
 static HWND g_hWnd = nullptr;
 static HWND g_hIpEdit = nullptr;
-static HWND g_hCtrlCombo = nullptr;
 static HWND g_hConnectBtn = nullptr;
 static HWND g_hStatusText = nullptr;
-static HWND g_hCtrlNameText = nullptr;
-
-static HWND g_hRefreshBtn = nullptr;
+static HWND g_hP1Text = nullptr;
+static HWND g_hP2Text = nullptr;
+static HWND g_hP3Text = nullptr;
+static HWND g_hP4Text = nullptr;
 
 static std::atomic<bool> g_senderRunning{false};
 static std::atomic<bool> g_connected{false};
@@ -216,11 +157,9 @@ static uint8_t g_hmacKey[32]{};
 static uint32_t g_packetCount = 0;
 static std::string g_targetHost;
 static uint16_t g_targetPort = ns::DEFAULT_PORT;
-static std::vector<ControllerEntry> g_controllers;
-static std::unique_ptr<ControllerReader> g_reader;
 
 // ── Registry helpers ──
-static const wchar_t* REG_KEY = L"Software\\NintendoSwitchPCControl";
+static const wchar_t* REG_KEY = L"Software\\NSPCControl";
 static const wchar_t* REG_VAL_IP = L"LastIP";
 
 static std::wstring LoadSavedIP() {
@@ -246,7 +185,7 @@ static void SaveLastIP(const wchar_t* ip) {
 }
 
 // ── Control IDs ──
-enum { IDC_IP = 101, IDC_CTRL, IDC_CONNECT, IDC_REFRESH };
+enum { IDC_IP = 101, IDC_CONNECT };
 
 // ── Create a modern button with theme support ──
 static HWND CreateButton(HWND parent, const wchar_t* text, int x, int y, int w, int h, int id) {
@@ -259,7 +198,7 @@ static HWND CreateButton(HWND parent, const wchar_t* text, int x, int y, int w, 
     return hw;
 }
 
-// ── Sender thread ──
+// ── Sender thread (4-Player) ──
 static void SenderThread() {
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock == INVALID_SOCKET) return;
@@ -282,72 +221,52 @@ static void SenderThread() {
     uint32_t seq = 0;
 
     while (g_senderRunning) {
-        ns::HIDReport report;
-        if (g_reader && g_reader->Read(report)) {
-            ns::Packet pkt{};
-            pkt.magic = ns::PROTO_MAGIC;
-            pkt.version = ns::PROTO_VERSION;
-            pkt.flags = ns::FLAG_NONE;
-            pkt.seq = seq++;
-            pkt.ts_us = ns::now_us();
-            pkt.report = report;
-            {
-                uint8_t fullHmac[32];
-                hmac_sha256(g_hmacKey, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, fullHmac);
-                memcpy(pkt.hmac, fullHmac, ns::HMAC_TAG_SIZE);
-            }
-            sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));
-            g_packetCount++;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        } else {
-            // Send neutral
-            ns::Packet pkt{};
-            pkt.magic = ns::PROTO_MAGIC;
-            pkt.version = ns::PROTO_VERSION;
-            pkt.flags = ns::FLAG_NONE;
-            pkt.seq = seq++;
-            pkt.ts_us = ns::now_us();
-            pkt.report.reset();
-            {
-                uint8_t fullHmac[32];
-                hmac_sha256(g_hmacKey, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, fullHmac);
-                memcpy(pkt.hmac, fullHmac, ns::HMAC_TAG_SIZE);
-            }
-            sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        ns::Packet pkt{}; memset(&pkt, 0, sizeof(ns::Packet));
+        pkt.magic   = ns::PROTO_MAGIC;
+        pkt.version = ns::PROTO_VERSION;
+        pkt.flags   = ns::FLAG_NONE;
+        pkt.seq     = seq++;
+        pkt.ts_us   = ns::now_us();
+
+        bool c1, c2, c3, c4;
+        fetch_pad_throttled(0, pkt.report.p1, c1);
+        fetch_pad_throttled(1, pkt.report.p2, c2);
+        fetch_pad_throttled(2, pkt.report.p3, c3);
+        fetch_pad_throttled(3, pkt.report.p4, c4);
+
+        bool any_connected = (c1 || c2 || c3 || c4);
+        if (!any_connected) pkt.report.reset();
+
+        {
+            uint8_t fullHmac[32];
+            hmac_sha256(g_hmacKey, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, fullHmac);
+            memcpy(pkt.hmac, fullHmac, ns::HMAC_TAG_SIZE);
         }
+
+        sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));
+        g_packetCount++;
+
+        if (any_connected) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        else std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
     closesocket(sock);
     g_sock = INVALID_SOCKET;
 }
 
-// ── Refresh controller list ──
-static void RefreshControllerList() {
-    int prevSel = ComboBox_GetCurSel(g_hCtrlCombo);
-    DWORD prevSlot = (prevSel >= 0) ? (DWORD)ComboBox_GetItemData(g_hCtrlCombo, prevSel) : (DWORD)-1;
-
-    g_controllers = ScanControllers();
-    ComboBox_ResetContent(g_hCtrlCombo);
-
-    int newSel = -1;
-    for (size_t i = 0; i < g_controllers.size(); i++) {
-        int idx = (int)ComboBox_AddString(g_hCtrlCombo, g_controllers[i].name.c_str());
-        ComboBox_SetItemData(g_hCtrlCombo, idx, g_controllers[i].id);
-        if (g_controllers[i].id == (int)prevSlot)
-            newSel = (int)i;
-    }
-    if (newSel >= 0)
-        ComboBox_SetCurSel(g_hCtrlCombo, newSel);
-    else if (g_controllers.size() > 0)
-        ComboBox_SetCurSel(g_hCtrlCombo, 0);
-
-    if (g_controllers.empty()) {
-        SetWindowText(g_hCtrlNameText, L"No controllers detected");
-        EnableWindow(g_hConnectBtn, FALSE);
-    } else {
-        SetWindowText(g_hCtrlNameText, L"");
-        EnableWindow(g_hConnectBtn, TRUE);
+// ── Update P1-P4 status display ──
+static void UpdateControllerStatus() {
+    wchar_t buf[64];
+    HWND hText[4] = { g_hP1Text, g_hP2Text, g_hP3Text, g_hP4Text };
+    for (DWORD i = 0; i < 4; i++) {
+        XINPUT_CAPABILITIES caps{};
+        bool present = (XInputGetCapabilities(i, 0, &caps) == ERROR_SUCCESS);
+        if (g_connected) {
+            swprintf(buf, 64, L"P%d: %s", i + 1, g_is_connected[i] ? L"Connected" : L"Idle");
+        } else {
+            swprintf(buf, 64, L"P%d: %s", i + 1, present ? L"Available" : L"Not connected");
+        }
+        SetWindowText(hText[i], buf);
     }
 }
 
@@ -371,20 +290,6 @@ static void DoConnect(HWND hWnd) {
         if (port <= 0 || port > 65535) port = ns::DEFAULT_PORT;
     }
 
-    int sel = ComboBox_GetCurSel(g_hCtrlCombo);
-    if (sel < 0) return;
-
-    int controllerId = (int)ComboBox_GetItemData(g_hCtrlCombo, sel);
-    // Find the selected controller
-    const ControllerEntry* selected = nullptr;
-    for (const auto& c : g_controllers) {
-        if (c.id == controllerId) { selected = &c; break; }
-    }
-    if (!selected) return;
-
-    // Create the XInput reader
-    g_reader = std::make_unique<XInputReader>(selected->xinputSlot, selected->name);
-
     derive_key(ns::DEFAULT_SECRET, g_hmacKey);
 
     SaveLastIP(ipBuf);
@@ -394,6 +299,12 @@ static void DoConnect(HWND hWnd) {
     g_targetHost = hostA;
     g_targetPort = (uint16_t)port;
     g_packetCount = 0;
+
+    for (int i = 0; i < 4; i++) {
+        g_is_connected[i] = false;
+        g_last_check_us[i] = 0;
+    }
+
     g_connected = true;
 
     if (g_senderThread.joinable()) g_senderThread.join();
@@ -401,8 +312,6 @@ static void DoConnect(HWND hWnd) {
 
     SetWindowText(g_hConnectBtn, L"Disconnect");
     EnableWindow(g_hIpEdit, FALSE);
-    EnableWindow(g_hCtrlCombo, FALSE);
-    EnableWindow(g_hRefreshBtn, FALSE);
 
     std::wstring status = L"Connected to " + std::wstring(ipBuf) + L":" + std::to_wstring(port);
     SetWindowText(g_hStatusText, status.c_str());
@@ -414,14 +323,15 @@ static void DoDisconnect() {
     g_connected = false;
     g_senderRunning = false;
     if (g_senderThread.joinable()) g_senderThread.join();
-    g_reader.reset();
 
     SetWindowText(g_hConnectBtn, L"Connect");
     EnableWindow(g_hIpEdit, TRUE);
-    EnableWindow(g_hCtrlCombo, TRUE);
-    EnableWindow(g_hRefreshBtn, TRUE);
     SetWindowText(g_hStatusText, L"Disconnected");
-    RefreshControllerList();
+    SetWindowText(g_hP1Text, L"");
+    SetWindowText(g_hP2Text, L"");
+    SetWindowText(g_hP3Text, L"");
+    SetWindowText(g_hP4Text, L"");
+    UpdateControllerStatus();
 }
 
 // ── Theme colors (white background) ──
@@ -443,7 +353,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             HFONT hTitleFont = CreateFont(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                 CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-            HWND hTitle = CreateWindow(L"STATIC", L"Nintendo Switch PC Control",
+            HWND hTitle = CreateWindow(L"STATIC", L"NS PC Control",
                 WS_VISIBLE | WS_CHILD, x, y, 380, 30, hWnd, nullptr, g_hInst, nullptr);
             SendMessage(hTitle, WM_SETFONT, (WPARAM)hTitleFont, TRUE);
             y += 40;
@@ -467,24 +377,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 SendMessage(hw, WM_SETFONT, (WPARAM)hFieldFont, TRUE);
                 return hw;
             };
-            auto makeCombo = [&](int id, int x, int y, int w, int h) {
-                HWND hw = CreateWindow(L"COMBOBOX", nullptr, WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL | CBS_HASSTRINGS,
-                    x, y, w, h, hWnd, (HMENU)(INT_PTR)id, g_hInst, nullptr);
-                SendMessage(hw, WM_SETFONT, (WPARAM)hFieldFont, TRUE);
-                return hw;
-            };
-
             // ── IP row ──
             makeLabel(L"Raspberry Pi IP:", x, y + 4, 110, 22);
             std::wstring savedIp = LoadSavedIP();
             if (savedIp.empty()) savedIp = L"192.168.1.100";
             g_hIpEdit = makeEdit(IDC_IP, x + 115, y, 265, 24, savedIp.c_str());
-            y += 36;
-
-            // ── Controller row ──
-            makeLabel(L"Controller:", x, y + 4, 110, 22);
-            g_hCtrlCombo = makeCombo(IDC_CTRL, x + 115, y, 210, 120);
-            g_hRefreshBtn = CreateButton(hWnd, L"Refresh", x + 332, y, 52, 24, IDC_REFRESH);
             y += 36;
 
             // ── Connect / Quit buttons ──
@@ -510,26 +407,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             g_hStatusText = makeStatus(L"Ready", y);
             y += 22;
-            g_hCtrlNameText = makeStatus(L"No controllers detected", y);
 
-            // Initial scan
-            g_controllers = ScanControllers();
-            for (const auto& c : g_controllers) {
-                int idx = (int)ComboBox_AddString(g_hCtrlCombo, c.name.c_str());
-                ComboBox_SetItemData(g_hCtrlCombo, idx, c.id);
-            }
-            if (!g_controllers.empty()) {
-                ComboBox_SetCurSel(g_hCtrlCombo, 0);
-                SetWindowText(g_hCtrlNameText, L"");
-                EnableWindow(g_hConnectBtn, TRUE);
-            } else {
-                EnableWindow(g_hConnectBtn, FALSE);
-            }
+            g_hP1Text = makeStatus(L"", y); y += 18;
+            g_hP2Text = makeStatus(L"", y); y += 18;
+            g_hP3Text = makeStatus(L"", y); y += 18;
+            g_hP4Text = makeStatus(L"", y);
 
-            if (g_controllers.empty())
-                SetWindowText(g_hCtrlNameText, L"No controllers detected");
-
-            // Refresh button callback
+            UpdateControllerStatus();
+            EnableWindow(g_hConnectBtn, TRUE);
             break;
         }
 
@@ -540,8 +425,6 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 else DoDisconnect();
             } else if (id == 1002) {
                 PostMessage(hWnd, WM_CLOSE, 0, 0);
-            } else if (id == IDC_REFRESH && !g_connected) {
-                RefreshControllerList();
             }
             break;
         }
@@ -558,14 +441,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_TIMER: {
-            if (g_connected && g_reader)
-                SetWindowText(g_hCtrlNameText, g_reader->GetName().c_str());
+            if (g_connected) UpdateControllerStatus();
             break;
         }
 
         case WM_DEVICECHANGE: {
-            if ((wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) && !g_connected) {
-                RefreshControllerList();
+            if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) {
+                UpdateControllerStatus();
             }
             break;
         }
@@ -578,7 +460,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             // Title label gets red accent
             wchar_t buf[64];
             GetWindowText(hCtrl, buf, 64);
-            if (wcscmp(buf, L"Nintendo Switch PC Control") == 0) {
+            if (wcscmp(buf, L"NS PC Control") == 0) {
                 SetTextColor(hdc, ACCENT_RED);
             }
             static HBRUSH hWhiteBrush = []{ return CreateSolidBrush(RGB(255,255,255)); }();
@@ -610,6 +492,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 // ── Entry point ──
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
+    timeBeginPeriod(1);
     g_hInst = hInst;
 
     WSADATA wsa{};
@@ -628,10 +511,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     wc.lpszClassName = CLASS_NAME;
     RegisterClass(&wc);
 
-    RECT rc{0, 0, 410, 230};
+    RECT rc{0, 0, 410, 280};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX), FALSE);
 
-    HWND hWnd = CreateWindowEx(0, CLASS_NAME, L"Nintendo Switch PC Control",
+    HWND hWnd = CreateWindowEx(0, CLASS_NAME, L"NS PC Control",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
         nullptr, nullptr, hInst, nullptr);
@@ -655,5 +538,5 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
 
     DoDisconnect();
     WSACleanup();
-    return 0;
+    timeEndPeriod(1); return 0;
 }

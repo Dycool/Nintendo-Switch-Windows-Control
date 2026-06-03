@@ -6,9 +6,9 @@
 
 **Control your Console from a PC (Windows, Linux, or macOS) with low latency using a Raspberry Pi.**
 
-This project was built from scratch in **C++** and uses **UDP** to guarantee the lowest possible latency. It's the ideal setup for playing Switch games using your PC controller, avoiding the typical lag of Bluetooth or heavy script-based solutions. 
+This project was built from scratch in **C++** and uses **UDP** to get the lowest possible latency. It's the ideal setup for playing NS games using your PC controller, avoiding the typical lag of Bluetooth or heavy script-based solutions.
 
-With version 2.0.0+, clients now feature a **Graphical User Interface (GUI)** for easy connection, alongside the classic CLI.
+**🎮 Up to 4 players simultaneously** — Connect multiple controllers to a single PC and each gets its own physical slot (P1–P4).
 
 > **📦 Pre-compiled Binaries Available!**
 > You can download ready-to-use GUI/CLI clients and the Raspberry Pi server directly from the **[Releases](https://github.com/Dycool/NS-PC-Control/releases)** page.
@@ -25,7 +25,8 @@ With version 2.0.0+, clients now feature a **Graphical User Interface (GUI)** fo
 **2. PC (Client):**
 * Download the appropriate zip for your OS (Windows, Mac, or Linux).
 * Launch the `ns-gui` application.
-* Enter your Raspberry Pi's IP address and connect your controller!
+* Enter your Raspberry Pi's IP address and connect your controller(s)!
+* **Up to 4 controllers** are supported simultaneously on a single PC.
 
 ---
 
@@ -35,7 +36,7 @@ Any **XInput-compatible controller** connected to your PC (Xbox controllers and 
 
 | Action  | Shortcut                                |
 | ------- | --------------------------------------- |
-| HOME    | Press **L3 + R3** simultaneously        |
+| HOME    | Press **GUIDE** button, or **L3 + R3** simultaneously |
 | CAPTURE | Press **START + BACK** simultaneously   |
 
 ---
@@ -52,7 +53,26 @@ Detailed guides and technical information are in our `docs/` folder:
 
 ## 🚀 Planned Features
 
-* Multiple Controllers (With emulation of a GameCube adapter)
+* Keyboard support
+
+---
+
+## 📚 References
+
+| Component | Technology |
+|---|---|
+| **Linux client** | [SDL2 GameController API](https://wiki.libsdl.org/SDL2) / [GTK3](https://docs.gtk.org/gtk3/) |
+| **Windows client** | [XInput](https://learn.microsoft.com/en-us/windows/win32/xinput/xinput-input-structures) / [Winsock2](https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-reference) / [MSVC](https://visualstudio.microsoft.com/) / [MinGW](https://www.mingw-w64.org/) |
+| **macOS client** | [GameController.framework](https://developer.apple.com/documentation/gamecontroller) / [Foundation](https://developer.apple.com/documentation/foundation) |
+| **Raspberry Pi server** | [Linux USB Gadget (configfs / libcomposite)](https://www.kernel.org/doc/html/latest/usb/gadget_configfs.html) / UDP sockets |
+| **Cryptography** | [HMAC-SHA256](https://datatracker.ietf.org/doc/html/rfc4868) (standalone C++ implementation) |
+| **Protocol** | Custom UDP-based protocol with magic/version/sequence number guards |
+
+---
+
+## 🐛 Reporting Issues
+
+Found a bug or have a feature request? Open an issue at **[github.com/Dycool/NS-PC-Control/issues](https://github.com/Dycool/NS-PC-Control/issues)** with as much detail as possible (OS, controller model, reproduction steps).
 
 ---
 

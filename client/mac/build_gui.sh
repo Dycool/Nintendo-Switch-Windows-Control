@@ -55,7 +55,7 @@ cat > ns-gui.app/Contents/Info.plist <<EOF
     <string>icon</string>
     <!-- Required on macOS 14+ for GameController framework background access -->
     <key>NSGameControllerUsageDescription</key>
-    <string>This app uses game controllers to send inputs to your Nintendo Switch.</string>
+    <string>This app uses game controllers to send inputs to your NS.</string>
     <!-- Required for Bluetooth controllers (wireless Xbox/PlayStation/Switch Pro) -->
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>This app uses Bluetooth to communicate with wireless game controllers.</string>

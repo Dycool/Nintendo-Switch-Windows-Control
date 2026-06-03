@@ -4,11 +4,10 @@ If you prefer to compile the binaries yourself rather than using the release zip
 
 ## 🍓 Raspberry Pi (Server)
 
-1. Clone only the server portion of the repository:
+1. Clone the repository:
 ```bash
-git clone --depth 1 --filter=blob:none --sparse https://github.com/Dycool/NS-PC-Control.git
+git clone https://github.com/Dycool/NS-PC-Control.git
 cd NS-PC-Control
-git sparse-checkout set server
 ```
 
 2. Compile the server:
@@ -23,11 +22,10 @@ make
 
 ## 💻 PC Clients
 
-Clone only the client portion of the repository to your PC:
+Clone the repository to your PC:
 ```bash
-git clone --depth 1 --filter=blob:none --sparse https://github.com/Dycool/NS-PC-Control.git
+git clone https://github.com/Dycool/NS-PC-Control.git
 cd NS-PC-Control
-git sparse-checkout set client
 ```
 
 ---
@@ -40,7 +38,7 @@ On Windows, the CLI tool is built using MinGW (GCC), while the GUI application i
 2. Open the **MSYS2 UCRT64** terminal and navigate to `client/windows/`.
 3. Build the CLI client:
 ```bash
-g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput
+g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput -lwinmm
 ```
 
 **To build the GUI (MSVC):**
@@ -50,7 +48,7 @@ g++.exe -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -
 4. Compile the resources and the GUI application:
 ```cmd
 rc /nologo ns-gui.rc
-cl /std:c++17 /O2 /EHsc /W3 ns-gui.cpp ns-gui.res /link ws2_32.lib xinput.lib setupapi.lib comctl32.lib user32.lib kernel32.lib gdi32.lib advapi32.lib /out:ns-gui.exe
+cl /std:c++17 /O2 /EHsc /W3 ns-gui.cpp ns-gui.res /link ws2_32.lib xinput.lib setupapi.lib comctl32.lib user32.lib kernel32.lib gdi32.lib advapi32.lib winmm.lib /out:ns-gui.exe
 ```
 
 ---
@@ -61,20 +59,20 @@ To compile on Linux, you need a C++ compiler and the GTK3 development headers fo
 **Prerequisites:**
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential libgtk-3-dev
+sudo apt-get install -y build-essential libgtk-3-dev libsdl2-dev
 ```
 
 Navigate to `client/linux/` and run the following depending on what you want to build:
 
 **Build the CLI:**
 ```bash
-g++ -O3 -pthread ns-gamepad.cpp -o ns-gamepad
+g++ -O3 -pthread ns-gamepad.cpp -o ns-gamepad -lSDL2
 ```
 *Tip: You may need to run with `sudo` or add your user to the `input` group if the application cannot access controller events.*
 
 **Build the GUI:**
 ```bash
-g++ -std=c++17 -O2 -Wall ns-gui.cpp -o ns-gui $(pkg-config --cflags --libs gtk+-3.0) -lpthread
+g++ -std=c++17 -O2 -Wall ns-gui.cpp -o ns-gui $(pkg-config --cflags --libs gtk+-3.0) -lpthread -lSDL2
 ```
 
 ---
