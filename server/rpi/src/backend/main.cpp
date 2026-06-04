@@ -438,8 +438,8 @@ function conn(url){
     console.log("Connecting to:", url);
     logWebSocketStatus("Connecting...");
     
-    // Passamos o subprotocolo 'ns-protocol' conforme configurado no backend C++
-    ws = new WebSocket(url, 'ns-protocol');
+    // ── FIXED: Removido o argumento 'ns-protocol' para evitar conflitos de handshake ──
+    ws = new WebSocket(url);
     
     ws.onopen = () => {
         console.log("WebSocket connected");
@@ -759,6 +759,8 @@ static void webserver_thread(int port) {
                 if (r == -2 || r == -1) { dead.push_back((int)i); continue; }
                 if (r == 0) continue; // control frame
                 
+                if (g_verbose) std::printf("WS frame received: %d bytes\n", r);
+
                 if (r >= (int)sizeof(MultiReport)) {
                     MultiReport report;
                     memcpy(&report, buf, sizeof(MultiReport));
@@ -814,12 +816,12 @@ static void webserver_thread(int port) {
                                 std::printf("Accept key: %s\n", accept.c_str());
                             }
                             
+                            // ── FIXED: Removido o Sec-WebSocket-Protocol daqui para prevenir conflitos ──
                             std::string resp =
                                 "HTTP/1.1 101 Switching Protocols\r\n"
                                 "Upgrade: websocket\r\n"
                                 "Connection: Upgrade\r\n"
-                                "Sec-WebSocket-Accept: " + accept + "\r\n"
-                                "Sec-WebSocket-Protocol: ns-protocol\r\n\r\n"; // ── FIXED: Adicionado protocolo ──
+                                "Sec-WebSocket-Accept: " + accept + "\r\n\r\n"; 
                             
                             if (g_verbose) std::printf("Response:\n%s\n", resp.c_str());
                             
