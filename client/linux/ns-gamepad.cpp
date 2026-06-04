@@ -82,10 +82,14 @@ void init_global_keyboard() {
                     if (test_bit(EV_KEY, evbit)) {
                         unsigned long keybit[NLONGS(KEY_MAX)] = {0};
                         ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit);
-                        if (test_bit(KEY_A, keybit)) g_kb_fds.push_back(fd);
-                        else close(fd);
-                    } else close(fd);
-                } else close(fd);
+                        // A standard keyboard will have SPACE or ENTER or 'A'
+                        if (test_bit(KEY_SPACE, keybit) || test_bit(KEY_ENTER, keybit) || test_bit(KEY_A, keybit)) {
+                            g_kb_fds.push_back(fd);
+                            continue;
+                        }
+                    }
+                }
+                close(fd);
             }
         }
     }
@@ -106,7 +110,7 @@ bool is_key_down_global(int linux_key_code) {
 int name_to_linux_key(std::string name) {
     std::transform(name.begin(), name.end(), name.begin(), ::toupper);
     
-    // FIX: Exact mapping to Linux EVDEV hardware scan codes
+    // Strict hardware mapping for EVDEV keycodes
     static const std::unordered_map<std::string, int> key_map = {
         {"A", KEY_A}, {"B", KEY_B}, {"C", KEY_C}, {"D", KEY_D}, {"E", KEY_E},
         {"F", KEY_F}, {"G", KEY_G}, {"H", KEY_H}, {"I", KEY_I}, {"J", KEY_J},
@@ -117,8 +121,8 @@ int name_to_linux_key(std::string name) {
         {"1", KEY_1}, {"2", KEY_2}, {"3", KEY_3}, {"4", KEY_4}, {"5", KEY_5},
         {"6", KEY_6}, {"7", KEY_7}, {"8", KEY_8}, {"9", KEY_9}, {"0", KEY_0},
         {"UP", KEY_UP}, {"DOWN", KEY_DOWN}, {"LEFT", KEY_LEFT}, {"RIGHT", KEY_RIGHT},
-        {"SHIFT_L", KEY_LEFTSHIFT}, {"LSHIFT", KEY_LEFTSHIFT}, {"LEFT SHIFT", KEY_LEFTSHIFT},
-        {"SHIFT_R", KEY_RIGHTSHIFT}, {"RSHIFT", KEY_RIGHTSHIFT}, {"RIGHT SHIFT", KEY_RIGHTSHIFT},
+        {"SHIFT_L", KEY_LEFTSHIFT}, {"LSHIFT", KEY_LEFTSHIFT}, {"LEFT_SHIFT", KEY_LEFTSHIFT},
+        {"SHIFT_R", KEY_RIGHTSHIFT}, {"RSHIFT", KEY_RIGHTSHIFT}, {"RIGHT_SHIFT", KEY_RIGHTSHIFT},
         {"CONTROL_L", KEY_LEFTCTRL}, {"LCTRL", KEY_LEFTCTRL},
         {"CONTROL_R", KEY_RIGHTCTRL}, {"RCTRL", KEY_RIGHTCTRL},
         {"ALT_L", KEY_LEFTALT}, {"LALT", KEY_LEFTALT},
@@ -144,6 +148,8 @@ uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8000) {
 }
 
 void scan_for_gamepads() {
+    SDL_Event e; while (SDL_PollEvent(&e)) {} // MANDATORY to prevent OS queue stall
+    
     static uint64_t last_scan = 0;
     uint64_t now = ns::now_us();
     if (now - last_scan < 1'000'000) return;
@@ -401,7 +407,6 @@ int main(int argc, char** argv) {
     while (g_running.load(std::memory_order_relaxed)) {
         while (std::chrono::steady_clock::now() < next_tick) std::atomic_thread_fence(std::memory_order_relaxed);
         
-        SDL_Event e; while (SDL_PollEvent(&e)) {}
         scan_for_gamepads();
 
         ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet)); 

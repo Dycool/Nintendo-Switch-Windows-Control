@@ -83,10 +83,14 @@ void init_global_keyboard() {
                     if (test_bit(EV_KEY, evbit)) {
                         unsigned long keybit[NLONGS(KEY_MAX)] = {0};
                         ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit);
-                        if (test_bit(KEY_A, keybit)) g_kb_fds.push_back(fd);
-                        else close(fd);
-                    } else close(fd);
-                } else close(fd);
+                        // A standard keyboard will have SPACE or ENTER or 'A'
+                        if (test_bit(KEY_SPACE, keybit) || test_bit(KEY_ENTER, keybit) || test_bit(KEY_A, keybit)) {
+                            g_kb_fds.push_back(fd);
+                            continue;
+                        }
+                    }
+                }
+                close(fd);
             }
         }
     }
@@ -107,7 +111,7 @@ bool is_key_down_global(int linux_key_code) {
 int name_to_linux_key(std::string name) {
     std::transform(name.begin(), name.end(), name.begin(), ::toupper);
     
-    // FIX: Exact mapping to Linux EVDEV hardware scan codes
+    // Strict hardware mapping for EVDEV keycodes
     static const std::unordered_map<std::string, int> key_map = {
         {"A", KEY_A}, {"B", KEY_B}, {"C", KEY_C}, {"D", KEY_D}, {"E", KEY_E},
         {"F", KEY_F}, {"G", KEY_G}, {"H", KEY_H}, {"I", KEY_I}, {"J", KEY_J},
@@ -118,8 +122,8 @@ int name_to_linux_key(std::string name) {
         {"1", KEY_1}, {"2", KEY_2}, {"3", KEY_3}, {"4", KEY_4}, {"5", KEY_5},
         {"6", KEY_6}, {"7", KEY_7}, {"8", KEY_8}, {"9", KEY_9}, {"0", KEY_0},
         {"UP", KEY_UP}, {"DOWN", KEY_DOWN}, {"LEFT", KEY_LEFT}, {"RIGHT", KEY_RIGHT},
-        {"SHIFT_L", KEY_LEFTSHIFT}, {"LSHIFT", KEY_LEFTSHIFT}, {"LEFT SHIFT", KEY_LEFTSHIFT},
-        {"SHIFT_R", KEY_RIGHTSHIFT}, {"RSHIFT", KEY_RIGHTSHIFT}, {"RIGHT SHIFT", KEY_RIGHTSHIFT},
+        {"SHIFT_L", KEY_LEFTSHIFT}, {"LSHIFT", KEY_LEFTSHIFT}, {"LEFT_SHIFT", KEY_LEFTSHIFT},
+        {"SHIFT_R", KEY_RIGHTSHIFT}, {"RSHIFT", KEY_RIGHTSHIFT}, {"RIGHT_SHIFT", KEY_RIGHTSHIFT},
         {"CONTROL_L", KEY_LEFTCTRL}, {"LCTRL", KEY_LEFTCTRL},
         {"CONTROL_R", KEY_RIGHTCTRL}, {"RCTRL", KEY_RIGHTCTRL},
         {"ALT_L", KEY_LEFTALT}, {"LALT", KEY_LEFTALT},
@@ -133,6 +137,7 @@ int name_to_linux_key(std::string name) {
     auto it = key_map.find(name);
     return (it != key_map.end()) ? it->second : KEY_RESERVED;
 }
+
 
 // ── Logic State ──
 enum { KB_OFF = 0, KB_SINGLE = 1, KB_OVERRIDE = 2 };
@@ -217,9 +222,10 @@ static uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8
 }
 
 static void scan_for_gamepads() {
+    SDL_Event e; while (SDL_PollEvent(&e)) {} // MANDATORY to prevent OS queue stall
+    
     static uint64_t last_scan = 0;
     uint64_t now = ns::now_us();
-    SDL_GameControllerUpdate();
     if (now - last_scan < 1'000'000) return;
     last_scan = now;
 
@@ -241,7 +247,6 @@ static void scan_for_gamepads() {
                 SDL_GameController* pad = SDL_GameControllerOpen(i);
                 if (!pad) break;
                 
-                // Keep the lock scoped ONLY to the variable assignment!
                 {
                     std::lock_guard<std::mutex> lock(g_hw_mtx);
                     g_pads[p] = pad;
@@ -356,6 +361,7 @@ static void SenderThread(std::string host, uint16_t port) {
 
     while (g_senderRunning.load()) {
         while (std::chrono::steady_clock::now() < next_tick) std::atomic_thread_fence(std::memory_order_relaxed);
+        
         scan_for_gamepads();
 
         ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet)); 
@@ -503,10 +509,8 @@ extern "C" void on_bindings_clicked(GtkWidget*, gpointer parent_window) {
 }
 
 extern "C" gboolean on_timer(gpointer) {
-    // 1. Move the scan OUTSIDE the mutex lock to prevent deadlock
     if (!g_connected) scan_for_gamepads();
     
-    // 2. Lock UI specifically for reading the mapped arrays safely
     std::lock_guard<std::mutex> lock(g_hw_mtx);
     int km = g_keyboardMode.load();
     
