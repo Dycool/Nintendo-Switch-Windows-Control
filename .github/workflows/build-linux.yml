@@ -31,6 +31,7 @@ jobs:
           curl -sL "https://github.com/ocornut/imgui/archive/refs/tags/v${IMGUI_VER}.zip" -o /tmp/imgui.zip
           unzip -q -o /tmp/imgui.zip -d /tmp/
           ISRC="/tmp/imgui-${IMGUI_VER}"
+          SDL_CFLAGS="$(pkg-config --cflags sdl2)"
           g++ -O3 -std=c++17 ns-gui.cpp \
             "${ISRC}/imgui.cpp" \
             "${ISRC}/imgui_draw.cpp" \
@@ -38,7 +39,7 @@ jobs:
             "${ISRC}/imgui_widgets.cpp" \
             "${ISRC}/backends/imgui_impl_sdl2.cpp" \
             "${ISRC}/backends/imgui_impl_sdlrenderer2.cpp" \
-            -I"${ISRC}" -I"${ISRC}/backends" \
+            -I"${ISRC}" -I"${ISRC}/backends" ${SDL_CFLAGS} \
             -o ns-gui -lpthread -lSDL2
 
       - uses: actions/upload-artifact@v6

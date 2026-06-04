@@ -12,6 +12,7 @@ curl -sL "https://github.com/ocornut/imgui/archive/refs/tags/${IMGUI_VERSION}.zi
 unzip -q -o "${IMGUI_DIR}/imgui.zip" -d "${IMGUI_DIR}"
 IMGUI_SRC="${IMGUI_DIR}/imgui-1.91.0"
 
+SDL_CFLAGS="$(pkg-config --cflags sdl2)"
 g++ -O3 -std=c++17 ns-gui.cpp \
     "${IMGUI_SRC}/imgui.cpp" \
     "${IMGUI_SRC}/imgui_draw.cpp" \
@@ -19,7 +20,7 @@ g++ -O3 -std=c++17 ns-gui.cpp \
     "${IMGUI_SRC}/imgui_widgets.cpp" \
     "${IMGUI_SRC}/backends/imgui_impl_sdl2.cpp" \
     "${IMGUI_SRC}/backends/imgui_impl_sdlrenderer2.cpp" \
-    -I"${IMGUI_SRC}" -I"${IMGUI_SRC}/backends" \
+    -I"${IMGUI_SRC}" -I"${IMGUI_SRC}/backends" ${SDL_CFLAGS} \
     -o ns-gui -lpthread -lSDL2
 
 rm -rf "${IMGUI_DIR}"
