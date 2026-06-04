@@ -260,7 +260,7 @@ static void SenderThread(std::string host, uint16_t port) {
         }
 
         sendto(sock, (const char*)&pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
-        if (active_count > 0) next_tick += std::chrono::milliseconds(2);
+        if (active_count > 0) next_tick += std::chrono::milliseconds(4);
         else next_tick += std::chrono::milliseconds(500);
     }
 

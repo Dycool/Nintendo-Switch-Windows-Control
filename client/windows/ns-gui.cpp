@@ -246,7 +246,7 @@ static void SenderThread() {
         sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));
         g_packetCount++;
 
-        if (any_connected) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (any_connected) std::this_thread::sleep_for(std::chrono::milliseconds(4));
         else std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 

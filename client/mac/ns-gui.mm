@@ -407,7 +407,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
 
             // FIX 3: Sleep instead of busy-waiting so we don't burn a full CPU core.
             auto interval = (active_count > 0)
-        ? std::chrono::milliseconds(2)
+        ? std::chrono::milliseconds(4)
             : std::chrono::milliseconds(50); // keep connection alive below watchdog timeout
             std::this_thread::sleep_for(interval);
         }

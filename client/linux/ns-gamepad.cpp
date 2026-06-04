@@ -292,8 +292,8 @@ int main(int argc, char** argv) {
         // 5. Transmit to Server
         sendto(sock, (const char*)&pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
         
-        // Dynamic throttling: 500Hz when active, 2Hz when idle (saves network/CPU)
-        if (active_count > 0) next_tick += std::chrono::milliseconds(2);
+        // Dynamic throttling: 250Hz when active, 2Hz when idle (saves network/CPU)
+        if (active_count > 0) next_tick += std::chrono::milliseconds(4);
         else next_tick += std::chrono::milliseconds(500);
     }
 

@@ -104,7 +104,7 @@ static void writer_thread(int hz) {
         }
         
         if (g_verbose || !was_connected)
-            std::puts("[backend] 4x /dev/hidg* opened — Ready for up to 4 PCs");
+            std::puts("4x /dev/hidg* opened");
         was_connected = true;
 
         auto next = Clock::now() + tick;
@@ -126,7 +126,7 @@ static void writer_thread(int hz) {
                 for (int c = 0; c < MAX_CLIENTS; ++c) {
                     if (g_clients[c].active && (now_stamp - g_clients[c].last_rx_us > WATCHDOG_MS * 1000ULL)) {
                         g_clients[c].active = false;
-                        if (g_verbose) std::printf("[backend] PC %d timed out and was disconnected.\n", c+1);
+                        if (g_verbose) std::printf("PC %d timed out and was disconnected.\n", c+1);
                     }
                 }
 
@@ -162,7 +162,7 @@ static void writer_thread(int hz) {
                                     hw_slots[h].client_idx = c;
                                     hw_slots[h].sub_idx = s;
                                     if (g_verbose) 
-                                        std::printf("[backend] Map -> PC %d (Pad %d) took Switch Port %d\n", c+1, s+1, h+1);
+                                        std::printf("Map -> PC %d (Pad %d) took Switch Port %d\n", c+1, s+1, h+1);
                                     break;
                                 }
                             }
@@ -191,7 +191,7 @@ static void writer_thread(int hz) {
             if (r.p4 != prev.p4) { if(write(fds[3], &r.p4, 8) < 0 && errno != EAGAIN) ok = false; }
 
             if (!ok) {
-                if (!error_shown) { std::puts("[backend] Switch disconnected — waiting for reconnect..."); error_shown = true; }
+                if (!error_shown) { std::puts("Switch disconnected — waiting for reconnect..."); error_shown = true; }
                 for(int i=0; i<4; ++i) { close(fds[i]); fds[i] = -1; }
                 std::this_thread::sleep_for(ms(1000)); break;
             }
@@ -213,7 +213,7 @@ static void stats_thread() {
     while (g_running.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(ms(5000));
         if (!g_verbose) continue;
-        std::printf("[backend] pkts_rx=%-8llu  hid_writes=%-8llu\n",
+        std::printf("pkts_rx=%-8llu  hid_writes=%-8llu\n",
             (unsigned long long)g_pkts_rx.load(),
             (unsigned long long)g_hid_writes.load());
     }
@@ -263,8 +263,8 @@ static bool upnp_add_mapping(uint16_t port) {
     g_upnp_active = true;
     char external_ip[40];
     if (UPNP_GetExternalIPAddress(g_upnp_urls.controlURL, g_upnp_data.first.servicetype, external_ip) == 0) {
-        std::printf("[backend] UPnP: UDP port %u successfully forwarded!\n", port);
-        std::printf("[backend] UPnP: Tell your clients to connect to -> %s:%u\n", external_ip, port);
+        std::printf("UPnP: UDP port %u successfully forwarded!\n", port);
+        std::printf("UPnP: Tell your clients to connect to -> %s:%u\n", external_ip, port);
     }
     return true;
 }
@@ -273,7 +273,7 @@ static void upnp_remove_mapping(uint16_t port) {
     if (!g_upnp_active) return;
     char port_str[8]; snprintf(port_str, sizeof(port_str), "%u", port);
     UPNP_DeletePortMapping(g_upnp_urls.controlURL, g_upnp_data.first.servicetype, port_str, "UDP", nullptr);
-    std::puts("[backend] UPnP: port mapping removed cleanly");
+    std::puts("UPnP: port mapping removed cleanly");
     FreeUPNPUrls(&g_upnp_urls); g_upnp_active = false;
 }
 #else
@@ -318,7 +318,7 @@ int main(int argc, char** argv) {
     addr.sin_addr.s_addr = inet_addr(bind_addr.c_str());
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); close(sock); return 1; }
     
-    std::printf("[backend] UDP %s:%u  Mode=Multi-Client Router (Max 4 PCs)  writer=%d Hz  HMAC=always\n",
+    std::printf("UDP %s:%u writer=%d Hz\n",
                 bind_addr.c_str(), port, WRITER_HZ);
 
     std::thread wt(writer_thread, WRITER_HZ);
@@ -342,13 +342,13 @@ int main(int argc, char** argv) {
         // ── 1. Per-IP rate limiter ────────────────────────────────────────────────
         uint32_t src_ip = sender.sin_addr.s_addr;
         if (!rate_allow(src_ip)) {
-            if (g_verbose) puts("[backend] rate limit exceeded, dropped");
+            if (g_verbose) puts("rate limit exceeded, dropped");
             continue;
         }
 
         // ── 2. Magic + version check ──────────────────────────────────────────────
         if (!packet_ok(pkt)) {
-            if (g_verbose) puts("[backend] bad magic/version, dropped");
+            if (g_verbose) puts("bad magic/version, dropped");
             continue;
         }
 
@@ -374,7 +374,7 @@ int main(int argc, char** argv) {
                     g_clients[i].addr = sender;
                     g_clients[i].first_pkt = true;
                     g_clients[i].report.reset();
-                    if (g_verbose) std::printf("[backend] New PC accepted into Server Slot %d/4\n", i+1);
+                    if (g_verbose) std::printf("New PC accepted into Server Slot %d/4\n", i+1);
                     break;
                 }
             }
@@ -382,13 +382,13 @@ int main(int argc, char** argv) {
 
         // If all 4 slots are taken by active PCs, drop the packet
         if (client_idx == -1) {
-            if (g_verbose) puts("[backend] server is full (4 PCs already active), dropped");
+            if (g_verbose) puts("server is full (4 PCs already active), dropped");
             continue;
         }
 
         // ── 4. HMAC authentication ────────────────────────────────────────────────
         if (hmac_verify(g_hmac_key, 32, (const uint8_t *)&pkt, PACKET_AUTH_SIZE, pkt.hmac, HMAC_TAG_SIZE) != 0) {
-            if (g_verbose) puts("[backend] bad HMAC, dropped");
+            if (g_verbose) puts("bad HMAC, dropped");
             continue;
         }
 
@@ -398,7 +398,7 @@ int main(int argc, char** argv) {
 
         if (!g_clients[client_idx].first_pkt && pkt.seq < g_clients[client_idx].expected_seq && !is_reset && !sequence_jump) {
             if (g_verbose)
-                std::printf("[backend] PC %d out-of-order seq=%u, dropped\n", client_idx+1, pkt.seq);
+                std::printf("PC %d out-of-order seq=%u, dropped\n", client_idx+1, pkt.seq);
             continue;
         }
         g_clients[client_idx].first_pkt = false;

@@ -176,10 +176,10 @@ int main(int argc, char** argv) {
 
         sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));
         
-        // Sleep to throttle transmission (~500Hz when active, 2Hz when idle)
+        // Sleep to throttle transmission (~250Hz when active, 2Hz when idle)
         if (active_count > 0) {
             no_controllers_printed = false;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
         } else {
             if (!no_controllers_printed) {
                 std::cout << "No controllers detected — waiting for connections...\n";
