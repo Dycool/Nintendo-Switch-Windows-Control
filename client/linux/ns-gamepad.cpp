@@ -66,22 +66,24 @@ static void on_signal(int) { g_running.store(false, std::memory_order_relaxed); 
 static std::vector<int> g_kb_fds;
 
 void init_global_keyboard() {
+    for (int fd : g_kb_fds) close(fd);
+    g_kb_fds.clear();
+
     DIR* dir = opendir("/dev/input");
     if (!dir) return;
     struct dirent* ent;
     while ((ent = readdir(dir)) != nullptr) {
         if (strncmp(ent->d_name, "event", 5) == 0) {
-            char path[256];
-            snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+            char path[256]; snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
             int fd = open(path, O_RDONLY | O_NONBLOCK);
             if (fd >= 0) {
-                unsigned long evbit[NLONGS(EV_MAX)];
-                ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), evbit);
-                if (test_bit(EV_KEY, evbit)) {
-                    unsigned long keybit[NLONGS(KEY_MAX)];
-                    ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit);
-                    if (test_bit(KEY_A, keybit)) { // If it has 'A', it's likely a keyboard
-                        g_kb_fds.push_back(fd);
+                unsigned long evbit[NLONGS(EV_MAX)] = {0};
+                if (ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), evbit) >= 0) {
+                    if (test_bit(EV_KEY, evbit)) {
+                        unsigned long keybit[NLONGS(KEY_MAX)] = {0};
+                        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit);
+                        if (test_bit(KEY_A, keybit)) g_kb_fds.push_back(fd);
+                        else close(fd);
                     } else close(fd);
                 } else close(fd);
             }

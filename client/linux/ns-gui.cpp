@@ -67,7 +67,9 @@ static std::vector<int> g_kb_fds;
 static bool g_kb_permission_warning_shown = false;
 
 void init_global_keyboard() {
+    for (int fd : g_kb_fds) close(fd);
     g_kb_fds.clear();
+
     DIR* dir = opendir("/dev/input");
     if (!dir) return;
     struct dirent* ent;
