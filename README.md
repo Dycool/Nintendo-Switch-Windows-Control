@@ -10,6 +10,8 @@ This project was built from scratch in **C++** and uses **UDP** to get the lowes
 
 **🎮 Up to 4 players simultaneously** — Works with a single raspberry pi and a single PC.
 
+**⌨️ Keyboard Support** — Windows and mac support keyboard controls, either through overriding P1 or with it as one player.
+
 > **📦 Pre-compiled Binaries Available!**
 > You can download ready-to-use GUI/CLI clients and the Raspberry Pi server directly from the **[Releases](https://github.com/Dycool/NS-PC-Control/releases)** page.
 
@@ -57,7 +59,7 @@ Detailed guides and technical information are in our `docs/` folder:
 
 ## 🚀 Planned Features
 
-* Keyboard support
+* Client as a web application (help needed)
 
 ---
 
