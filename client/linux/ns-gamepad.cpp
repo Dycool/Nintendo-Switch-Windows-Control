@@ -273,6 +273,12 @@ struct KeyBindings {
 
     // Poll keyboard via SDL and fill HIDReport for player 1
     void apply(ns::HIDReport& rep) const {
+        // Guarantee centered sticks immediately (prevents top-left drift bug)
+        if (mode != 2) {
+            rep.lx = 128; rep.ly = 128;
+            rep.rx = 128; rep.ry = 128;
+        }
+
         const Uint8* keystate = SDL_GetKeyboardState(nullptr);
         if (!keystate) return;
 

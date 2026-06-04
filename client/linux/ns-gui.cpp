@@ -151,6 +151,11 @@ static SDL_GameController* g_pads[4] = {nullptr, nullptr, nullptr, nullptr};
 static char         g_hw_names[4][128]; // Stored safely for the GTK thread to read
 static std::mutex   g_hw_mtx;           // Protects hardware string arrays
 
+// Shared reports — written by fast timer (main thread), read by SenderThread
+static ns::HIDReport g_shared_reports[4];
+static bool          g_shared_connected[4] = {};
+static std::mutex    g_report_mtx;
+
 // ── Axis conversion ──
 static uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8000) {
     if (val > -deadzone && val < deadzone) return 128;
@@ -387,10 +392,7 @@ static void SenderThread(std::string host, uint16_t port) {
     auto next_tick = std::chrono::steady_clock::now();
 
     while (g_senderRunning.load()) {
-        while (std::chrono::steady_clock::now() < next_tick)
-            std::atomic_thread_fence(std::memory_order_relaxed);
-
-        scan_for_gamepads();
+        std::this_thread::sleep_until(next_tick);
 
         ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet)); 
         pkt.magic         = ns::PROTO_MAGIC;
@@ -403,43 +405,15 @@ static void SenderThread(std::string host, uint16_t port) {
         ns::HIDReport* out_reports[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
         int active_count = 0;
 
-        bool c1 = false, c2 = false, c3 = false, c4 = false;
-        for (int i = 0; i < 4; ++i) {
-            bool is_conn = false;
-            read_pad(i, *out_reports[i], is_conn);
-            if (is_conn) {
-                active_count++;
-                if (i == 0) c1 = true;
-                else if (i == 1) c2 = true;
-                else if (i == 2) c3 = true;
-                else if (i == 3) c4 = true;
-            }
-        }
-
-        // Keyboard overrides Player 1
-        int km = g_keyboardMode.load();
-        if (km == KB_SINGLE) {
-            if (c1) {
-                if (!c2) {
-                    *out_reports[1] = *out_reports[0]; c2 = true; active_count++;
-                    std::lock_guard<std::mutex> lock(g_hw_mtx);
-                    strncpy(g_hw_names[1], g_hw_names[0], sizeof(g_hw_names[1]) - 1);
-                } else if (!c3) {
-                    *out_reports[2] = *out_reports[0]; c3 = true; active_count++;
-                    std::lock_guard<std::mutex> lock(g_hw_mtx);
-                    strncpy(g_hw_names[2], g_hw_names[0], sizeof(g_hw_names[2]) - 1);
-                } else if (!c4) {
-                    *out_reports[3] = *out_reports[0]; c4 = true; active_count++;
-                    std::lock_guard<std::mutex> lock(g_hw_mtx);
-                    strncpy(g_hw_names[3], g_hw_names[0], sizeof(g_hw_names[3]) - 1);
+        // Copy latest reports polled by the fast timer on the main thread
+        {
+            std::lock_guard<std::mutex> lock(g_report_mtx);
+            for (int i = 0; i < 4; ++i) {
+                if (g_shared_connected[i]) {
+                    *out_reports[i] = g_shared_reports[i];
+                    active_count++;
                 }
             }
-            out_reports[0]->reset();
-            apply_keyboard_to_report(*out_reports[0], false);
-            active_count = std::max(active_count, 1);
-        } else if (km == KB_OVERRIDE) {
-            apply_keyboard_to_report(*out_reports[0], true);
-            active_count = std::max(active_count, 1);
         }
 
         {
@@ -453,9 +427,6 @@ static void SenderThread(std::string host, uint16_t port) {
         else next_tick += std::chrono::milliseconds(500);
     }
 
-    for (int i = 0; i < 4; ++i) {
-        if (g_pads[i]) { SDL_GameControllerClose(g_pads[i]); g_pads[i] = nullptr; g_hw_names[i][0] = '\0'; }
-    }
     close(sock);
 }
 
@@ -675,6 +646,12 @@ extern "C" void on_connect_clicked(GtkWidget*, gpointer) {
         g_senderRunning = false;
         if (g_senderThread.joinable()) g_senderThread.join();
         
+        // Clean up gamepads on the main thread
+        for (int i = 0; i < 4; ++i) {
+            if (g_pads[i]) { SDL_GameControllerClose(g_pads[i]); g_pads[i] = nullptr; g_hw_names[i][0] = '\0'; }
+        }
+        for (int i = 0; i < 4; ++i) g_shared_connected[i] = false;
+
         gtk_button_set_label(GTK_BUTTON(connectBtn), "Connect");
         gtk_widget_set_sensitive(ipEntry, TRUE);
         gtk_widget_set_sensitive(kbCombo, TRUE);
@@ -735,7 +712,6 @@ extern "C" gboolean on_timer(gpointer) {
             gtk_label_set_text(GTK_LABEL(ctrlLabels[i]), lbl);
         }
     } else {
-        scan_for_gamepads();
         std::lock_guard<std::mutex> lock(g_hw_mtx);
         for (int i = 0; i < 4; ++i) {
             char lbl[128];
@@ -754,6 +730,60 @@ extern "C" gboolean on_timer(gpointer) {
             gtk_label_set_text(GTK_LABEL(ctrlLabels[i]), lbl);
         }
     }
+    return G_SOURCE_CONTINUE;
+}
+
+// ── Fast Timer: SDL Polling on Main Thread (250Hz) ──
+extern "C" gboolean on_fast_timer(gpointer) {
+    scan_for_gamepads();
+
+    if (!g_connected) return G_SOURCE_CONTINUE;
+
+    ns::HIDReport reports[4];
+    bool connected[4] = {};
+    int active_count = 0;
+
+    for (int i = 0; i < 4; ++i) {
+        bool conn = false;
+        read_pad(i, reports[i], conn);
+        connected[i] = conn;
+        if (conn) active_count++;
+    }
+
+    int km = g_keyboardMode.load();
+    if (km == KB_SINGLE) {
+        bool c1 = connected[0], c2 = connected[1], c3 = connected[2], c4 = connected[3];
+        if (c1) {
+            if (!c2) {
+                reports[1] = reports[0]; connected[1] = true; active_count++;
+                std::lock_guard<std::mutex> lock(g_hw_mtx);
+                strncpy(g_hw_names[1], g_hw_names[0], sizeof(g_hw_names[1]) - 1);
+            } else if (!c3) {
+                reports[2] = reports[0]; connected[2] = true; active_count++;
+                std::lock_guard<std::mutex> lock(g_hw_mtx);
+                strncpy(g_hw_names[2], g_hw_names[0], sizeof(g_hw_names[2]) - 1);
+            } else if (!c4) {
+                reports[3] = reports[0]; connected[3] = true; active_count++;
+                std::lock_guard<std::mutex> lock(g_hw_mtx);
+                strncpy(g_hw_names[3], g_hw_names[0], sizeof(g_hw_names[3]) - 1);
+            }
+        }
+        reports[0].reset();
+        apply_keyboard_to_report(reports[0], false);
+        active_count = std::max(active_count, 1);
+    } else if (km == KB_OVERRIDE) {
+        apply_keyboard_to_report(reports[0], true);
+        active_count = std::max(active_count, 1);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_report_mtx);
+        for (int i = 0; i < 4; ++i) {
+            g_shared_reports[i] = reports[i];
+            g_shared_connected[i] = connected[i];
+        }
+    }
+
     return G_SOURCE_CONTINUE;
 }
 
@@ -779,7 +809,7 @@ int main(int argc, char* argv[]) {
 
     // Initialise SDL2 GameController subsystem
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    if (SDL_Init(SDL_INIT_GAMECONTROLLER) < 0) {
+    if (SDL_Init(SDL_INIT_GAMECONTROLLER | SDL_INIT_VIDEO) < 0) {
         std::cerr << "Failed to initialise SDL2: " << SDL_GetError() << "\n";
         return 1;
     }
@@ -856,6 +886,8 @@ int main(int argc, char* argv[]) {
         gtk_grid_attach(GTK_GRID(grid), ctrlLabels[i], 0, 5 + i, 4, 1);
     }
 
+    // Fast timer for SDL gamepad polling (250Hz, main thread only)
+    g_timeout_add(4, on_fast_timer, nullptr);
     // Timer for UI updates (100ms)
     g_timeout_add(100, on_timer, nullptr);
 
