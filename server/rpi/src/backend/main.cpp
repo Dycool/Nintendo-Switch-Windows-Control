@@ -20,7 +20,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
-#include <sys/poll.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -81,7 +81,6 @@ static std::atomic<uint64_t> g_hid_writes{0};
 // ── Signal ────────────────────────────────────────────────────────────────────
 static void on_signal(int) { g_running.store(false, std::memory_order_relaxed); }
 
-
 // ── Smart Multiplexer HID Writer Thread ───────────────────────────────────────
 static void writer_thread(int hz) {
     const auto tick = us(1'000'000 / hz);
@@ -89,7 +88,6 @@ static void writer_thread(int hz) {
     std::string devs[4] = {"/dev/hidg0", "/dev/hidg1", "/dev/hidg2", "/dev/hidg3"};
     bool was_connected = false;
 
-    // Tracks which physical Switch port is claimed by which (Client, SubController)
     struct HwSlot { int client_idx = -1; int sub_idx = -1; };
     HwSlot hw_slots[4];
 
@@ -112,7 +110,7 @@ static void writer_thread(int hz) {
         was_connected = true;
 
         auto next = Clock::now() + tick;
-        MultiReport prev{}; prev.p1.buttons = 0xFFFF; // Force first write
+        MultiReport prev{}; prev.p1.buttons = 0xFFFF;
         bool error_shown = false;
 
         while (g_running.load(std::memory_order_relaxed)) {
@@ -120,21 +118,19 @@ static void writer_thread(int hz) {
             auto now = Clock::now(); next = std::max(next + tick, now + tick);
 
             MultiReport r;
-            r.reset(); // Base neutral state
+            r.reset();
 
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
                 uint64_t now_stamp = now_us();
 
-                // 1. Clear timed-out clients (Watchdog)
                 for (int c = 0; c < MAX_CLIENTS; ++c) {
                     if (g_clients[c].active && (now_stamp - g_clients[c].last_rx_us > WATCHDOG_MS * 1000ULL)) {
                         g_clients[c].active = false;
-                        if (g_verbose) std::printf("PC/Web %d timed out and was disconnected.\n", c+1);
+                        if (g_verbose) std::printf("PC/Web %d timed out.\n", c+1);
                     }
                 }
 
-                // 2. Free hardware slots mapped to inactive clients
                 for (int h = 0; h < 4; ++h) {
                     if (hw_slots[h].client_idx != -1) {
                         if (!g_clients[hw_slots[h].client_idx].active) {
@@ -144,10 +140,8 @@ static void writer_thread(int hz) {
                     }
                 }
 
-                // 3. Auto-assign unmapped active inputs to free hardware slots immediately
                 for (int c = 0; c < MAX_CLIENTS; ++c) {
                     if (!g_clients[c].active) continue;
-                    
                     for (int s = 0; s < 4; ++s) {
                         bool mapped = false;
                         for (int h = 0; h < 4; ++h) {
@@ -155,14 +149,13 @@ static void writer_thread(int hz) {
                                 mapped = true; break;
                             }
                         }
-                        
                         if (!mapped) {
                             for (int h = 0; h < 4; ++h) {
                                 if (hw_slots[h].client_idx == -1) {
                                     hw_slots[h].client_idx = c;
                                     hw_slots[h].sub_idx = s;
                                     if (g_verbose) 
-                                        std::printf("Map -> Slot %d (Pad %d) took Switch Port %d\n", c+1, s+1, h+1);
+                                        std::printf("Map Slot %d Pad %d -> Port %d\n", c+1, s+1, h+1);
                                     break;
                                 }
                             }
@@ -170,7 +163,6 @@ static void writer_thread(int hz) {
                     }
                 }
 
-                // 4. Construct the final mixed 4-player report
                 HIDReport* out_subs[4] = { &r.p1, &r.p2, &r.p3, &r.p4 };
                 for (int h = 0; h < 4; ++h) {
                     if (hw_slots[h].client_idx != -1) {
@@ -183,7 +175,6 @@ static void writer_thread(int hz) {
                 }
             }
 
-            // 5. Send to physical USB gadget drivers efficiently
             bool ok = true;
             if (r.p1 != prev.p1) { if(write(fds[0], &r.p1, 8) < 0 && errno != EAGAIN) ok = false; }
             if (r.p2 != prev.p2) { if(write(fds[1], &r.p2, 8) < 0 && errno != EAGAIN) ok = false; }
@@ -191,7 +182,7 @@ static void writer_thread(int hz) {
             if (r.p4 != prev.p4) { if(write(fds[3], &r.p4, 8) < 0 && errno != EAGAIN) ok = false; }
 
             if (!ok) {
-                if (!error_shown) { std::puts("Switch disconnected — waiting for reconnect..."); error_shown = true; }
+                if (!error_shown) { std::puts("Switch disconnected — waiting..."); error_shown = true; }
                 for(int i=0; i<4; ++i) { close(fds[i]); fds[i] = -1; }
                 std::this_thread::sleep_for(ms(1000)); break;
             }
@@ -200,13 +191,11 @@ static void writer_thread(int hz) {
         }
     }
     
-    // Shutdown securely by neutralizing all ports
     MultiReport neutral{}; neutral.reset();
     for(int i=0; i<4; ++i) { 
         if (fds[i] >= 0) { (void)write(fds[i], &neutral.p1, 8); close(fds[i]); }
     }
 }
-
 
 // ── Stats thread ──────────────────────────────────────────────────────────────
 static void stats_thread() {
@@ -234,7 +223,6 @@ static bool rate_allow(uint32_t ip) {
     return s.count <= RATE_MAX_PKT;
 }
 
-
 #ifdef USE_UPNP
 // ── UPnP port forwarding ──
 static bool g_upnp_active = false;
@@ -244,27 +232,20 @@ static char g_upnp_lan_addr[64]{};
 
 static bool upnp_add_mapping(uint16_t port) {
     if (g_upnp_active) return false; 
-
     struct UPNPDev* devlist = upnpDiscover(2000, nullptr, nullptr, 0, 0, 2, nullptr);
     if (!devlist) return false;
-    
     int igd = UPNP_GetValidIGD(devlist, &g_upnp_urls, &g_upnp_data, g_upnp_lan_addr, sizeof(g_upnp_lan_addr), nullptr, 0);
     freeUPNPDevlist(devlist);
-    
     if (igd != 1 && igd != 2) return false;
-    
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
-    
     int r = UPNP_AddPortMapping(g_upnp_urls.controlURL, g_upnp_data.first.servicetype,
                                 port_str, port_str, g_upnp_lan_addr, "ns-backend", "UDP", nullptr, "0");
     if (r != 0) { FreeUPNPUrls(&g_upnp_urls); return false; }
-    
     g_upnp_active = true;
     char external_ip[40];
     if (UPNP_GetExternalIPAddress(g_upnp_urls.controlURL, g_upnp_data.first.servicetype, external_ip) == 0) {
-        std::printf("UPnP: UDP port %u successfully forwarded!\n", port);
-        std::printf("UPnP: Tell your clients to connect to -> %s:%u\n", external_ip, port);
+        std::printf("UPnP: UDP port %u forwarded. External IP: %s\n", port, external_ip);
     }
     return true;
 }
@@ -273,7 +254,7 @@ static void upnp_remove_mapping(uint16_t port) {
     if (!g_upnp_active) return;
     char port_str[8]; snprintf(port_str, sizeof(port_str), "%u", port);
     UPNP_DeletePortMapping(g_upnp_urls.controlURL, g_upnp_data.first.servicetype, port_str, "UDP", nullptr);
-    std::puts("UPnP: port mapping removed cleanly");
+    std::puts("UPnP: port mapping removed");
     FreeUPNPUrls(&g_upnp_urls); g_upnp_active = false;
 }
 #else
@@ -281,9 +262,7 @@ static bool upnp_add_mapping(uint16_t) { return false; }
 static void upnp_remove_mapping(uint16_t) {}
 #endif
 
-
 // ── Web Server (HTTP + WebSocket) ─────────────────────────────────────────────
-
 static const char* WEB_PAGE = R"html(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -428,114 +407,79 @@ function sendR(){
     for(let i=0;i<4;i++){let o=i*8;dv.setUint16(o,reps[i].b,true);dv.setUint8(o+2,reps[i].h);dv.setUint8(o+3,reps[i].lx);dv.setUint8(o+4,reps[i].ly);dv.setUint8(o+5,reps[i].rx);dv.setUint8(o+6,reps[i].ry);dv.setUint8(o+7,0);}
     ws.send(dv.buffer);
 }
-
-function logWebSocketStatus(message) {
-    const statusEl = document.getElementById('status');
-    if (statusEl) statusEl.textContent = message;
-}
-
 function conn(url){
     console.log("Connecting to:", url);
-    logWebSocketStatus("Connecting...");
-    
-    // ── FIXED: Removido o argumento 'ns-protocol' para evitar conflitos de handshake ──
-    ws = new WebSocket(url);
-    
+    document.getElementById('status').textContent = "Connecting...";
+    ws = new WebSocket(url, 'ns-protocol');
     ws.onopen = () => {
         console.log("WebSocket connected");
-        logWebSocketStatus("Connected (WebSocket)");
+        document.getElementById('status').textContent = "Connected";
         connected = true;
         ui();
+        if(pollId) clearInterval(pollId);
         pollId = setInterval(sendR, 4);
     };
-    
     ws.onmessage = (e) => {
         try {
             const d = JSON.parse(e.data);
             if (d.type === 'status' && d.clients){
                 for(let i=0;i<4;i++){
                     const el=document.getElementById(`p${i+1}`),c=d.clients[i];
-                    if(c&&c.active){
-                        el.textContent=`P${i+1}: Connected`;
-                        el.className='player active';
-                    }else{
-                        el.textContent=`P${i+1}: Idle`;
-                        el.className='player';
-                    }
+                    el.textContent = c&&c.active ? `P${i+1}: Connected` : `P${i+1}: Idle`;
+                    el.className = c&&c.active ? 'player active' : 'player';
                 }
-                if(d.pkts_rx!==undefined)document.getElementById('pkt-info').textContent=`Packets rx by Pi: ${d.pkts_rx}`;
+                if(d.pkts_rx!==undefined) document.getElementById('pkt-info').textContent = `Packets rx by Pi: ${d.pkts_rx}`;
             }
-        } catch(err) {
-            console.error("Error parsing message:", err);
-        }
+        } catch(err) { console.error("Parse error", err); }
     };
-    
     ws.onclose = (e) => {
         console.log("WebSocket closed:", e.code, e.reason);
-        logWebSocketStatus("Disconnected: " + (e.reason || "Unknown reason"));
+        document.getElementById('status').textContent = "Disconnected (Code "+e.code+")";
         connected = false;
         if(pollId) clearInterval(pollId);
         pollId = null;
         ui();
     };
-    
-    ws.onerror = (e) => {
-        console.error("WebSocket error:", e);
-        logWebSocketStatus("Error: Check console");
-    };
+    ws.onerror = (e) => { console.error("WebSocket error", e); };
 }
-
 function ui(){
     const b=document.getElementById('connect-btn');
-    b.textContent=connected?'Disconnect':'Connect'; b.className=connected?'btn-primary active':'btn-primary';
-    document.getElementById('ip').disabled=connected; document.getElementById('kb-mode').disabled=connected;
+    b.textContent=connected?'Disconnect':'Connect';
+    b.className=connected?'btn-primary active':'btn-primary';
+    document.getElementById('ip').disabled=connected;
+    document.getElementById('kb-mode').disabled=connected;
     document.getElementById('bindings-btn').disabled=(connected||kbMode===0);
 }
-
 document.getElementById('connect-btn').onclick=()=>{
     if(!connected){
         let inputIp=document.getElementById('ip').value.trim();
         try{localStorage.setItem('nsLastIP',inputIp)}catch(e){}
-        
         let wsProto = location.protocol === "https:" ? "wss://" : "ws://";
-        let url;
-        
-        if (!inputIp) {
-            url = `${wsProto}${location.host}/`;
-        } else {
-            let targetHost = inputIp;
-            if (!targetHost.includes(':')) {
-                targetHost += ":7331";
-            }
-            url = `${wsProto}${targetHost}/`;
-        }
-        
+        let url = !inputIp ? `${wsProto}${location.host}/` : `${wsProto}${inputIp.includes(':')?inputIp:inputIp+':7331'}/`;
         conn(url);
-    }else{ws.close();}
+    }else{ ws.close(); }
 };
-
 document.getElementById('kb-mode').onchange=e=>{
     kbMode=parseInt(e.target.value);
     try{localStorage.setItem('nsKbMode',kbMode)}catch(err){}
-    const bb=document.getElementById('bindings-btn'); bb.disabled=(kbMode===0);
+    const bb=document.getElementById('bindings-btn');
+    bb.disabled=(kbMode===0);
     bb.onclick=kbMode!==0?openEditor:null;
 };
-if(kbMode!==0)document.getElementById('bindings-btn').onclick=openEditor;
-document.getElementById('bindings-btn').disabled=(kbMode===0);
-
+if(kbMode!==0) document.getElementById('bindings-btn').onclick=openEditor;
 window.addEventListener('keydown',e=>{
-    if(kbMode===0||!connected||listeningIdx>=0)return;
-    if(e.target.tagName==='INPUT' || e.target.tagName==='SELECT') return;
+    if(kbMode===0||!connected||listeningIdx>=0) return;
+    if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
     keys[e.code]=true;
-    if(!e.code.startsWith('F'))e.preventDefault();
+    if(!e.code.startsWith('F')) e.preventDefault();
 });
 window.addEventListener('keyup',e=>{
-    if(kbMode===0)return;
-    if(e.target.tagName==='INPUT' || e.target.tagName==='SELECT') return;
+    if(kbMode===0) return;
+    if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
     keys[e.code]=false;
-    if(!e.code.startsWith('F'))e.preventDefault();
+    if(!e.code.startsWith('F')) e.preventDefault();
 });
-window.addEventListener('beforeunload',()=>{if(ws&&ws.readyState===1)ws.close();});
+window.addEventListener('beforeunload',()=>{ if(ws && ws.readyState===1) ws.close(); });
 ui();
 </script>
 </body>
@@ -632,24 +576,7 @@ static std::string ws_accept_key(const std::string& key) {
     return b64enc(hash, 20);
 }
 
-// ── FIXED: read_fully tolerates EAGAIN correctly ──
-static bool read_fully(int fd, void* buf, size_t len) {
-    uint8_t* p = (uint8_t*)buf;
-    while (len > 0) {
-        ssize_t n = read(fd, p, len);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            }
-            return false;
-        }
-        if (n == 0) return false;
-        p += n; len -= (size_t)n;
-    }
-    return true;
-}
-
+// ── WebSocket frame helpers ───────────────────────────────────────────────────
 static bool ws_send_frame(int fd, const void* data, size_t len, uint8_t opcode) {
     uint8_t hdr[14]; size_t hl;
     hdr[0] = 0x80 | opcode;
@@ -667,100 +594,104 @@ static bool ws_send_frame(int fd, const void* data, size_t len, uint8_t opcode) 
     return sendmsg(fd, &msg, MSG_NOSIGNAL) == (ssize_t)(hl + len);
 }
 
-// Returns: -1 = error, -2 = close, 0 = control frame (no data), >0 = payload length
 static int ws_recv_frame(int fd, uint8_t* buf, size_t cap) {
     uint8_t hdr[2];
-    if (!read_fully(fd, hdr, 2)) return -1;
-    
-    bool fin = (hdr[0] & 0x80) != 0;
-    uint8_t opcode = hdr[0] & 0x0F;
+    ssize_t n = recv(fd, hdr, 2, MSG_WAITALL);
+    if (n != 2) return -1;
     bool mask = (hdr[1] & 0x80) != 0;
     uint64_t len = hdr[1] & 0x7F;
-
-    if (!fin && opcode == 0x0) {
-        std::puts("Warning: Fragmented frames not fully supported");
-    }
-
     if (len == 126) {
-        uint8_t ext[2]; if (!read_fully(fd, ext, 2)) return -1;
+        uint8_t ext[2];
+        if (recv(fd, ext, 2, MSG_WAITALL) != 2) return -1;
         len = (uint64_t)ext[0] << 8 | ext[1];
     } else if (len == 127) {
-        uint8_t ext[8]; if (!read_fully(fd, ext, 8)) return -1;
-        len = 0; for (int i = 0; i < 8; ++i) len = (len << 8) | ext[i];
+        uint8_t ext[8];
+        if (recv(fd, ext, 8, MSG_WAITALL) != 8) return -1;
+        len = 0;
+        for (int i = 0; i < 8; ++i) len = (len << 8) | ext[i];
     }
-    
     uint8_t mk[4] = {0};
-    if (mask && !read_fully(fd, mk, 4)) return -1;
+    if (mask && recv(fd, mk, 4, MSG_WAITALL) != 4) return -1;
     if (len > cap) return -1;
-    if (len > 0 && !read_fully(fd, buf, (size_t)len)) return -1;
+    if (len > 0 && recv(fd, buf, len, MSG_WAITALL) != (ssize_t)len) return -1;
     if (mask) for (uint64_t i = 0; i < len; ++i) buf[i] ^= mk[i & 3];
-
-    if (g_verbose) {
-        std::printf("Received WebSocket frame: fd=%d, len=%llu, opcode=%d\n", fd, (unsigned long long)len, opcode);
-    }
-
-    if (opcode == 0x8) return -2; // Close
-    if (opcode == 0x9) { // Ping -> Pong
-        // ── FIXED: Proper Pong generation ──
-        ws_send_frame(fd, buf, (size_t)len, 0xA);
-        return 0;
-    }
-    if (opcode == 0xA) return 0; // Pong
+    uint8_t opcode = hdr[0] & 0x0F;
+    if (opcode == 0x8) return -2; // close
+    if (opcode == 0x9) { ws_send_frame(fd, buf, len, 0xA); return 0; } // ping->pong
+    if (opcode == 0xA) return 0; // pong
     return (int)len;
 }
 
+// ── Web Server Thread (fixed, using select) ───────────────────────────────────
 static void webserver_thread(int port) {
     std::puts("WebSocket server starting...");
-    int sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (sock < 0) { perror("web socket"); return; }
-    int yes = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(port);
-    if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("web bind"); close(sock); return; }
-    if (listen(sock, 8) < 0) { perror("web listen"); close(sock); return; }
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) { perror("socket"); return; }
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+    if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind"); close(listen_fd); return;
+    }
+    if (listen(listen_fd, 10) < 0) {
+        perror("listen"); close(listen_fd); return;
+    }
+    std::printf("Web server listening on port %d\n", port);
 
-    // ── FIXED: Add an HTTP buffer per client to withstand chunked headers ──
-    struct Client { int fd; bool ws; std::string http_buf; };
+    struct Client {
+        int fd;
+        bool websocket;
+        std::string buffer;
+    };
     std::vector<Client> clients;
     uint64_t last_status = 0;
 
     while (g_running.load(std::memory_order_relaxed)) {
-        // Build poll set
-        std::vector<struct pollfd> pfds;
-        pfds.push_back({sock, POLLIN, 0});
-        for (auto& c : clients) pfds.push_back({c.fd, POLLIN, 0});
-
-        int n = poll(pfds.data(), (nfds_t)pfds.size(), 1000); // ── FIXED: Timeout aumentado para 1000ms ──
-        if (n < 0) { if (errno == EINTR) continue; break; }
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        int max_fd = listen_fd;
+        FD_SET(listen_fd, &readfds);
+        for (auto& c : clients) {
+            FD_SET(c.fd, &readfds);
+            if (c.fd > max_fd) max_fd = c.fd;
+        }
+        struct timeval tv = {0, 100000}; // 100ms
+        int activity = select(max_fd + 1, &readfds, nullptr, nullptr, &tv);
+        if (activity < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
 
         // Accept new connections
-        if (n > 0 && (pfds[0].revents & POLLIN)) {
-            sockaddr_in ca{}; socklen_t sl = sizeof(ca);
-            int cfd = accept(sock, (sockaddr*)&ca, &sl);
+        if (FD_ISSET(listen_fd, &readfds)) {
+            struct sockaddr_in ca;
+            socklen_t sl = sizeof(ca);
+            int cfd = accept(listen_fd, (struct sockaddr*)&ca, &sl);
             if (cfd >= 0) {
-                int fl = fcntl(cfd, F_GETFL, 0);
-                fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
                 clients.push_back({cfd, false, ""});
+                if (g_verbose) std::printf("New client fd=%d from %s\n", cfd, inet_ntoa(ca.sin_addr));
             }
         }
 
         // Process existing clients
         std::vector<int> dead;
         for (size_t i = 0; i < clients.size(); ++i) {
-            int pi = (int)i + 1; // index into pfds
-            if (pi >= (int)pfds.size() || !(pfds[pi].revents & (POLLIN | POLLHUP | POLLERR)))
-                continue;
-
             int fd = clients[i].fd;
-            if (clients[i].ws) {
-                uint8_t buf[256]; 
-                int r = ws_recv_frame(fd, buf, sizeof(buf));
-                if (r == -2 || r == -1) { dead.push_back((int)i); continue; }
-                if (r == 0) continue; // control frame
-                
-                if (g_verbose) std::printf("WS frame received: %d bytes\n", r);
+            if (!FD_ISSET(fd, &readfds)) continue;
 
+            if (clients[i].websocket) {
+                uint8_t buf[4096];
+                int r = ws_recv_frame(fd, buf, sizeof(buf));
+                if (r == -2 || r == -1) {
+                    dead.push_back(i);
+                    continue;
+                }
+                if (r == 0) continue;
+                if (g_verbose) std::printf("WS frame %d bytes from fd=%d\n", r, fd);
                 if (r >= (int)sizeof(MultiReport)) {
                     MultiReport report;
                     memcpy(&report, buf, sizeof(MultiReport));
@@ -780,123 +711,99 @@ static void webserver_thread(int port) {
                     g_clients[WEB_CLIENT_IDX].last_rx_us = now_us();
                 }
             } else {
-                uint8_t rbuf[8192]; // ── FIXED: Aumentado para lidar com headers maiores (ex. vários cookies)
-                ssize_t nr = recv(fd, rbuf, sizeof(rbuf)-1, MSG_DONTWAIT);
-                if (nr <= 0) { dead.push_back((int)i); continue; }
-                
-                // ── FIXED: Buffering HTTP headers and parsing case-insensitively ──
-                clients[i].http_buf.append((const char*)rbuf, nr);
-                
-                if (clients[i].http_buf.find("\r\n\r\n") == std::string::npos) {
-                    continue; // Wait until full header block arrives
+                char buf[8192];
+                ssize_t n = recv(fd, buf, sizeof(buf)-1, 0);
+                if (n <= 0) {
+                    dead.push_back(i);
+                    continue;
                 }
+                buf[n] = '\0';
+                clients[i].buffer.append(buf, n);
+                if (clients[i].buffer.find("\r\n\r\n") == std::string::npos)
+                    continue; // wait for full headers
 
-                std::string req = clients[i].http_buf;
-                std::string req_lower = req;
-                std::transform(req_lower.begin(), req_lower.end(), req_lower.begin(), ::tolower);
+                std::string req = clients[i].buffer;
+                std::string lower = req;
+                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
-                if (req_lower.find("upgrade: websocket") != std::string::npos) {
-                    auto kp = req_lower.find("sec-websocket-key:");
-                    if (kp != std::string::npos) {
-                        kp = req_lower.find(':', kp) + 1;
-                        while (kp < req_lower.size() && req_lower[kp] == ' ') ++kp;
-                        auto ke = req_lower.find("\r\n", kp);
-                        if (ke != std::string::npos) {
-                            // ── FIXED: Extrair a chave do texto ORIGINAL (não lowercased) ──
-                            std::string key = req.substr(kp, ke - kp);
-                            
-                            // Remove espaços e quebras de linha em excesso
-                            key.erase(0, key.find_first_not_of(" \t\r\n"));
-                            key.erase(key.find_last_not_of(" \t\r\n") + 1);
-                            
+                if (lower.find("upgrade: websocket") != std::string::npos) {
+                    size_t key_pos = lower.find("sec-websocket-key:");
+                    if (key_pos != std::string::npos) {
+                        key_pos = req.find(':', key_pos) + 1;
+                        while (key_pos < req.size() && req[key_pos] == ' ') key_pos++;
+                        size_t end = req.find("\r\n", key_pos);
+                        if (end != std::string::npos) {
+                            std::string key = req.substr(key_pos, end - key_pos);
+                            key.erase(std::remove_if(key.begin(), key.end(), ::isspace), key.end());
                             std::string accept = ws_accept_key(key);
-                            
-                            if (g_verbose) {
-                                std::printf("WebSocket handshake for fd=%d, key='%s'\n", fd, key.c_str());
-                                std::printf("Accept key: %s\n", accept.c_str());
-                            }
-                            
-                            // ── FIXED: Removido o Sec-WebSocket-Protocol daqui para prevenir conflitos ──
-                            std::string resp =
+                            std::string response =
                                 "HTTP/1.1 101 Switching Protocols\r\n"
                                 "Upgrade: websocket\r\n"
                                 "Connection: Upgrade\r\n"
-                                "Sec-WebSocket-Accept: " + accept + "\r\n\r\n"; 
-                            
-                            if (g_verbose) std::printf("Response:\n%s\n", resp.c_str());
-                            
-                            ssize_t sent = write(fd, resp.data(), resp.size());
-                            if (sent != (ssize_t)resp.size()) {
-                                std::puts("Failed to send WebSocket handshake");
-                                dead.push_back((int)i);
-                                continue;
+                                "Sec-WebSocket-Accept: " + accept + "\r\n"
+                                "Sec-WebSocket-Protocol: ns-protocol\r\n\r\n";
+                            if (send(fd, response.data(), response.size(), 0) == (ssize_t)response.size()) {
+                                clients[i].websocket = true;
+                                clients[i].buffer.clear();
+                                std::puts("WebSocket handshake OK");
+                            } else {
+                                dead.push_back(i);
                             }
-                            
-                            clients[i].ws = true;
-                            clients[i].http_buf.clear(); // Clean up memory
-                            std::puts("WebSocket handshake completed");
-                        } else { dead.push_back((int)i); }
-                    } else { dead.push_back((int)i); }
+                            continue;
+                        }
+                    }
+                    dead.push_back(i);
                 } else if (req.find("GET ") == 0) {
-                    size_t slen = strlen(WEB_PAGE);
-                    std::string resp =
+                    std::string page(WEB_PAGE);
+                    std::string response =
                         "HTTP/1.1 200 OK\r\n"
                         "Content-Type: text/html; charset=utf-8\r\n"
-                        "Connection: close\r\n"
-                        "Content-Length: " + std::to_string(slen) + "\r\n\r\n" + WEB_PAGE;
-                    write(fd, resp.data(), resp.size());
-                    dead.push_back((int)i);
+                        "Content-Length: " + std::to_string(page.size()) + "\r\n"
+                        "Connection: close\r\n\r\n" + page;
+                    send(fd, response.data(), response.size(), 0);
+                    dead.push_back(i);
                 } else {
-                    std::string resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                    write(fd, resp.data(), resp.size());
-                    dead.push_back((int)i);
+                    dead.push_back(i);
                 }
             }
         }
 
-        // Cleanup dead clients (reverse order to maintain indices)
+        // Remove dead clients
         std::sort(dead.begin(), dead.end(), std::greater<int>());
         for (int idx : dead) {
             if (idx >= 0 && idx < (int)clients.size()) {
-                if (clients[idx].ws) {
-                    // Reset web client state
+                if (clients[idx].websocket) {
                     std::lock_guard<std::mutex> lk(g_mtx);
                     g_clients[WEB_CLIENT_IDX].active = false;
-                    g_clients[WEB_CLIENT_IDX].report.reset();
                 }
                 close(clients[idx].fd);
                 clients.erase(clients.begin() + idx);
             }
         }
-        dead.clear();
 
-        // Broadcast status periodically
+        // Broadcast status to WebSocket clients
         uint64_t now = now_us();
-        if (now - last_status > 100000) { // Every 100ms
+        if (now - last_status > 100000) {
             last_status = now;
             std::string json;
-            
-            // ── FIXED: Thread-safe generation of the status payload ──
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
                 json = "{\"type\":\"status\",\"clients\":[";
                 for (int i = 0; i < MAX_CLIENTS; ++i) {
-                    if (i > 0) json += ",";
+                    if (i) json += ",";
                     json += "{\"active\":" + std::string(g_clients[i].active ? "true" : "false") + "}";
                 }
                 json += "],\"pkts_rx\":" + std::to_string(g_pkts_rx.load()) + "}";
             }
-
             for (auto& c : clients) {
-                if (c.ws) ws_send_frame(c.fd, json.data(), json.size(), 1);
+                if (c.websocket) ws_send_frame(c.fd, json.data(), json.size(), 1);
             }
         }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     for (auto& c : clients) close(c.fd);
-    close(sock);
+    close(listen_fd);
+    std::puts("WebSocket server stopped");
 }
 
 // ── UDP receive loop (main thread) ────────────────────────────────────────────
@@ -926,81 +833,50 @@ int main(int argc, char** argv) {
 
     int sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (sock < 0) { perror("socket"); return 1; }
-
     int yes = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
     int rbuf = 256 * 1024;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof(rbuf));
-
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(port);
     addr.sin_addr.s_addr = inet_addr(bind_addr.c_str());
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); close(sock); return 1; }
-    
-    std::printf("UDP %s:%u writer=%d Hz\n",
-                bind_addr.c_str(), port, WRITER_HZ);
+    std::printf("UDP %s:%u writer=%d Hz\n", bind_addr.c_str(), port, WRITER_HZ);
 
     std::thread wt(writer_thread, WRITER_HZ);
     std::thread st(stats_thread);
     std::thread web;
-    if (do_web) {
-        web = std::thread(webserver_thread, port);
-    }
+    if (do_web) web = std::thread(webserver_thread, port);
 
-    int ep = epoll_create1(0); epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = sock; epoll_ctl(ep, EPOLL_CTL_ADD, sock, &ev);
-
+    int ep = epoll_create1(0);
+    epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = sock;
+    epoll_ctl(ep, EPOLL_CTL_ADD, sock, &ev);
     Packet pkt{};
     epoll_event evs[4];
 
     while (g_running.load(std::memory_order_relaxed)) {
-        int n = epoll_wait(ep, evs, 4, 200 /*ms timeout*/);
+        int n = epoll_wait(ep, evs, 4, 200);
         if (n <= 0) continue;
-
         sockaddr_in sender{};
         socklen_t slen = sizeof(sender);
         ssize_t bytes = recvfrom(sock, &pkt, sizeof(pkt), 0, (sockaddr*)&sender, &slen);
-
         if (bytes != (ssize_t)PACKET_SIZE) continue;
-
-        // ── 1. Per-IP rate limiter ────────────────────────────────────────────────
         uint32_t src_ip = sender.sin_addr.s_addr;
-        if (!rate_allow(src_ip)) {
-            if (g_verbose) puts("rate limit exceeded, dropped");
-            continue;
-        }
-
-        // ── 2. Magic + version check ──────────────────────────────────────────────
-        if (!packet_ok(pkt)) {
-            if (g_verbose) puts("bad magic/version, dropped");
-            continue;
-        }
-
-        // ── 3. HMAC authentication ────────────────────────────────────────────────
+        if (!rate_allow(src_ip)) { if (g_verbose) puts("rate limit"); continue; }
+        if (!packet_ok(pkt)) { if (g_verbose) puts("bad magic"); continue; }
         if (hmac_verify(g_hmac_key, 32, (const uint8_t *)&pkt, PACKET_AUTH_SIZE, pkt.hmac, HMAC_TAG_SIZE) != 0) {
-            if (g_verbose) puts("bad HMAC, dropped");
-            continue;
+            if (g_verbose) puts("bad HMAC"); continue;
         }
-
         int client_idx = -1;
         uint64_t now = now_us();
         bool is_reset = (pkt.flags & FLAG_RESET);
-
-        // ── FIXED: Complete Thread-safety around g_clients structure ──
         {
             std::lock_guard<std::mutex> lk(g_mtx);
-            static constexpr int UDP_SLOTS = MAX_CLIENTS - 1;
-            
-            // Find existing Session
+            constexpr int UDP_SLOTS = MAX_CLIENTS - 1;
             for (int i = 0; i < UDP_SLOTS; ++i) {
-                if (g_clients[i].active &&
-                    g_clients[i].addr.sin_addr.s_addr == src_ip &&
-                    g_clients[i].addr.sin_port == sender.sin_port) {
-                    client_idx = i;
-                    break;
+                if (g_clients[i].active && g_clients[i].addr.sin_addr.s_addr == src_ip && g_clients[i].addr.sin_port == sender.sin_port) {
+                    client_idx = i; break;
                 }
             }
-
-            // Assign new Session if full
             if (client_idx == -1) {
                 for (int i = 0; i < UDP_SLOTS; ++i) {
                     if (!g_clients[i].active || (now - g_clients[i].last_rx_us > WATCHDOG_MS * 1000ULL)) {
@@ -1009,37 +885,25 @@ int main(int argc, char** argv) {
                         g_clients[i].addr = sender;
                         g_clients[i].first_pkt = true;
                         g_clients[i].report.reset();
-                        if (g_verbose) std::printf("New PC accepted into Server Slot %d/4\n", i+1);
+                        if (g_verbose) std::printf("New PC slot %d\n", i+1);
                         break;
                     }
                 }
             }
-
-            // Apply payload sequence + update
             if (client_idx != -1) {
-                bool sequence_jump = (g_clients[client_idx].expected_seq > pkt.seq) && ((g_clients[client_idx].expected_seq - pkt.seq) > 100);
-
-                if (!g_clients[client_idx].first_pkt && pkt.seq < g_clients[client_idx].expected_seq && !is_reset && !sequence_jump) {
-                    if (g_verbose)
-                        std::printf("PC %d out-of-order seq=%u, dropped\n", client_idx+1, pkt.seq);
+                bool jump = (g_clients[client_idx].expected_seq > pkt.seq) && ((g_clients[client_idx].expected_seq - pkt.seq) > 100);
+                if (!g_clients[client_idx].first_pkt && pkt.seq < g_clients[client_idx].expected_seq && !is_reset && !jump) {
+                    if (g_verbose) std::printf("Out-of-order seq %u\n", pkt.seq);
                 } else {
                     g_clients[client_idx].first_pkt = false;
                     g_clients[client_idx].expected_seq = pkt.seq + 1;
-                    if (is_reset) {
-                        g_clients[client_idx].report.reset();
-                    } else {
-                        g_clients[client_idx].report = pkt.report;
-                    }
+                    if (is_reset) g_clients[client_idx].report.reset();
+                    else g_clients[client_idx].report = pkt.report;
                     g_clients[client_idx].last_rx_us = now;
                 }
             }
-        } // lock released
-
-        if (client_idx == -1) {
-            if (g_verbose) puts("server is full (4 PCs already active), dropped");
-            continue;
         }
-
+        if (client_idx == -1) { if (g_verbose) puts("server full"); continue; }
         ++g_pkts_rx;
     }
 
