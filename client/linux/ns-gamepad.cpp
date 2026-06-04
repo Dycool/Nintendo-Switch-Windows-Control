@@ -43,6 +43,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 static SDL_GameController* g_pads[4] = {nullptr, nullptr, nullptr, nullptr};
+static int keyboard_mode = 0; // 0=off, 1=single, 2=override
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Signal handling
@@ -108,14 +109,20 @@ void scan_for_gamepads() {
                 if (!pad) break;
                 g_pads[p] = pad;
                 const char* name = SDL_GameControllerName(pad);
-                std::cout << "Mapped '" << (name ? name : "Unknown") << "' to local slot P" << (p + 1) << "\n";
+                int display_slot = p + 1;
+                if (keyboard_mode == 1 && p == 0) {
+                    int free_idx = 1;
+                    while (free_idx < 4 && g_pads[free_idx]) free_idx++;
+                    display_slot = free_idx + 1;
+                }
+                std::cout << "Mapped '" << (name ? name : "Unknown") << "' to local slot P" << display_slot << "\n";
                 break;
             }
         }
     }
     if (num == 0) {
         if (!no_controllers_printed) {
-            std::cout << "No controllers detected — waiting for connections...\n";
+            std::cout << "No controllers detected - waiting for connections...\n";
             no_controllers_printed = true;
         }
     } else {
@@ -382,7 +389,6 @@ struct KeyBindings {
 //  Entry point
 // ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
-    int keyboard_mode = 0;
     std::string host;
     int port = ns::DEFAULT_PORT;
 
@@ -417,7 +423,7 @@ int main(int argc, char** argv) {
     if (keyboard_mode) {
         kb.load_or_create();
         kb.mode = keyboard_mode;
-        std::cout << "Keyboard mode enabled (" << (keyboard_mode == 1 ? "single" : "override") << ") — ";
+        std::cout << "Keyboard mode enabled (" << (keyboard_mode == 1 ? "single" : "override") << ") - ";
         std::cout << (keyboard_mode == 1 ? "replaces" : "augments") << " Player 1\n";
     }
 

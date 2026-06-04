@@ -73,6 +73,7 @@ static GCController* g_controllers[MAX_SLOTS] = {};
 // Only the main thread reads/writes g_controllers[]; the sender thread only
 // reads g_slot_active[].
 static std::atomic<bool> g_slot_active[MAX_SLOTS] = {};
+static int keyboard_mode = 0; // 0=off, 1=single, 2=override
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Signal handling
@@ -416,7 +417,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    int keyboard_mode = 0;
     std::string host;
     int port = ns::DEFAULT_PORT;
 
@@ -451,7 +451,7 @@ int main(int argc, char** argv) {
     if (keyboard_mode) {
         kb.load_or_create();
         kb.mode = keyboard_mode;
-        std::cout << "Keyboard mode enabled (" << (keyboard_mode == 1 ? "single" : "override") << ") — ";
+        std::cout << "Keyboard mode enabled (" << (keyboard_mode == 1 ? "single" : "override") << ") - ";
         std::cout << (keyboard_mode == 1 ? "replaces" : "augments") << " Player 1\n";
     }
 
@@ -563,9 +563,15 @@ int main(int argc, char** argv) {
         for (int i = 0; i < MAX_SLOTS; ++i) {
             if (g_controllers[i] == nullptr) {
                 g_controllers[i] = ctrl;
-                g_slot_active[i].store(true, std::memory_order_relaxed); // FIX 1
+                g_slot_active[i].store(true, std::memory_order_relaxed);
                 NSString* name = ctrl.vendorName ?: @"Unknown Controller";
-                std::cout << "Mapped '" << name.UTF8String << "' to local slot P" << (i + 1) << "\n";
+                int display_slot = i + 1;
+                if (keyboard_mode == 1 && i == 0) {
+                    int free_idx = 1;
+                    while (free_idx < MAX_SLOTS && g_controllers[free_idx]) free_idx++;
+                    display_slot = free_idx + 1;
+                }
+                std::cout << "Mapped '" << name.UTF8String << "' to local slot P" << display_slot << "\n";
                 attach_handlers(ctrl.extendedGamepad, &g_states[i]);
                 break;
             }
@@ -599,9 +605,15 @@ int main(int argc, char** argv) {
         for (int i = 0; i < MAX_SLOTS; ++i) {
             if (g_controllers[i] == nullptr) {
                 g_controllers[i] = ctrl;
-                g_slot_active[i].store(true, std::memory_order_relaxed); // FIX 1
+                g_slot_active[i].store(true, std::memory_order_relaxed);
                 NSString* name = ctrl.vendorName ?: @"Unknown Controller";
-                std::cout << "Mapped '" << name.UTF8String << "' to local slot P" << (i + 1) << "\n";
+                int display_slot = i + 1;
+                if (keyboard_mode == 1 && i == 0) {
+                    int free_idx = 1;
+                    while (free_idx < MAX_SLOTS && g_controllers[free_idx]) free_idx++;
+                    display_slot = free_idx + 1;
+                }
+                std::cout << "Mapped '" << name.UTF8String << "' to local slot P" << display_slot << "\n";
                 attach_handlers(ctrl.extendedGamepad, &g_states[i]);
                 break;
             }
@@ -609,7 +621,7 @@ int main(int argc, char** argv) {
     }
 
     if ([GCController controllers].count == 0) {
-        std::cout << "No controllers detected — waiting for connections...\n";
+        std::cout << "No controllers detected - waiting for connections...\n";
     }
 
     // ── Main NSRunLoop ─────────────────────────────────────────────────────────

@@ -76,6 +76,7 @@ ns::HIDReport map_xinput_to_switch(const XINPUT_GAMEPAD& pad) {
 // ── XInput Throttling (Prevents USB driver crash on Windows) ──
 static uint64_t g_last_check_us[4] = {0, 0, 0, 0};
 static bool g_is_connected[4] = {false, false, false, false};
+static int keyboard_mode = 0; // 0=off, 1=single, 2=override
 
 // Checks for controller status efficiently and maps its inputs
 void fetch_pad_throttled(DWORD index, ns::HIDReport& rep, bool& conn) {
@@ -96,8 +97,15 @@ void fetch_pad_throttled(DWORD index, ns::HIDReport& rep, bool& conn) {
         conn = false; return;
     }
     
-    if (!g_is_connected[index])
-        std::cout << "Mapped 'Xbox controller' to local slot P" << (index + 1) << "\n";
+    if (!g_is_connected[index]) {
+        int slot = index + 1;
+        if (keyboard_mode == 1 && index == 0) {
+            if (!g_is_connected[1]) slot = 2;
+            else if (!g_is_connected[2]) slot = 3;
+            else slot = 4;
+        }
+        std::cout << "Mapped 'Xbox controller' to local slot P" << slot << "\n";
+    }
     g_is_connected[index] = true; conn = true;
     rep = map_xinput_to_switch(state.Gamepad);
 }
@@ -281,7 +289,6 @@ int main(int argc, char** argv) {
         timeEndPeriod(1); return 1;
     }
 
-    int keyboard_mode = 0;
     std::string host;
     int port = ns::DEFAULT_PORT;
 
@@ -315,7 +322,7 @@ int main(int argc, char** argv) {
     if (keyboard_mode) {
         kb.load_or_create();
         kb.mode = keyboard_mode;
-        std::cout << "Keyboard mode enabled (" << (keyboard_mode == 1 ? "single" : "override") << ") — ";
+        std::cout << "Keyboard mode enabled (" << (keyboard_mode == 1 ? "single" : "override") << ") - ";
         std::cout << (keyboard_mode == 1 ? "replaces" : "augments") << " Player 1\n";
     }
 
@@ -405,7 +412,7 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(4));
         } else {
             if (!no_controllers_printed) {
-                std::cout << "No controllers detected — waiting for connections...\n";
+                std::cout << "No controllers detected - waiting for connections...\n";
                 no_controllers_printed = true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
