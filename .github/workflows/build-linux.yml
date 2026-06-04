@@ -27,9 +27,18 @@ jobs:
       - name: Build GUI Client (Dear ImGui)
         run: |
           cd client/linux/
+          IMGUI_VER="1.91.0"
+          curl -sL "https://github.com/ocornut/imgui/archive/refs/tags/v${IMGUI_VER}.zip" -o /tmp/imgui.zip
+          unzip -q -o /tmp/imgui.zip -d /tmp/
+          ISRC="/tmp/imgui-${IMGUI_VER}"
           g++ -O3 -std=c++17 ns-gui.cpp \
-            imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp \
-            backends/imgui_impl_sdl2.cpp backends/imgui_impl_sdlrenderer2.cpp \
+            "${ISRC}/imgui.cpp" \
+            "${ISRC}/imgui_draw.cpp" \
+            "${ISRC}/imgui_tables.cpp" \
+            "${ISRC}/imgui_widgets.cpp" \
+            "${ISRC}/backends/imgui_impl_sdl2.cpp" \
+            "${ISRC}/backends/imgui_impl_sdlrenderer2.cpp" \
+            -I"${ISRC}" -I"${ISRC}/backends" \
             -o ns-gui -lpthread -lSDL2
 
       - uses: actions/upload-artifact@v6
