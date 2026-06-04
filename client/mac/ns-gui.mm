@@ -391,7 +391,8 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
         listeningIdx = -1;
         setupMode = NO;
 
-        NSRect frame = NSMakeRect(0, 0, 600, 460);
+        // 1. Expand window slightly to accommodate larger buttons and spacing
+        NSRect frame = NSMakeRect(0, 0, 680, 480);
         NSWindow* win = [[NSWindow alloc] initWithContentRect:frame
             styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
             backing:NSBackingStoreBuffered defer:NO];
@@ -402,68 +403,87 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
         KeyCaptureView* view = [[KeyCaptureView alloc] initWithFrame:frame];
         [view setEditor:self];
         [win setContentView:view];
-        int y = (int)frame.size.height - 30;
+        
+        // Start rendering lower from the top to give breathing room
+        int y = (int)frame.size.height - 40;
 
-        int lx = 15, rx = 302;
-        int labelW = 100, keyW = 110, btnW = 54, gap = 4;
+        // 2. Adjust columns and expand btnW to 75 so "Change" fits
+        int lx = 20;
+        int rx = 350; // Shifted further right to make room for the wider left column
+        int labelW = 115, keyW = 110, btnW = 75, gap = 5;
         int half = (int)binding_keys.size() / 2;
+        
         for (int i = 0; i < half; i++) {
             int li = i, ri = i + half;
+            
             // Left column
             NSTextField* ll = [[NSTextField alloc] initWithFrame:NSMakeRect(lx, y - 22, labelW, 20)];
             [ll setStringValue:[NSString stringWithUTF8String:binding_keys[li].c_str()]];
             [ll setBezeled:NO]; [ll setDrawsBackground:NO]; [ll setEditable:NO]; [ll setSelectable:NO];
-            [ll setAlignment:NSTextAlignmentCenter];
+            [ll setAlignment:NSTextAlignmentRight]; // Right-aligning labels looks much cleaner
             [view addSubview:ll];
+            
             NSTextField* lv = [[NSTextField alloc] initWithFrame:NSMakeRect(lx + labelW + gap, y - 22, keyW, 20)];
             [lv setStringValue:[NSString stringWithUTF8String:editBindings[binding_keys[li]].c_str()]];
             [lv setBezeled:YES]; [lv setDrawsBackground:YES]; [lv setEditable:NO]; [lv setSelectable:NO];
             [lv setAlignment:NSTextAlignmentCenter];
             [view addSubview:lv];
             keyLabels.push_back(lv);
+            
             NSButton* lc = [[NSButton alloc] initWithFrame:NSMakeRect(lx + labelW + gap + keyW + gap, y - 24, btnW, 24)];
             [lc setTitle:@"Change"]; [lc setBezelStyle:NSBezelStyleRounded];
             [lc setTag:(NSInteger)li]; [lc setTarget:self]; [lc setAction:@selector(changeClicked:)];
             [view addSubview:lc];
+            
             // Right column
             NSTextField* rl = [[NSTextField alloc] initWithFrame:NSMakeRect(rx, y - 22, labelW, 20)];
             [rl setStringValue:[NSString stringWithUTF8String:binding_keys[ri].c_str()]];
             [rl setBezeled:NO]; [rl setDrawsBackground:NO]; [rl setEditable:NO]; [rl setSelectable:NO];
-            [rl setAlignment:NSTextAlignmentCenter];
+            [rl setAlignment:NSTextAlignmentRight];
             [view addSubview:rl];
+            
             NSTextField* rv = [[NSTextField alloc] initWithFrame:NSMakeRect(rx + labelW + gap, y - 22, keyW, 20)];
             [rv setStringValue:[NSString stringWithUTF8String:editBindings[binding_keys[ri]].c_str()]];
             [rv setBezeled:YES]; [rv setDrawsBackground:YES]; [rv setEditable:NO]; [rv setSelectable:NO];
             [rv setAlignment:NSTextAlignmentCenter];
             [view addSubview:rv];
             keyLabels.push_back(rv);
+            
             NSButton* rc = [[NSButton alloc] initWithFrame:NSMakeRect(rx + labelW + gap + keyW + gap, y - 24, btnW, 24)];
             [rc setTitle:@"Change"]; [rc setBezelStyle:NSBezelStyleRounded];
             [rc setTag:(NSInteger)ri]; [rc setTarget:self]; [rc setAction:@selector(changeClicked:)];
             [view addSubview:rc];
-            y -= 26;
+            
+            y -= 28; // Increased from 26 for slightly better row breathing room
         }
 
-        y -= 8;
-        int aw = 74;
-        int leftBtnX = lx;
-        int rightBtnX = rx + labelW + gap + keyW + gap + btnW - aw;
-        // Left: Save (above) Cancel (below)
-        NSButton* saveBtn = [[NSButton alloc] initWithFrame:NSMakeRect(leftBtnX, y - 4, aw, 28)];
-        [saveBtn setTitle:@"Save"]; [saveBtn setBezelStyle:NSBezelStyleRounded];
-        [saveBtn setTarget:self]; [saveBtn setAction:@selector(save)];
-        [view addSubview:saveBtn];
-        NSButton* setupBtn = [[NSButton alloc] initWithFrame:NSMakeRect(rightBtnX, y - 4, aw, 28)];
-        [setupBtn setTitle:@"Setup"]; [setupBtn setBezelStyle:NSBezelStyleRounded];
-        [setupBtn setTarget:self]; [setupBtn setAction:@selector(setupClicked)];
-        [view addSubview:setupBtn];
-        y -= 34;
-        // Right: Cancel (below left) Reset (below right)
-        NSButton* cancelBtn = [[NSButton alloc] initWithFrame:NSMakeRect(leftBtnX, y - 4, aw, 28)];
+        // 3. Move action buttons to a single clean row at the very bottom
+        y -= 10;
+        int aw = 85; 
+        int ah = 28;
+        int by = y - ah; 
+
+        // Left Actions
+        NSButton* cancelBtn = [[NSButton alloc] initWithFrame:NSMakeRect(lx, by, aw, ah)];
         [cancelBtn setTitle:@"Cancel"]; [cancelBtn setBezelStyle:NSBezelStyleRounded];
         [cancelBtn setTarget:self]; [cancelBtn setAction:@selector(cancel)];
         [view addSubview:cancelBtn];
-        NSButton* resetBtn = [[NSButton alloc] initWithFrame:NSMakeRect(rightBtnX, y - 4, aw, 28)];
+
+        NSButton* saveBtn = [[NSButton alloc] initWithFrame:NSMakeRect(lx + aw + 10, by, aw, ah)];
+        [saveBtn setTitle:@"Save"]; [saveBtn setBezelStyle:NSBezelStyleRounded];
+        [saveBtn setTarget:self]; [saveBtn setAction:@selector(save)];
+        [saveBtn setKeyEquivalent:@"\r"]; // Pressing Enter will trigger Save!
+        [view addSubview:saveBtn];
+
+        // Right Actions (anchored to the right edge of the right column)
+        int rightEdge = rx + labelW + gap + keyW + gap + btnW; 
+        
+        NSButton* setupBtn = [[NSButton alloc] initWithFrame:NSMakeRect(rightEdge - aw, by, aw, ah)];
+        [setupBtn setTitle:@"Setup"]; [setupBtn setBezelStyle:NSBezelStyleRounded];
+        [setupBtn setTarget:self]; [setupBtn setAction:@selector(setupClicked)];
+        [view addSubview:setupBtn];
+
+        NSButton* resetBtn = [[NSButton alloc] initWithFrame:NSMakeRect(rightEdge - aw - 10 - aw, by, aw, ah)];
         [resetBtn setTitle:@"Reset"]; [resetBtn setBezelStyle:NSBezelStyleRounded];
         [resetBtn setTarget:self]; [resetBtn setAction:@selector(resetClicked)];
         [view addSubview:resetBtn];
