@@ -20,7 +20,7 @@ jobs:
         shell: bash
         run: |
           cd client/windows/
-          g++ -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput -lwinmm
+          g++ -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput -lwinmm -luser32
 
       - name: Setup MSVC
         uses: TheMrMilchmann/setup-msvc-dev@v4

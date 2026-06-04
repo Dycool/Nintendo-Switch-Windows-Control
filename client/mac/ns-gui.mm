@@ -179,6 +179,7 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
 @class BindingsEditor;
 
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate> {
+    @public
     NSTextField* ipField;
     NSButton* connectBtn;
     NSPopUpButton* kbCombo;
@@ -326,6 +327,7 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
 
 // ── Bindings Editor Window Controller ──
 @interface BindingsEditor : NSWindowController <NSWindowDelegate> {
+    @public
     std::unordered_map<std::string, std::string> editBindings;
     std::vector<NSTextField*> keyLabels;
     int listeningIdx;
@@ -338,6 +340,12 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
 - (void)changeClicked:(NSButton*)sender;
 - (void)resetClicked;
 - (void)setupClicked;
+@end
+
+// ── Custom NSView to capture key events for bindings editor ──
+@class BindingsEditor;
+@interface KeyCaptureView : NSView
+@property (assign) BindingsEditor* editor;
 @end
 
 @implementation BindingsEditor
@@ -471,11 +479,6 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
     return YES;
 }
 
-@end
-
-// ── Custom NSView to capture key events for bindings editor ──
-@interface KeyCaptureView : NSView
-@property (assign) BindingsEditor* editor;
 @end
 
 @implementation KeyCaptureView
