@@ -76,13 +76,14 @@ void init_global_keyboard() {
             char path[256]; snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
             int fd = open(path, O_RDONLY | O_NONBLOCK);
             if (fd >= 0) {
-                unsigned long evbit[NLONGS(EV_MAX)];
-                ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), evbit);
-                if (test_bit(EV_KEY, evbit)) {
-                    unsigned long keybit[NLONGS(KEY_MAX)];
-                    ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit);
-                    if (test_bit(KEY_A, keybit)) g_kb_fds.push_back(fd);
-                    else close(fd);
+                unsigned long evbit[NLONGS(EV_MAX)] = {0};
+                if (ioctl(fd, EVIOCGBIT(0, sizeof(evbit)), evbit) >= 0) {
+                    if (test_bit(EV_KEY, evbit)) {
+                        unsigned long keybit[NLONGS(KEY_MAX)] = {0};
+                        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keybit)), keybit);
+                        if (test_bit(KEY_A, keybit)) g_kb_fds.push_back(fd);
+                        else close(fd);
+                    } else close(fd);
                 } else close(fd);
             }
         }
@@ -127,7 +128,6 @@ int name_to_linux_key(std::string name) {
     
     return KEY_RESERVED;
 }
-
 
 // ── Logic State ──
 enum { KB_OFF = 0, KB_SINGLE = 1, KB_OVERRIDE = 2 };
@@ -235,10 +235,14 @@ static void scan_for_gamepads() {
             if (!g_pads[p]) {
                 SDL_GameController* pad = SDL_GameControllerOpen(i);
                 if (!pad) break;
-                std::lock_guard<std::mutex> lock(g_hw_mtx);
-                g_pads[p] = pad;
-                const char* name = SDL_GameControllerName(pad);
-                strncpy(g_hw_names[p], name ? name : "Unknown", sizeof(g_hw_names[p]) - 1);
+                
+                // Keep the lock scoped ONLY to the variable assignment!
+                {
+                    std::lock_guard<std::mutex> lock(g_hw_mtx);
+                    g_pads[p] = pad;
+                    const char* name = SDL_GameControllerName(pad);
+                    strncpy(g_hw_names[p], name ? name : "Unknown", sizeof(g_hw_names[p]) - 1);
+                }
                 break;
             }
         }
@@ -383,6 +387,9 @@ static void SenderThread(std::string host, uint16_t port) {
         sendto(sock, (const char*)&pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
         if (active_count > 0) next_tick += std::chrono::milliseconds(4); else next_tick += std::chrono::milliseconds(500);
     }
+    
+    // Cleanup on thread exit
+    std::lock_guard<std::mutex> lock(g_hw_mtx);
     for (int i = 0; i < 4; ++i) { if (g_pads[i]) { SDL_GameControllerClose(g_pads[i]); g_pads[i] = nullptr; g_hw_names[i][0] = '\0'; } }
     close(sock);
 }
@@ -409,7 +416,10 @@ extern "C" void on_connect_clicked(GtkWidget*, gpointer) {
     derive_key(ns::DEFAULT_SECRET, g_hmacKey);
     g_connected = true;
 
-    for (int i=0; i<4; ++i) { g_hw_names[i][0] = '\0'; g_pads[i] = nullptr; }
+    {
+        std::lock_guard<std::mutex> lock(g_hw_mtx);
+        for (int i=0; i<4; ++i) { g_hw_names[i][0] = '\0'; g_pads[i] = nullptr; }
+    }
     
     // Check permission context immediately upon connection
     init_global_keyboard();
@@ -488,10 +498,12 @@ extern "C" void on_bindings_clicked(GtkWidget*, gpointer parent_window) {
 }
 
 extern "C" gboolean on_timer(gpointer) {
+    // 1. Move the scan OUTSIDE the mutex lock to prevent deadlock
+    if (!g_connected) scan_for_gamepads();
+    
+    // 2. Lock UI specifically for reading the mapped arrays safely
     std::lock_guard<std::mutex> lock(g_hw_mtx);
     int km = g_keyboardMode.load();
-    
-    if (!g_connected) scan_for_gamepads();
     
     for (int i = 0; i < 4; ++i) {
         char lbl[128];
@@ -500,7 +512,6 @@ extern "C" gboolean on_timer(gpointer) {
                 snprintf(lbl, sizeof(lbl), "🎮 P1: Keyboard");
             } else {
                 int phys_i = i - 1; 
-                // Physical slot 0 goes to P2, etc.
                 if (g_hw_names[phys_i][0] != '\0') snprintf(lbl, sizeof(lbl), "🎮 P%d: %s", i + 1, g_hw_names[phys_i]);
                 else snprintf(lbl, sizeof(lbl), "P%d: Waiting...", i + 1);
             }
