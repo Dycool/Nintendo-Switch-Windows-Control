@@ -33,6 +33,22 @@
 #include <dirent.h>
 #include <sys/ioctl.h>
 
+// Undefine colliding macros from <linux/input.h> before importing the protocol
+#undef BTN_A
+#undef BTN_B
+#undef BTN_X
+#undef BTN_Y
+#undef BTN_L
+#undef BTN_R
+#undef BTN_ZL
+#undef BTN_ZR
+#undef BTN_MINUS
+#undef BTN_PLUS
+#undef BTN_LSTICK
+#undef BTN_RSTICK
+#undef BTN_HOME
+#undef BTN_CAPTURE
+
 #include "../../server/rpi/include/sha256.h"
 #include "../../server/rpi/include/protocol.hpp"
 
