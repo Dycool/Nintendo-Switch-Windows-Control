@@ -458,7 +458,9 @@ int main(int argc, char** argv) {
 
     // Initialise SDL2 GameController subsystem
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    if (SDL_Init(SDL_INIT_GAMECONTROLLER) < 0) {
+    Uint32 sdl_flags = SDL_INIT_GAMECONTROLLER;
+    if (keyboard_mode) sdl_flags |= SDL_INIT_VIDEO;
+    if (SDL_Init(sdl_flags) < 0) {
         std::cerr << "Failed to initialise SDL2: " << SDL_GetError() << "\n";
         close(sock); return 1;
     }
@@ -474,10 +476,9 @@ int main(int argc, char** argv) {
     // ── Main Loop (Input Polling & UDP Networking) ────────────────────────────
     while (g_running.load(std::memory_order_relaxed)) {
         
-        // Busy-wait for 2ms precision timing
-        while (std::chrono::steady_clock::now() < next_tick) {
-            std::atomic_thread_fence(std::memory_order_relaxed);
-        }
+        SDL_PumpEvents();
+
+        std::this_thread::sleep_until(next_tick);
 
         // 1. Scan for newly plugged controllers
         scan_for_gamepads();
