@@ -315,7 +315,7 @@ h1{font-size:22px;font-weight:700;color:#c00;margin:0 0 16px 0;text-align:center
 #edit-table td{padding:2px 3px;font-size:12px}
 #edit-table td.el{text-align:center;font-weight:600;width:95px}
 #edit-table td.ek{font-family:Consolas,monospace;background:#f5f5f5;padding:2px 6px;border-radius:3px;width:115px;text-align:center}
-#edit-table td button{padding:1px 8px;font-size:11px;border:1px solid #bbb;border-radius:3px;background:#fff;cursor:pointer}
+#edit-table td button{padding:2px 6px;font-size:11px;border:1px solid #bbb;border-radius:3px;background:#fff;cursor:pointer}
 #edit-table td button:hover{background:#eee}
 .modal-buttons{display:flex;justify-content:space-between;margin:8px 4px 0}
 .modal-buttons .group{display:flex;flex-direction:column;gap:6px}
@@ -359,8 +359,8 @@ function openEditor(){
     for(let i=0;i<half;i++){
         let li=i, ri=i+half;
         let tr=document.createElement('tr');
-        let r_html = ri<BKEYS.length ? `<td class="el">${BKEYS[ri]}</td><td class="ek" id="ek-${ri}">${editBindings[BKEYS[ri]]||''}</td><td><button class="eb" data-idx="${ri}">Ch</button></td>` : `<td colspan="3"></td>`;
-        tr.innerHTML=`<td class="el">${BKEYS[li]}</td><td class="ek" id="ek-${li}">${editBindings[BKEYS[li]]||''}</td><td><button class="eb" data-idx="${li}">Ch</button></td>` + r_html;
+        let r_html = ri<BKEYS.length ? `<td class="el">${BKEYS[ri]}</td><td class="ek" id="ek-${ri}">${editBindings[BKEYS[ri]]||''}</td><td><button class="eb" data-idx="${ri}">Change</button></td>` : `<td colspan="3"></td>`;
+        tr.innerHTML=`<td class="el">${BKEYS[li]}</td><td class="ek" id="ek-${li}">${editBindings[BKEYS[li]]||''}</td><td><button class="eb" data-idx="${li}">Change</button></td>` + r_html;
         tb.appendChild(tr);
     }
     document.querySelectorAll('.eb').forEach(b=>{
@@ -450,18 +450,25 @@ function ui(){
 }
 document.getElementById('connect-btn').onclick=()=>{
     if(!connected){
-        let inputIp=document.getElementById('ip').value;
+        let inputIp=document.getElementById('ip').value.trim();
         try{localStorage.setItem('nsLastIP',inputIp)}catch(e){}
         
-        let targetHost = inputIp ? inputIp : location.host;
         let wsProto = location.protocol === "https:" ? "wss://" : "ws://";
+        let url;
         
-        // If they provided a raw IP/domain without a port, and not on HTTPS, default to 7331
-        if (inputIp && !inputIp.includes(':') && location.protocol !== "https:") {
-            targetHost += ":7331";
+        if (!inputIp) {
+            // Auto mode: use the exact same host and port as the web page
+            url = `${wsProto}${location.host}/`;
+        } else {
+            // Manual mode
+            let targetHost = inputIp;
+            if (!targetHost.includes(':')) {
+                targetHost += ":7331";
+            }
+            url = `${wsProto}${targetHost}/`;
         }
         
-        conn(`${wsProto}${targetHost}/`);
+        conn(url);
     }else{ws.close();}
 };
 document.getElementById('kb-mode').onchange=e=>{
