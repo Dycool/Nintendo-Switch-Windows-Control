@@ -45,6 +45,13 @@
 // Import external protocol structures (Version 4 with MultiReport)
 #include "../../server/rpi/include/protocol.hpp"
 
+// ── Keyboard mode constants ──
+enum KeyboardMode {
+    KB_OFF = 0,
+    KB_SINGLE = 1,
+    KB_OVERRIDE = 2
+};
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Shared gamepad state
@@ -68,6 +75,32 @@ struct GamepadState {
         dpad_up = false; dpad_down = false; dpad_left = false; dpad_right = false;
         lx = 0.0f; ly = 0.0f; rx = 0.0f; ry = 0.0f;
         // note: does not clear slotActive (managed separately)
+    }
+
+    GamepadState& operator=(const GamepadState& other) {
+        if (this != &other) {
+            btn_a.store(other.btn_a.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            btn_b.store(other.btn_b.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            btn_x.store(other.btn_x.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            btn_y.store(other.btn_y.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            btn_l.store(other.btn_l.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            btn_r.store(other.btn_r.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            zl.store(other.zl.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            zr.store(other.zr.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            btn_menu.store(other.btn_menu.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            btn_options.store(other.btn_options.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            btn_lstick.store(other.btn_lstick.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            btn_rstick.store(other.btn_rstick.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            dpad_up.store(other.dpad_up.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            dpad_down.store(other.dpad_down.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            dpad_left.store(other.dpad_left.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            dpad_right.store(other.dpad_right.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            lx.store(other.lx.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ly.store(other.ly.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            rx.store(other.rx.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ry.store(other.ry.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
     }
 };
 
