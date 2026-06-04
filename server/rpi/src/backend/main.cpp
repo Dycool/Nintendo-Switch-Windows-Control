@@ -428,26 +428,70 @@ function sendR(){
     for(let i=0;i<4;i++){let o=i*8;dv.setUint16(o,reps[i].b,true);dv.setUint8(o+2,reps[i].h);dv.setUint8(o+3,reps[i].lx);dv.setUint8(o+4,reps[i].ly);dv.setUint8(o+5,reps[i].rx);dv.setUint8(o+6,reps[i].ry);dv.setUint8(o+7,0);}
     ws.send(dv.buffer);
 }
-function conn(url){
-    ws=new WebSocket(url);
-    ws.onopen=()=>{connected=true;ui();pollId=setInterval(sendR,4);};
-    ws.onmessage=e=>{try{
-        const d=JSON.parse(e.data);
-        if(d.type==='status'&&d.clients){
-            for(let i=0;i<4;i++){const el=document.getElementById(`p${i+1}`),c=d.clients[i];if(c&&c.active){el.textContent=`P${i+1}: Connected`;el.className='player active'}else{el.textContent=`P${i+1}: Idle`;el.className='player'}}
-            if(d.pkts_rx!==undefined)document.getElementById('pkt-info').textContent=`Packets rx by Pi: ${d.pkts_rx}`;
-        }
-    }catch(err){}};
-    ws.onclose=()=>{connected=false;if(pollId){clearInterval(pollId);pollId=null;}ui();};
-    ws.onerror=()=>{};
+
+function logWebSocketStatus(message) {
+    const statusEl = document.getElementById('status');
+    if (statusEl) statusEl.textContent = message;
 }
+
+function conn(url){
+    console.log("Connecting to:", url);
+    logWebSocketStatus("Connecting...");
+    
+    // Passamos o subprotocolo 'ns-protocol' conforme configurado no backend C++
+    ws = new WebSocket(url, 'ns-protocol');
+    
+    ws.onopen = () => {
+        console.log("WebSocket connected");
+        logWebSocketStatus("Connected (WebSocket)");
+        connected = true;
+        ui();
+        pollId = setInterval(sendR, 4);
+    };
+    
+    ws.onmessage = (e) => {
+        try {
+            const d = JSON.parse(e.data);
+            if (d.type === 'status' && d.clients){
+                for(let i=0;i<4;i++){
+                    const el=document.getElementById(`p${i+1}`),c=d.clients[i];
+                    if(c&&c.active){
+                        el.textContent=`P${i+1}: Connected`;
+                        el.className='player active';
+                    }else{
+                        el.textContent=`P${i+1}: Idle`;
+                        el.className='player';
+                    }
+                }
+                if(d.pkts_rx!==undefined)document.getElementById('pkt-info').textContent=`Packets rx by Pi: ${d.pkts_rx}`;
+            }
+        } catch(err) {
+            console.error("Error parsing message:", err);
+        }
+    };
+    
+    ws.onclose = (e) => {
+        console.log("WebSocket closed:", e.code, e.reason);
+        logWebSocketStatus("Disconnected: " + (e.reason || "Unknown reason"));
+        connected = false;
+        if(pollId) clearInterval(pollId);
+        pollId = null;
+        ui();
+    };
+    
+    ws.onerror = (e) => {
+        console.error("WebSocket error:", e);
+        logWebSocketStatus("Error: Check console");
+    };
+}
+
 function ui(){
     const b=document.getElementById('connect-btn');
     b.textContent=connected?'Disconnect':'Connect'; b.className=connected?'btn-primary active':'btn-primary';
-    document.getElementById('status').textContent=connected?'Connected':'Disconnected';
     document.getElementById('ip').disabled=connected; document.getElementById('kb-mode').disabled=connected;
     document.getElementById('bindings-btn').disabled=(connected||kbMode===0);
 }
+
 document.getElementById('connect-btn').onclick=()=>{
     if(!connected){
         let inputIp=document.getElementById('ip').value.trim();
@@ -457,10 +501,8 @@ document.getElementById('connect-btn').onclick=()=>{
         let url;
         
         if (!inputIp) {
-            // Auto mode: use the exact same host and port as the web page
             url = `${wsProto}${location.host}/`;
         } else {
-            // Manual mode
             let targetHost = inputIp;
             if (!targetHost.includes(':')) {
                 targetHost += ":7331";
@@ -471,6 +513,7 @@ document.getElementById('connect-btn').onclick=()=>{
         conn(url);
     }else{ws.close();}
 };
+
 document.getElementById('kb-mode').onchange=e=>{
     kbMode=parseInt(e.target.value);
     try{localStorage.setItem('nsKbMode',kbMode)}catch(err){}
@@ -482,7 +525,7 @@ document.getElementById('bindings-btn').disabled=(kbMode===0);
 
 window.addEventListener('keydown',e=>{
     if(kbMode===0||!connected||listeningIdx>=0)return;
-    if(e.target.tagName==='INPUT' || e.target.tagName==='SELECT') return; // Do not steal keys from inputs
+    if(e.target.tagName==='INPUT' || e.target.tagName==='SELECT') return;
     keys[e.code]=true;
     if(!e.code.startsWith('F'))e.preventDefault();
 });
@@ -628,8 +671,16 @@ static bool ws_send_frame(int fd, const void* data, size_t len, uint8_t opcode) 
 static int ws_recv_frame(int fd, uint8_t* buf, size_t cap) {
     uint8_t hdr[2];
     if (!read_fully(fd, hdr, 2)) return -1;
+    
+    bool fin = (hdr[0] & 0x80) != 0;
+    uint8_t opcode = hdr[0] & 0x0F;
     bool mask = (hdr[1] & 0x80) != 0;
     uint64_t len = hdr[1] & 0x7F;
+
+    if (!fin && opcode == 0x0) {
+        std::puts("Warning: Fragmented frames not fully supported");
+    }
+
     if (len == 126) {
         uint8_t ext[2]; if (!read_fully(fd, ext, 2)) return -1;
         len = (uint64_t)ext[0] << 8 | ext[1];
@@ -637,22 +688,29 @@ static int ws_recv_frame(int fd, uint8_t* buf, size_t cap) {
         uint8_t ext[8]; if (!read_fully(fd, ext, 8)) return -1;
         len = 0; for (int i = 0; i < 8; ++i) len = (len << 8) | ext[i];
     }
+    
     uint8_t mk[4] = {0};
     if (mask && !read_fully(fd, mk, 4)) return -1;
     if (len > cap) return -1;
     if (len > 0 && !read_fully(fd, buf, (size_t)len)) return -1;
     if (mask) for (uint64_t i = 0; i < len; ++i) buf[i] ^= mk[i & 3];
-    if ((hdr[0] & 0x0F) == 0x8) return -2; // Close
-    if ((hdr[0] & 0x0F) == 0x9) { // Ping -> Pong
+
+    if (g_verbose) {
+        std::printf("Received WebSocket frame: fd=%d, len=%llu, opcode=%d\n", fd, (unsigned long long)len, opcode);
+    }
+
+    if (opcode == 0x8) return -2; // Close
+    if (opcode == 0x9) { // Ping -> Pong
         // ── FIXED: Proper Pong generation ──
         ws_send_frame(fd, buf, (size_t)len, 0xA);
         return 0;
     }
-    if ((hdr[0] & 0x0F) == 0xA) return 0; // Pong
+    if (opcode == 0xA) return 0; // Pong
     return (int)len;
 }
 
 static void webserver_thread(int port) {
+    std::puts("WebSocket server starting...");
     int sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (sock < 0) { perror("web socket"); return; }
     int yes = 1;
@@ -661,7 +719,6 @@ static void webserver_thread(int port) {
     addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY; addr.sin_port = htons(port);
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("web bind"); close(sock); return; }
     if (listen(sock, 8) < 0) { perror("web listen"); close(sock); return; }
-    std::printf("Web server listening on TCP %d\n", port);
 
     // ── FIXED: Add an HTTP buffer per client to withstand chunked headers ──
     struct Client { int fd; bool ws; std::string http_buf; };
@@ -674,7 +731,7 @@ static void webserver_thread(int port) {
         pfds.push_back({sock, POLLIN, 0});
         for (auto& c : clients) pfds.push_back({c.fd, POLLIN, 0});
 
-        int n = poll(pfds.data(), (nfds_t)pfds.size(), 200);
+        int n = poll(pfds.data(), (nfds_t)pfds.size(), 1000); // ── FIXED: Timeout aumentado para 1000ms ──
         if (n < 0) { if (errno == EINTR) continue; break; }
 
         // Accept new connections
@@ -702,8 +759,6 @@ static void webserver_thread(int port) {
                 if (r == -2 || r == -1) { dead.push_back((int)i); continue; }
                 if (r == 0) continue; // control frame
                 
-                if (g_verbose) std::printf("WS frame received: %d bytes\n", r);
-
                 if (r >= (int)sizeof(MultiReport)) {
                     MultiReport report;
                     memcpy(&report, buf, sizeof(MultiReport));
@@ -723,8 +778,8 @@ static void webserver_thread(int port) {
                     g_clients[WEB_CLIENT_IDX].last_rx_us = now_us();
                 }
             } else {
-                uint8_t rbuf[4096];
-                ssize_t nr = read(fd, rbuf, sizeof(rbuf)-1);
+                uint8_t rbuf[8192]; // ── FIXED: Aumentado para lidar com headers maiores (ex. vários cookies)
+                ssize_t nr = recv(fd, rbuf, sizeof(rbuf)-1, MSG_DONTWAIT);
                 if (nr <= 0) { dead.push_back((int)i); continue; }
                 
                 // ── FIXED: Buffering HTTP headers and parsing case-insensitively ──
@@ -745,17 +800,39 @@ static void webserver_thread(int port) {
                         while (kp < req_lower.size() && req_lower[kp] == ' ') ++kp;
                         auto ke = req_lower.find("\r\n", kp);
                         if (ke != std::string::npos) {
-                            // Extract key from the ORIGINAL casing (since base64 is case sensitive)
+                            // ── FIXED: Extrair a chave do texto ORIGINAL (não lowercased) ──
                             std::string key = req.substr(kp, ke - kp);
+                            
+                            // Remove espaços e quebras de linha em excesso
+                            key.erase(0, key.find_first_not_of(" \t\r\n"));
+                            key.erase(key.find_last_not_of(" \t\r\n") + 1);
+                            
                             std::string accept = ws_accept_key(key);
+                            
+                            if (g_verbose) {
+                                std::printf("WebSocket handshake for fd=%d, key='%s'\n", fd, key.c_str());
+                                std::printf("Accept key: %s\n", accept.c_str());
+                            }
+                            
                             std::string resp =
                                 "HTTP/1.1 101 Switching Protocols\r\n"
                                 "Upgrade: websocket\r\n"
                                 "Connection: Upgrade\r\n"
-                                "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
-                            write(fd, resp.data(), resp.size());
+                                "Sec-WebSocket-Accept: " + accept + "\r\n"
+                                "Sec-WebSocket-Protocol: ns-protocol\r\n\r\n"; // ── FIXED: Adicionado protocolo ──
+                            
+                            if (g_verbose) std::printf("Response:\n%s\n", resp.c_str());
+                            
+                            ssize_t sent = write(fd, resp.data(), resp.size());
+                            if (sent != (ssize_t)resp.size()) {
+                                std::puts("Failed to send WebSocket handshake");
+                                dead.push_back((int)i);
+                                continue;
+                            }
+                            
                             clients[i].ws = true;
                             clients[i].http_buf.clear(); // Clean up memory
+                            std::puts("WebSocket handshake completed");
                         } else { dead.push_back((int)i); }
                     } else { dead.push_back((int)i); }
                 } else if (req.find("GET ") == 0) {
@@ -866,7 +943,6 @@ int main(int argc, char** argv) {
     std::thread web;
     if (do_web) {
         web = std::thread(webserver_thread, port);
-        std::printf("Web interface enabled on http://<ip>:%u\n", port);
     }
 
     int ep = epoll_create1(0); epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = sock; epoll_ctl(ep, EPOLL_CTL_ADD, sock, &ev);
