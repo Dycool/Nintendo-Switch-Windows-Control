@@ -853,22 +853,10 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
             int km = self->keyboardMode.load();
             if (km == KB_SINGLE) {
                 if (c1) {
-                    if (!c2) {
-                        *out_reports[1] = *out_reports[0]; c2 = true; active_count++;
-                        self->slotActive[1].store(true, std::memory_order_relaxed);
-                        self->states[1] = self->states[0];
-                        self->hwNames[1] = self->hwNames[0];
-                    } else if (!c3) {
-                        *out_reports[2] = *out_reports[0]; c3 = true; active_count++;
-                        self->slotActive[2].store(true, std::memory_order_relaxed);
-                        self->states[2] = self->states[0];
-                        self->hwNames[2] = self->hwNames[0];
-                    } else if (!c4) {
-                        *out_reports[3] = *out_reports[0]; c4 = true; active_count++;
-                        self->slotActive[3].store(true, std::memory_order_relaxed);
-                        self->states[3] = self->states[0];
-                        self->hwNames[3] = self->hwNames[0];
-                    }
+                    // ONLY modify the outgoing reports, never the slotActive state
+                    if (!c2) { *out_reports[1] = *out_reports[0]; c2 = true; active_count++; }
+                    else if (!c3) { *out_reports[2] = *out_reports[0]; c3 = true; active_count++; }
+                    else if (!c4) { *out_reports[3] = *out_reports[0]; c4 = true; active_count++; }
                 }
                 out_reports[0]->reset();
                 apply_keyboard_to_report_mac(*out_reports[0], self->keyBindings, false);
@@ -923,25 +911,37 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
     }
     
     int km = keyboardMode.load();
+    
+    // Figure out where P1's physical controller is being shifted
+    int shifted_p1_target = -1;
+    if (km == KB_SINGLE && slotActive[0].load(std::memory_order_relaxed)) {
+        if (!slotActive[1].load(std::memory_order_relaxed)) shifted_p1_target = 1;
+        else if (!slotActive[2].load(std::memory_order_relaxed)) shifted_p1_target = 2;
+        else if (!slotActive[3].load(std::memory_order_relaxed)) shifted_p1_target = 3;
+    }
+
     for (int i = 0; i < 4; ++i) {
         NSString* text;
         NSColor* color;
+        
         if (i == 0 && km != KB_OFF) {
-            if (km == KB_SINGLE) {
-                text = @"P1: Keyboard";
-                color = [NSColor textColor];
-            } else {
-                bool conn = slotActive[0].load(std::memory_order_relaxed);
-                text = [NSString stringWithFormat:@"P1: %@ / Keyboard", conn ? @"Connected" : @"Idle"];
-                color = [NSColor textColor];
-            }
-        } else if (slotActive[i].load(std::memory_order_relaxed)) {
+            text = (km == KB_SINGLE) ? @"P1: Keyboard (Single)" : @"P1: Keyboard (Override)";
+            color = [NSColor textColor];
+        } 
+        else if (i == shifted_p1_target) {
+            // Visually insert the shifted controller
+            text = [NSString stringWithFormat:@"P%d: %@ (Shifted)", i+1, hwNames[0]];
+            color = [NSColor textColor];
+        }
+        else if (slotActive[i].load(std::memory_order_relaxed)) {
             text = [NSString stringWithFormat:@"P%d: %@", i+1, hwNames[i]];
             color = [NSColor textColor];
-        } else {
+        } 
+        else {
             text = [NSString stringWithFormat:@"P%d: Waiting...", i+1];
             color = [NSColor disabledControlTextColor];
         }
+        
         [ctrlLabels[i] setStringValue:text];
         [ctrlLabels[i] setTextColor:color];
     }
