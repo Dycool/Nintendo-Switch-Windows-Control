@@ -47,7 +47,7 @@ and touch controls for on-screen play.
 - WebSocket connections use the same HMAC-SHA256 protocol as native clients —
   authentication is handled transparently by the backend.
 - There is **no TLS** (HTTPS/WSS) built in. For use over untrusted networks, pair
-  with a reverse proxy (e.g., `nginx` + `certbot`).
+  with a reverse proxy such as **[Caddy](https://caddyserver.com/)**.
 
 ---
 

@@ -41,7 +41,7 @@ https://github.com/user-attachments/assets/aef8eb25-dd14-4335-a3f7-b1953800f856
 **3. Web App (Optional):**
 * The backend includes an embedded web server with mobile touch controls.
 * Enable it with the `-w` flag: `sudo chrt -f 99 ./ns-backend -w`
-* Open `http://<pi-ip>:8080` in your browser (or `http://<pi-ip>:8080/mobile` on your phone).
+* Open `http://<pi-ip>:8080` in your browser.
 * See the **[Web App Guide](docs/web-app.md)** for details.
 
 ---
