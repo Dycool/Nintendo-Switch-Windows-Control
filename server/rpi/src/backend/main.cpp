@@ -23,6 +23,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <poll.h>
+#include <ctype.h>
 
 #ifdef USE_UPNP
 #include <miniupnpc/miniupnpc.h>
@@ -977,18 +978,60 @@ static void serve_404(int fd) {
 }
 
 
+// ── Case-insensitive substring check ─────────────────────────────────────────
+static bool has_header(const char *buf, const char *header) {
+    // Skip past "GET /... HTTP/1.1\r\n" to find header lines
+    const char *p = buf;
+    while (*p) {
+        // Compare prefix case-insensitively
+        const char *h = header;
+        const char *b = p;
+        while (*h && *b && (tolower((unsigned char)*b) == tolower((unsigned char)*h))) {
+            b++; h++;
+        }
+        if (!*h) return true; // full header name matched
+        // Advance to next line
+        p = strchr(p, '\n');
+        if (!p) break;
+        p++;
+    }
+    return false;
+}
+
+
+// ── Read until end of HTTP headers (\r\n\r\n) ───────────────────────────────
+// Returns true if headers were fully read, buf will be null-terminated
+static bool read_http_headers(int fd, char *buf, size_t size) {
+    size_t pos = 0;
+    while (pos < size - 1) {
+        ssize_t n = read(fd, buf + pos, 1);
+        if (n <= 0) return false;
+        pos++;
+        buf[pos] = '\0';
+        // Check for \r\n\r\n (end of headers)
+        if (pos >= 4 &&
+            buf[pos-1] == '\n' &&
+            buf[pos-2] == '\r' &&
+            buf[pos-3] == '\n' &&
+            buf[pos-4] == '\r')
+            return true;
+    }
+    return false; // buffer full without finding headers
+}
+
+
 // ── Accept and handle an HTTP/WS client connection ───────────────────────────
 static void handle_web_client(int client_fd, uint16_t udp_port) {
-    // Read the HTTP request line + headers (first ~4KB)
-    uint8_t buf[4096];
-    ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
-    if (n <= 0) { close(client_fd); return; }
-    buf[n] = '\0';
+    char buf[8192];
+    if (!read_http_headers(client_fd, buf, sizeof(buf))) {
+        close(client_fd);
+        return;
+    }
 
-    // Check if it's a WebSocket upgrade request
-    if (strstr((char*)buf, "Upgrade: websocket") != nullptr &&
-        strstr((char*)buf, "Sec-WebSocket-Key:") != nullptr) {
-        if (ws_upgrade(client_fd, (char*)buf))
+    // Check if it's a WebSocket upgrade request (case-insensitive headers)
+    if (has_header(buf, "upgrade: websocket") &&
+        has_header(buf, "sec-websocket-key:")) {
+        if (ws_upgrade(client_fd, buf))
             handle_ws_client(client_fd, udp_port);
         else
             close(client_fd);
@@ -996,8 +1039,8 @@ static void handle_web_client(int client_fd, uint16_t udp_port) {
     }
 
     // Otherwise serve HTTP
-    if (strstr((char*)buf, "GET / ") != nullptr || strstr((char*)buf, "GET /index.html ") != nullptr)
-        serve_http(client_fd, (char*)buf);
+    if (strstr(buf, "GET / ") != nullptr || strstr(buf, "GET /index.html ") != nullptr)
+        serve_http(client_fd, buf);
     else
         serve_404(client_fd);
 }
