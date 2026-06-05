@@ -1227,10 +1227,22 @@ static void handle_ws_client(int fd) {
 
 // ── Perform WebSocket upgrade handshake ──────────────────────────────────────
 static bool ws_upgrade(int fd, const char *key_line) {
-    // Extract key value after "Sec-WebSocket-Key: "
-    const char *key_start = strstr(key_line, "Sec-WebSocket-Key:");
+    // Procura pela chave ignorando maiúsculas/minúsculas
+    const char *key_start = nullptr;
+    const char *header_name = "sec-websocket-key:";
+    const char *p = key_line;
+    while (*p) {
+        const char *h = header_name;
+        const char *b = p;
+        while (*h && *b && (tolower((unsigned char)*b) == tolower((unsigned char)*h))) {
+            b++; h++;
+        }
+        if (!*h) { key_start = b; break; }
+        p++;
+    }
+
     if (!key_start) return false;
-    key_start += 18;
+
     while (*key_start == ' ') key_start++;
 
     // Find end of line

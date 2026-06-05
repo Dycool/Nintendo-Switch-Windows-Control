@@ -14,6 +14,8 @@ This project was built from scratch in **C++** and uses **UDP** to get the lowes
 
 > **📦 Pre-compiled Binaries Available!**
 > You can download ready-to-use GUI/CLI clients and the Raspberry Pi server directly from the **[Releases](https://github.com/Dycool/NS-PC-Control/releases)** page.
+>
+> The web interface is included in the Raspberry Pi server binary — no additional files needed.
 
 
 
@@ -33,6 +35,12 @@ https://github.com/user-attachments/assets/aef8eb25-dd14-4335-a3f7-b1953800f856
 * Launch the `ns-gui` application.
 * Enter your Raspberry Pi's IP address and connect your controller(s)!
 * **Up to 4 controllers** are supported simultaneously on a single PC.
+
+**3. Web App (Optional):**
+* The backend includes an embedded web server with mobile touch controls.
+* Enable it with the `-w` flag: `sudo chrt -f 99 ./ns-backend -w`
+* Open `http://<pi-ip>:8080` in your browser (or `http://<pi-ip>:8080/mobile` on your phone).
+* See the **[Web App Guide](docs/web-app.md)** for details.
 
 ---
 
@@ -54,12 +62,7 @@ Detailed guides and technical information are in our `docs/` folder:
 * **[Raspberry Pi System Setup](docs/raspberry-pi-setup.md)** — Enabling USB gadget mode and automating on boot.
 * **[Building from Source](docs/building-from-source.md)** — Compiling the client (Windows/Mac/Linux) and server from scratch.
 * **[Architecture & Security](docs/architecture.md)** — Latency optimization tips and HMAC-SHA256 protocol details.
-
----
-
-## 🚀 Planned Features
-
-* Client as a web application (help needed)
+* **[Web App & Mobile Controls](docs/web-app.md)** — Using the embedded web interface and mobile touch controls.
 
 ---
 
