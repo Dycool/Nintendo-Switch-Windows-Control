@@ -605,7 +605,7 @@ static const char INDEX_HTML[] =
     "        document.getElementById('btnConnect').innerText = \"Disconnect\";\n"
     "        document.getElementById('kbMode').disabled = true;\n"
     "        document.getElementById('statusText').innerText = `Connected to Pi Proxy.`;\n"
-    "        loopId = setInterval(buildAndSendPacket, 8);\n"
+    "        loopId = setInterval(buildAndSendPacket, 4);\n"
     "    };\n"
     "    ws.onerror = () => alert(\"Failed to connect to proxy!\");\n"
     "    ws.onclose = () => {\n"
@@ -807,127 +807,6 @@ static void sha1_final(Sha1Ctx *ctx, uint8_t digest[20]) {
 }
 
 
-// ── Minimal SHA-256 (for HMAC signing in web proxy) ──────────────────────────
-static const uint32_t SHA256_K[64] = {
-    0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5,
-    0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
-    0xD807AA98, 0x542B0B7,  0x243185BE, 0x550C7DC3,
-    0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
-    0xE49B69C1, 0xEFBE4786, 0xFC19DC6,  0x240CA1CC,
-    0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
-    0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7,
-    0xC6E00BF3, 0xD5A79147, 0x6CA6351,  0x14292967,
-    0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13,
-    0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85,
-    0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3,
-    0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070,
-    0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5,
-    0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
-    0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208,
-    0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2
-};
-
-#define SHA256_ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
-#define SHA256_CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
-#define SHA256_MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
-#define SHA256_S0(x) (SHA256_ROTR(x, 2) ^ SHA256_ROTR(x, 13) ^ SHA256_ROTR(x, 22))
-#define SHA256_S1(x) (SHA256_ROTR(x, 6) ^ SHA256_ROTR(x, 11) ^ SHA256_ROTR(x, 25))
-#define SHA256_s0(x) (SHA256_ROTR(x, 7) ^ SHA256_ROTR(x, 18) ^ ((x) >> 3))
-#define SHA256_s1(x) (SHA256_ROTR(x, 17) ^ SHA256_ROTR(x, 19) ^ ((x) >> 10))
-
-struct Sha256Ctx {
-    uint32_t state[8];
-    uint64_t count;
-    uint8_t  buffer[64];
-};
-
-static void sha256_transform(uint32_t state[8], const uint8_t block[64]) {
-    uint32_t w[64];
-    for (int i = 0; i < 16; i++)
-        w[i] = ((uint32_t)block[i*4]<<24) | ((uint32_t)block[i*4+1]<<16) | ((uint32_t)block[i*4+2]<<8) | block[i*4+3];
-    for (int i = 16; i < 64; i++)
-        w[i] = SHA256_s1(w[i-2]) + w[i-7] + SHA256_s0(w[i-15]) + w[i-16];
-    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
-    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
-    for (int i = 0; i < 64; i++) {
-        uint32_t t1 = h + SHA256_S1(e) + SHA256_CH(e, f, g) + SHA256_K[i] + w[i];
-        uint32_t t2 = SHA256_S0(a) + SHA256_MAJ(a, b, c);
-        h = g; g = f; f = e; e = d + t1;
-        d = c; c = b; b = a; a = t1 + t2;
-    }
-    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
-    state[4] += e; state[5] += f; state[6] += g; state[7] += h;
-}
-
-static void sha256_init(Sha256Ctx *ctx) {
-    ctx->state[0] = 0x6A09E667; ctx->state[1] = 0xBB67AE85;
-    ctx->state[2] = 0x3C6EF372; ctx->state[3] = 0xA54FF53A;
-    ctx->state[4] = 0x510E527F; ctx->state[5] = 0x9B05688C;
-    ctx->state[6] = 0x1F83D9AB; ctx->state[7] = 0x5BE0CD19;
-    ctx->count = 0;
-}
-
-static void sha256_update(Sha256Ctx *ctx, const uint8_t *data, size_t len) {
-    size_t idx = ctx->count & 63;
-    ctx->count += len;
-    while (len--) {
-        ctx->buffer[idx++] = *data++;
-        if (idx == 64) { sha256_transform(ctx->state, ctx->buffer); idx = 0; }
-    }
-}
-
-static void sha256_final(Sha256Ctx *ctx, uint8_t digest[32]) {
-    uint64_t bits = ctx->count * 8;
-    size_t idx = ctx->count & 63;
-    size_t pad = (idx < 56) ? (56 - idx) : (120 - idx);
-    uint8_t padding[64];
-    memset(padding, 0, pad);
-    padding[0] = 0x80;
-    sha256_update(ctx, padding, pad);
-    uint8_t len_bytes[8];
-    for (int i = 0; i < 8; i++) len_bytes[7-i] = (bits >> (i*8)) & 0xFF;
-    sha256_update(ctx, len_bytes, 8);
-    for (int i = 0; i < 8; i++) {
-        digest[i*4]   = (ctx->state[i] >> 24) & 0xFF;
-        digest[i*4+1] = (ctx->state[i] >> 16) & 0xFF;
-        digest[i*4+2] = (ctx->state[i] >> 8) & 0xFF;
-        digest[i*4+3] = ctx->state[i] & 0xFF;
-    }
-}
-
-
-// ── HMAC-SHA256 (sign packets forwarded from web clients) ────────────────────
-static void hmac_sha256(const uint8_t *key, size_t key_len,
-                        const uint8_t *msg, size_t msg_len,
-                        uint8_t out_hmac[32]) {
-    uint8_t k[64];
-    memset(k, 0, 64);
-    if (key_len > 64) {
-        Sha256Ctx ctx;
-        sha256_init(&ctx);
-        sha256_update(&ctx, key, key_len);
-        sha256_final(&ctx, k);
-    } else {
-        memcpy(k, key, key_len);
-    }
-    uint8_t ipad[64], opad[64];
-    for (int i = 0; i < 64; i++) {
-        ipad[i] = k[i] ^ 0x36;
-        opad[i] = k[i] ^ 0x5C;
-    }
-    Sha256Ctx ctx;
-    sha256_init(&ctx);
-    sha256_update(&ctx, ipad, 64);
-    sha256_update(&ctx, msg, msg_len);
-    uint8_t inner[32];
-    sha256_final(&ctx, inner);
-    sha256_init(&ctx);
-    sha256_update(&ctx, opad, 64);
-    sha256_update(&ctx, inner, 32);
-    sha256_final(&ctx, out_hmac);
-}
-
-
 // ── Base64 encoding ──────────────────────────────────────────────────────────
 static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -957,17 +836,12 @@ static bool read_exact(int fd, uint8_t *buf, size_t n) {
 }
 
 
-// ── Handle a single WebSocket client: read frames, forward to UDP ────────────
-static void handle_ws_client(int fd, uint16_t udp_port) {
-    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (udp_fd < 0) { close(fd); return; }
-
-    sockaddr_in dst{};
-    dst.sin_family = AF_INET;
-    dst.sin_port   = htons(udp_port);
-    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
-
-    uint8_t buf[4096];
+// ── Handle a single WebSocket client: read frames, write directly to state ───
+static void handle_ws_client(int fd) {
+    uint8_t buf[PACKET_SIZE];
+    int assigned_slot = -1;
+    uint32_t expected_seq = 0;
+    bool first_pkt = true;
 
     while (g_running.load(std::memory_order_relaxed)) {
         uint8_t hdr[2];
@@ -991,7 +865,7 @@ static void handle_ws_client(int fd, uint16_t udp_port) {
         uint8_t mask[4] = {0};
         if (masked && !read_exact(fd, mask, 4)) break;
 
-        if (len > sizeof(buf)) break;
+        if (len != PACKET_SIZE) break;
         if (!read_exact(fd, buf, len)) break;
 
         if (masked)
@@ -1003,16 +877,56 @@ static void handle_ws_client(int fd, uint16_t udp_port) {
             ssize_t _u = write(fd, pong, 2); (void)_u;
             continue;
         }
-        if (opcode == 2 && len >= PACKET_SIZE) {
-            // Sign the packet with HMAC before forwarding to UDP backend
-            uint8_t hmac[32];
-            hmac_sha256(g_hmac_key, 32, buf, PACKET_AUTH_SIZE, hmac);
-            memcpy(buf + PACKET_AUTH_SIZE, hmac, HMAC_TAG_SIZE);
-            sendto(udp_fd, buf, len, 0, (sockaddr*)&dst, sizeof(dst));
+        if (opcode != 2) continue; // not binary
+
+        // ── Parse packet and write directly to shared state ─────────────
+        uint32_t magic; memcpy(&magic, buf, 4);
+        if (magic != PROTO_MAGIC) continue;
+        uint8_t ver; memcpy(&ver, buf + 4, 1);
+        if (ver != PROTO_VERSION) continue;
+        uint8_t flags; memcpy(&flags, buf + 5, 1);
+        bool is_reset = (flags & FLAG_RESET);
+        uint32_t seq; memcpy(&seq, buf + 8, 4);
+
+        // Sequence anti-replay
+        if (!first_pkt && seq < expected_seq && !is_reset) continue;
+        first_pkt = false;
+        expected_seq = seq + 1;
+
+        // Decode report starting at byte 20
+        MultiReport report;
+        memcpy(&report, buf + 20, sizeof(MultiReport));
+
+        // Apply to backend state
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            if (assigned_slot < 0 || !g_clients[assigned_slot].active) {
+                assigned_slot = -1;
+                for (int i = 0; i < MAX_CLIENTS; ++i) {
+                    if (!g_clients[i].active) {
+                        assigned_slot = i;
+                        g_clients[i].active = true;
+                        g_clients[i].first_pkt = true;
+                        g_clients[i].report.reset();
+                        break;
+                    }
+                }
+            }
+            if (assigned_slot >= 0) {
+                if (is_reset)
+                    g_clients[assigned_slot].report.reset();
+                else
+                    g_clients[assigned_slot].report = report;
+                g_clients[assigned_slot].last_rx_us = now_us();
+            }
         }
+        ++g_pkts_rx;
     }
 
-    close(udp_fd);
+    if (assigned_slot >= 0) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_clients[assigned_slot].active = false;
+    }
     close(fd);
 }
 
@@ -1139,6 +1053,7 @@ static bool read_http_headers(int fd, char *buf, size_t size) {
 
 // ── Accept and handle an HTTP/WS client connection ───────────────────────────
 static void handle_web_client(int client_fd, uint16_t udp_port) {
+    (void)udp_port;
     char buf[8192];
     if (!read_http_headers(client_fd, buf, sizeof(buf))) {
         close(client_fd);
@@ -1149,7 +1064,7 @@ static void handle_web_client(int client_fd, uint16_t udp_port) {
     if (has_header(buf, "upgrade: websocket") &&
         has_header(buf, "sec-websocket-key:")) {
         if (ws_upgrade(client_fd, buf))
-            handle_ws_client(client_fd, udp_port);
+            handle_ws_client(client_fd);
         else
             close(client_fd);
         return;
