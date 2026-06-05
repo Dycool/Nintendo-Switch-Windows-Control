@@ -350,7 +350,7 @@ static const char INDEX_HTML[] =
     "\n"
     "    <h2>NS Web Control</h2>\n"
     "\n"
-    "    <div class=\"row\">\n"
+    "    <div class=\"row\" id=\"kbModeContainer\">\n"
     "        <label>Keyboard Mode:</label>\n"
     "        <select id=\"kbMode\">\n"
     "            <option value=\"0\">OFF</option>\n"
@@ -362,6 +362,7 @@ static const char INDEX_HTML[] =
     "    <div class=\"btn-group\">\n"
     "        <button id=\"btnConnect\">Connect</button>\n"
     "        <button id=\"btnBindings\">Bindings...</button>\n"
+    "        <button id=\"btnTouchControls\" style=\"display: none;\" onclick=\"window.location.href='/mobile'\">Touch Controls</button>\n"
     "    </div>\n"
     "\n"
     "    <hr>\n"
@@ -425,6 +426,13 @@ static const char INDEX_HTML[] =
     "let preEditBindings = {};\n"
     "\n"
     "window.onload = () => {\n"
+    "    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);\n"
+    "    if (isMobile) {\n"
+    "        document.getElementById('kbModeContainer').style.display = 'none';\n"
+    "        document.getElementById('btnBindings').style.display = 'none';\n"
+    "        document.getElementById('btnTouchControls').style.display = 'inline-block';\n"
+    "    }\n"
+    "\n"
     "    const savedMode = localStorage.getItem('nswc_mode');\n"
     "    if (savedMode) document.getElementById('kbMode').value = savedMode;\n"
     "    const savedBindings = localStorage.getItem('nswc_bindings');\n"
@@ -708,7 +716,7 @@ static const char INDEX_HTML[] =
     "    activeBindKey = null;\n"
     "    renderBindings();\n"
     "    document.getElementById('modalOverlay').style.display = 'flex';\n"
-    "};\n"
+    };\n"
     "\n"
     "document.getElementById('btnSaveBindings').onclick = () => {\n"
     "    localStorage.setItem('nswc_bindings', JSON.stringify(currentBindings));\n"
@@ -738,6 +746,152 @@ static const char INDEX_HTML[] =
     "    setupQueue = Object.keys(currentBindings);\n"
     "    isSetupMode = true;\n"
     "    startNextSetupBind();\n"
+    "};\n"
+    "</script>\n"
+    "</body>\n"
+    "</html>\n";
+
+// ── Embedded mobile.html (served at GET /mobile) ──────────────────────────────
+static const char MOBILE_HTML[] =
+    "<!DOCTYPE html>\n"
+    "<html lang=\"en\">\n"
+    "<head>\n"
+    "    <meta charset=\"UTF-8\">\n"
+    "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no\">\n"
+    "    <title>NS Touch Controls</title>\n"
+    "    <style>\n"
+    "        body { margin: 0; padding: 0; background: #1a1a1a; color: white; font-family: sans-serif; overflow: hidden; touch-action: none; user-select: none; }\n"
+    "        #topBar { position: absolute; top: 10px; width: 100%; display: flex; justify-content: space-between; padding: 0 20px; box-sizing: border-box; }\n"
+    "        .sys-btn { background: rgba(255,255,255,0.2); padding: 10px 20px; border-radius: 8px; border: none; color: white; font-weight: bold; }\n"
+    "        #status { position: absolute; top: 15px; left: 50%; transform: translateX(-50%); color: #ccc; font-size: 14px; }\n"
+    "        .pad-area { position: absolute; bottom: 20px; width: 100%; display: flex; justify-content: space-between; padding: 0 30px; box-sizing: border-box; }\n"
+    "        .joystick { width: 120px; height: 120px; background: rgba(255,255,255,0.1); border-radius: 50%; position: relative; }\n"
+    "        .knob { width: 50px; height: 50px; background: rgba(255,255,255,0.5); border-radius: 50%; position: absolute; top: 35px; left: 35px; transition: 0.1s transform ease-out; pointer-events: none; }\n"
+    "        .action-btns, .dpad { display: grid; grid-template-columns: 50px 50px 50px; grid-template-rows: 50px 50px 50px; gap: 5px; }\n"
+    "        .btn { background: rgba(255,255,255,0.2); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 20px; }\n"
+    "        .btn.active { background: rgba(255,255,255,0.6); color: black; }\n"
+    "        .triggers { position: absolute; top: 60px; width: 100%; display: flex; justify-content: space-between; padding: 0 40px; box-sizing: border-box; }\n"
+    "        .trigger-group { display: flex; gap: 10px; }\n"
+    "        /* Grid positioning for D-pad and ABXY */\n"
+    "        .up { grid-column: 2; grid-row: 1; } .left { grid-column: 1; grid-row: 2; } .right { grid-column: 3; grid-row: 2; } .down { grid-column: 2; grid-row: 3; }\n"
+    "    </style>\n"
+    "</head>\n"
+    "<body>\n"
+    "    <div id=\"topBar\">\n"
+    "        <button class=\"sys-btn btn-map\" data-btn=\"256\">-</button>\n" // BTN_MINUS
+    "        <button class=\"sys-btn\" id=\"btnConnect\">Connect</button>\n"
+    "        <button class=\"sys-btn btn-map\" data-btn=\"512\">+</button>\n" // BTN_PLUS
+    "    </div>\n"
+    "    <div id=\"status\">Disconnected</div>\n"
+    "    <div class=\"triggers\">\n"
+    "        <div class=\"trigger-group\">\n"
+    "            <div class=\"btn sys-btn btn-map\" data-btn=\"64\">ZL</div>\n"
+    "            <div class=\"btn sys-btn btn-map\" data-btn=\"16\">L</div>\n"
+    "        </div>\n"
+    "        <div class=\"trigger-group\">\n"
+    "            <div class=\"btn sys-btn btn-map\" data-btn=\"32\">R</div>\n"
+    "            <div class=\"btn sys-btn btn-map\" data-btn=\"128\">ZR</div>\n"
+    "        </div>\n"
+    "    </div>\n"
+    "    <div class=\"pad-area\">\n"
+    "        <div style=\"display:flex; flex-direction: column; gap: 20px; align-items: center;\">\n"
+    "            <div class=\"joystick\" id=\"lstick\"><div class=\"knob\" id=\"lknob\"></div></div>\n"
+    "            <div class=\"dpad\">\n"
+    "                <div class=\"btn up btn-hat\" data-hat=\"0\">▲</div><div class=\"btn left btn-hat\" data-hat=\"6\">◀</div>\n"
+    "                <div class=\"btn right btn-hat\" data-hat=\"2\">▶</div><div class=\"btn down btn-hat\" data-hat=\"4\">▼</div>\n"
+    "            </div>\n"
+    "        </div>\n"
+    "        <div style=\"display:flex; flex-direction: column; gap: 20px; align-items: center;\">\n"
+    "            <div class=\"action-btns\">\n"
+    "                <div class=\"btn up btn-map\" data-btn=\"4\">X</div><div class=\"btn left btn-map\" data-btn=\"1\">Y</div>\n"
+    "                <div class=\"btn right btn-map\" data-btn=\"2\">A</div><div class=\"btn down btn-map\" data-btn=\"8\">B</div>\n"
+    "            </div>\n"
+    "            <div class=\"joystick\" id=\"rstick\"><div class=\"knob\" id=\"rknob\"></div></div>\n"
+    "        </div>\n"
+    "    </div>\n"
+    "<script>\n"
+    "const PROTO_MAGIC = 0x4E535743, PROTO_VERSION = 4, PACKET_SIZE = 68;\n"
+    "let ws = null, loopId = null, seqCounter = 0, isConnected = false;\n"
+    "let state = { buttons: 0, hat: 8, lx: 128, ly: 128, rx: 128, ry: 128 };\n"
+    "\n"
+    "// Touch mapping for buttons\n"
+    "document.querySelectorAll('.btn-map').forEach(el => {\n"
+    "    const bit = parseInt(el.dataset.btn);\n"
+    "    el.addEventListener('touchstart', (e) => { e.preventDefault(); state.buttons |= bit; el.classList.add('active'); });\n"
+    "    el.addEventListener('touchend', (e) => { e.preventDefault(); state.buttons &= ~bit; el.classList.remove('active'); });\n"
+    "});\n"
+    "\n"
+    "// Touch mapping for D-Pad (Hat)\n"
+    "let activeHatTouches = 0;\n"
+    "document.querySelectorAll('.btn-hat').forEach(el => {\n"
+    "    const val = parseInt(el.dataset.hat);\n"
+    "    el.addEventListener('touchstart', (e) => { e.preventDefault(); state.hat = val; activeHatTouches++; el.classList.add('active'); });\n"
+    "    el.addEventListener('touchend', (e) => { e.preventDefault(); activeHatTouches--; if(activeHatTouches <= 0) { state.hat = 8; activeHatTouches=0; } el.classList.remove('active'); });\n"
+    "});\n"
+    "\n"
+    "// Virtual Joysticks\n"
+    "function setupJoystick(baseId, knobId, axisX, axisY) {\n"
+    "    const base = document.getElementById(baseId), knob = document.getElementById(knobId);\n"
+    "    const maxDist = 60; let activeTouch = null;\n"
+    "    const reset = () => { state[axisX] = 128; state[axisY] = 128; knob.style.transform = `translate(0px, 0px)`; activeTouch = null; };\n"
+    "    base.addEventListener('touchstart', e => { e.preventDefault(); activeTouch = e.changedTouches[0].identifier; updateJoy(e.changedTouches[0]); });\n"
+    "    base.addEventListener('touchmove', e => {\n"
+    "        e.preventDefault();\n"
+    "        for (let i=0; i<e.changedTouches.length; i++) {\n"
+    "            if (e.changedTouches[i].identifier === activeTouch) updateJoy(e.changedTouches[i]);\n"
+    "        }\n"
+    "    });\n"
+    "    base.addEventListener('touchend', e => {\n"
+    "        for (let i=0; i<e.changedTouches.length; i++) if (e.changedTouches[i].identifier === activeTouch) reset();\n"
+    "    });\n"
+    "    function updateJoy(t) {\n"
+    "        const rect = base.getBoundingClientRect();\n"
+    "        let dx = t.clientX - (rect.left + rect.width/2), dy = t.clientY - (rect.top + rect.height/2);\n"
+    "        let dist = Math.sqrt(dx*dx + dy*dy);\n"
+    "        if (dist > maxDist) { dx = (dx/dist)*maxDist; dy = (dy/dist)*maxDist; }\n"
+    "        knob.style.transform = `translate(${dx}px, ${dy}px)`;\n"
+    "        state[axisX] = Math.round(((dx / maxDist) + 1) * 127.5);\n"
+    "        state[axisY] = Math.round(((dy / maxDist) + 1) * 127.5);\n"
+    "    }\n"
+    "}\n"
+    "setupJoystick('lstick', 'lknob', 'lx', 'ly');\n"
+    "setupJoystick('rstick', 'rknob', 'rx', 'ry');\n"
+    "\n"
+    "function sendPacket() {\n"
+    "    if (!ws || ws.readyState !== WebSocket.OPEN) return;\n"
+    "    const buffer = new ArrayBuffer(PACKET_SIZE), view = new DataView(buffer);\n"
+    "    view.setUint32(0, PROTO_MAGIC, true); view.setUint8(4, PROTO_VERSION); view.setUint8(5, 0);\n"
+    "    view.setUint16(6, 0, true); view.setUint32(8, seqCounter++, true); view.setBigUint64(12, BigInt(Date.now()*1000), true);\n"
+    "    \n"
+    "    // Inject touch state directly into Player 1 (offset 20)\n"
+    "    view.setUint16(20, state.buttons, true); view.setUint8(22, state.hat);\n"
+    "    view.setUint8(23, state.lx); view.setUint8(24, state.ly);\n"
+    "    view.setUint8(25, state.rx); view.setUint8(26, state.ry);\n"
+    "    \n"
+    "    // Fill P2, P3, P4 with neutral states so we don't send garbage\n"
+    "    for(let p=1; p<4; p++) {\n"
+    "        let off = 20 + (p*8);\n"
+    "        view.setUint16(off, 0, true); view.setUint8(off+2, 8);\n"
+    "        view.setUint8(off+3, 128); view.setUint8(off+4, 128); view.setUint8(off+5, 128); view.setUint8(off+6, 128);\n"
+    "    }\n"
+    "    ws.send(buffer);\n"
+    "}\n"
+    "\n"
+    "document.getElementById('btnConnect').onclick = () => {\n"
+    "    if (isConnected) { ws.close(); return; }\n"
+    "    const wsUrl = window.location.protocol === 'https:' ? `wss://${window.location.host}` : `ws://${window.location.host}`;\n"
+    "    ws = new WebSocket(wsUrl); ws.binaryType = \"arraybuffer\";\n"
+    "    ws.onopen = () => {\n"
+    "        isConnected = true; document.getElementById('btnConnect').innerText = \"Disconnect\";\n"
+    "        document.getElementById('status').innerText = \"Connected\";\n"
+    "        loopId = setInterval(sendPacket, 4);\n"
+    "    };\n"
+    "    ws.onerror = () => alert(\"Connection failed!\");\n"
+    "    ws.onclose = () => {\n"
+    "        isConnected = false; clearInterval(loopId); \n"
+    "        document.getElementById('btnConnect').innerText = \"Connect\";\n"
+    "        document.getElementById('status').innerText = \"Disconnected\";\n"
+    "    };\n"
     "};\n"
     "</script>\n"
     "</body>\n"
@@ -979,9 +1133,8 @@ static bool ws_upgrade(int fd, const char *key_line) {
 }
 
 
-// ── Serve index.html via HTTP ────────────────────────────────────────────────
-static void serve_http(int fd, const char *request) {
-    (void)request;
+// ── Serve HTML via HTTP ────────────────────────────────────────────────
+static void serve_http(int fd, const char *html_content) {
     char hdr[512];
     int nh = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
@@ -989,9 +1142,9 @@ static void serve_http(int fd, const char *request) {
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "Cache-Control: no-cache\r\n"
-        "\r\n", strlen(INDEX_HTML));
+        "\r\n", strlen(html_content));
     ssize_t _u1 = write(fd, hdr, nh); (void)_u1;
-    ssize_t _u2 = write(fd, INDEX_HTML, strlen(INDEX_HTML)); (void)_u2;
+    ssize_t _u2 = write(fd, html_content, strlen(html_content)); (void)_u2;
     close(fd);
 }
 
@@ -1078,10 +1231,15 @@ static void handle_web_client(int client_fd, uint16_t udp_port) {
     }
 
     // Otherwise serve HTTP
-    if (strstr(buf, "GET / ") != nullptr || strstr(buf, "GET /index.html ") != nullptr)
-        serve_http(client_fd, buf);
-    else
+    if (strstr(buf, "GET / ") != nullptr || strstr(buf, "GET /index.html ") != nullptr) {
+        serve_http(client_fd, INDEX_HTML);
+    } 
+    else if (strstr(buf, "GET /mobile ") != nullptr) {
+        serve_http(client_fd, MOBILE_HTML);
+    }
+    else {
         serve_404(client_fd);
+    }
 }
 
 
