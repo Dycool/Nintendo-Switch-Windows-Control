@@ -206,7 +206,7 @@ static void writer_thread(int hz) {
     // Shutdown securely by neutralizing all ports
     MultiReport neutral{}; neutral.reset();
     for(int i=0; i<4; ++i) { 
-        if (fds[i] >= 0) { (void)write(fds[i], &neutral.p1, 8); close(fds[i]); }
+        if (fds[i] >= 0) { ssize_t _u = write(fds[i], &neutral.p1, 8); (void)_u; close(fds[i]); }
     }
 }
 
@@ -887,7 +887,7 @@ static void handle_ws_client(int fd, uint16_t udp_port) {
         if (opcode == 8) break; // close
         if (opcode == 9) {     // ping → pong
             uint8_t pong[2] = {0x8A, 0x00};
-            write(fd, pong, 2);
+            ssize_t _u = write(fd, pong, 2); (void)_u;
             continue;
         }
         if (opcode == 2 && len > 0) // binary → forward to UDP
@@ -948,24 +948,31 @@ static bool ws_upgrade(int fd, const char *key_line) {
 // ── Serve index.html via HTTP ────────────────────────────────────────────────
 static void serve_http(int fd, const char *request) {
     (void)request;
-    char resp[8192];
-    int n = snprintf(resp, sizeof(resp),
+    char hdr[512];
+    int nh = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "Cache-Control: no-cache\r\n"
-        "\r\n"
-        "%s", strlen(INDEX_HTML), INDEX_HTML);
-    write(fd, resp, n);
+        "\r\n", strlen(INDEX_HTML));
+    ssize_t _u1 = write(fd, hdr, nh); (void)_u1;
+    ssize_t _u2 = write(fd, INDEX_HTML, strlen(INDEX_HTML)); (void)_u2;
     close(fd);
 }
 
 
 // ── HTTP 404 ─────────────────────────────────────────────────────────────────
 static void serve_404(int fd) {
-    const char *resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
-    write(fd, resp, strlen(resp));
+    const char *body = "Not Found";
+    char hdr[256];
+    int nh = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n", strlen(body));
+    ssize_t _u1 = write(fd, hdr, nh); (void)_u1;
+    ssize_t _u2 = write(fd, body, strlen(body)); (void)_u2;
     close(fd);
 }
 
