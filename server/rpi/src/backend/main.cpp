@@ -716,7 +716,7 @@ static const char INDEX_HTML[] =
     "    activeBindKey = null;\n"
     "    renderBindings();\n"
     "    document.getElementById('modalOverlay').style.display = 'flex';\n"
-    };\n"
+    "};\n"
     "\n"
     "document.getElementById('btnSaveBindings').onclick = () => {\n"
     "    localStorage.setItem('nswc_bindings', JSON.stringify(currentBindings));\n"
