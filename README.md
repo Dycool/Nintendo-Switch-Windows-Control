@@ -4,7 +4,7 @@
 
 # 🎮 NS PC Control 
 
-**Control your Console from a PC (Windows, Linux, or macOS) with low latency using a Raspberry Pi.**
+**Control your Console from a PC (Windows, Linux, macOS) or even through your browser and phone with low latency using a Raspberry Pi.**
 
 This project was built from scratch in **C++** and uses **UDP** to get the lowest possible latency. It's the ideal setup for playing NS games using your PC controller, avoiding the typical lag of Bluetooth or heavy script-based solutions.
 
