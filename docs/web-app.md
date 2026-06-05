@@ -35,9 +35,6 @@ Once running, open the URLs below in a browser on the same network.
 | Fullscreen API | ✓ | ✓ | ✓ | ✓ |
 | localStorage | ✓ | ✓ | ✓ | ✓ |
 
-Mobile Safari (iOS) has full support — including Gamepad API for MFi controllers
-and touch controls for on-screen play.
-
 ---
 
 ## Security Notes
