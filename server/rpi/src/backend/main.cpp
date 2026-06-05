@@ -827,7 +827,9 @@ static void base64_encode(const uint8_t *in, size_t len, char *out) {
 // ── Read exactly N bytes from fd (returns false on error/close) ───────────────
 static bool read_exact(int fd, uint8_t *buf, size_t n) {
     while (n > 0) {
-        ssize_t r = read(fd, buf, n);
+        ssize_t r;
+        do r = read(fd, buf, n);
+        while (r < 0 && errno == EINTR);
         if (r <= 0) return false;
         buf += r;
         n -= r;
@@ -1105,8 +1107,12 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
 
         if (pfds[0].revents & POLLIN) {
             int client = accept(srv, nullptr, nullptr);
-            if (client >= 0)
+            if (client >= 0) {
+                // Accepted fd inherits O_NONBLOCK — make it blocking for read_http_headers
+                int fl = fcntl(client, F_GETFL);
+                if (fl != -1) fcntl(client, F_SETFL, fl & ~O_NONBLOCK);
                 std::thread(handle_web_client, client, udp_port).detach();
+            }
         }
     }
 
