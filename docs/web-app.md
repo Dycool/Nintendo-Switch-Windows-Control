@@ -39,10 +39,8 @@ Once running, open the URLs below in a browser on the same network.
 
 ## Security Notes
 
-- The web server binds to **`0.0.0.0`** (all interfaces). Consider firewall rules if
-  you don't want other devices on your LAN accessing the control panel.
-- WebSocket connections use the same HMAC-SHA256 protocol as native clients —
-  authentication is handled transparently by the backend.
+- The web server binds to **`0.0.0.0`** (all interfaces).
+- WebSocket connections does not use the same HMAC-SHA256 protocol as native clients.
 - There is **no TLS** (HTTPS/WSS) built in. For use over untrusted networks, pair
   with a reverse proxy such as **[Caddy](https://caddyserver.com/)**.
 
