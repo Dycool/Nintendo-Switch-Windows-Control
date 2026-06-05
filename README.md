@@ -81,6 +81,12 @@ Detailed guides and technical information are in our `docs/` folder:
 
 ---
 
+## 🚀 Planned Features
+
+* **Macros** — Record and replay button sequences for speedruns, TAS, or complex inputs.
+
+---
+
 ## 🐛 Reporting Issues
 
 Found a bug or have a feature request? Open an issue at **[github.com/Dycool/NS-PC-Control/issues](https://github.com/Dycool/NS-PC-Control/issues)** with as much detail as possible (OS, controller model, reproduction steps).
