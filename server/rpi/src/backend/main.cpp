@@ -648,24 +648,21 @@ static const char INDEX_HTML[] =
     "</body>\n"
     "</html>\n";
 
-static const char MOBILE_HTML[] =
-    "<!DOCTYPE html>\n"
-    "<html lang=\"en\">\n"
-    "<head>\n"
-    "    <meta charset=\"UTF-8\">\n"
-    "    <title>NS Touch Controls</title>\n"
+static const char MOBILE_STYLE_AND_DOM[] =
     "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover\">\n"
     "    <style>\n"
     "        html, body { background: #111; color: #fff; margin:0; padding:0; width: 100%; height: 100%; overflow:hidden; touch-action:none; user-select:none; -webkit-user-select:none; font-family:sans-serif; }\n"
     "        #gamepad { position: fixed; top: env(safe-area-inset-top, 0px); right: env(safe-area-inset-right, 0px); bottom: env(safe-area-inset-bottom, 0px); left: env(safe-area-inset-left, 0px); box-sizing: border-box; }\n"
     "        #rotate-msg { display:none; position:absolute; inset:0; background:#000; z-index:9999; justify-content:center; align-items:center; text-align:center; padding:20px; font-size:18px; }\n"
     "        @media (orientation: portrait) { #rotate-msg { display:flex; } #gamepad { display:none; } }\n"
+    "        \n"
     "        .edit-item { position: absolute; box-sizing: border-box; }\n"
     "        .btn { background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.2); display:flex; justify-content:center; align-items:center; font-weight:bold; color:#ddd; font-size:16px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); }\n"
     "        .btn.active { background: rgba(255,255,255,0.7); color: #000; box-shadow: 0 0 10px rgba(255,255,255,0.5); }\n"
     "        .btn-circle { border-radius: 50%; width: 100%; height: 100%; }\n"
     "        .btn-shoulder { border-radius: 8px; font-size:14px; }\n"
     "        .btn-sys { border-radius: 50%; font-size: 14px; }\n"
+    "        \n"
     "        .cross { display: grid; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 1fr 1fr 1fr; gap: 4px; }\n"
     "        .cross .up { grid-column: 2; grid-row: 1; }\n"
     "        .cross .down { grid-column: 2; grid-row: 3; }\n"
@@ -673,12 +670,22 @@ static const char MOBILE_HTML[] =
     "        .cross .right { grid-column: 3; grid-row: 2; }\n"
     "        .joystick { background: rgba(255,255,255,0.05); border: 2px solid rgba(255,255,255,0.15); border-radius: 50%; box-shadow: inset 0 0 20px rgba(0,0,0,0.5); aspect-ratio: 1/1; }\n"
     "        .knob { width: 40%; height: 40%; background: rgba(255,255,255,0.3); border-radius: 50%; position: absolute; top: 30%; left: 30%; pointer-events: none; box-shadow: 0 4px 10px rgba(0,0,0,0.4); }\n"
+    "    </style>\n"
+    "</head>\n"
+    "<body>\n";
+
+static const char MOBILE_HTML[] =
+    "<!DOCTYPE html>\n"
+    "<html lang=\"en\">\n"
+    "<head>\n"
+    "    <meta charset=\"UTF-8\">\n"
+    "    <title>NS Touch Controls</title>\n"
+    "%s" // MOBILE_STYLE_AND_DOM
+    "    <style>\n"
     "        #btnConnect { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 15px 30px; border-radius: 30px; background: rgba(200,0,0,0.8); border:none; color:#fff; font-weight:bold; font-size: 18px; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }\n"
     "        #btnConnect.connected { background: rgba(0,200,0,0.8); }\n"
     "        #statusDot { display: none; position: absolute; bottom: 20px; right: 20px; width: 15px; height: 15px; background: #0f0; border-radius: 50%; box-shadow: 0 0 10px #0f0; z-index: 100; cursor: pointer; }\n"
     "    </style>\n"
-    "</head>\n"
-    "<body>\n"
     "    <div id=\"rotate-msg\">Please rotate to landscape mode.</div>\n"
     "    <div id=\"gamepad\">\n"
     "        <div id=\"statusDot\"></div>\n"
@@ -828,25 +835,9 @@ static const char EDITOR_HTML[] =
     "<head>\n"
     "    <meta charset=\"UTF-8\">\n"
     "    <title>Layout Editor</title>\n"
-    "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover\">\n"
+    "%s" // MOBILE_STYLE_AND_DOM
     "    <style>\n"
-    "        html, body { background: #111; color: #fff; margin:0; padding:0; width: 100%; height: 100%; overflow:hidden; touch-action:none; user-select:none; -webkit-user-select:none; font-family:sans-serif; }\n"
-    "        #gamepad { position: fixed; top: env(safe-area-inset-top, 0px); right: env(safe-area-inset-right, 0px); bottom: env(safe-area-inset-bottom, 0px); left: env(safe-area-inset-left, 0px); box-sizing: border-box; }\n"
-    "        #rotate-msg { display:none; position:absolute; inset:0; background:#000; z-index:9999; justify-content:center; align-items:center; text-align:center; padding:20px; font-size:18px; }\n"
-    "        @media (orientation: portrait) { #rotate-msg { display:flex; } #gamepad { display:none; } }\n"
-    "        .edit-item { position: absolute; box-sizing: border-box; }\n"
     "        .overlap { border: 2px solid red !important; box-shadow: 0 0 15px red !important; z-index: 1000; }\n"
-    "        .btn { background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.2); display:flex; justify-content:center; align-items:center; font-weight:bold; color:#ddd; font-size:16px; box-shadow: 0 4px 8px rgba(0,0,0,0.3); }\n"
-    "        .btn-circle { border-radius: 50%; width: 100%; height: 100%; }\n"
-    "        .btn-shoulder { border-radius: 8px; font-size:14px; }\n"
-    "        .btn-sys { border-radius: 50%; font-size: 14px; }\n"
-    "        .cross { display: grid; grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 1fr 1fr 1fr; gap: 4px; }\n"
-    "        .cross .up { grid-column: 2; grid-row: 1; }\n"
-    "        .cross .down { grid-column: 2; grid-row: 3; }\n"
-    "        .cross .left { grid-column: 1; grid-row: 2; }\n"
-    "        .cross .right { grid-column: 3; grid-row: 2; }\n"
-    "        .joystick { background: rgba(255,255,255,0.05); border: 2px solid rgba(255,255,255,0.15); border-radius: 50%; box-shadow: inset 0 0 20px rgba(0,0,0,0.5); aspect-ratio: 1/1; }\n"
-    "        .knob { width: 40%; height: 40%; background: rgba(255,255,255,0.3); border-radius: 50%; position: absolute; top: 30%; left: 30%; pointer-events: none; }\n"
     "        #editor-bar {\n"
     "            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);\n"
     "            background: rgba(0,0,0,0.85); border-radius: 12px; display: flex; flex-direction: column;\n"
@@ -856,15 +847,13 @@ static const char EDITOR_HTML[] =
     "        #toggleDel { background: #555; color: white; transition: 0.2s; }\n"
     "        #toggleDel.active { background: #e33; }\n"
     "    </style>\n"
-    "</head>\n"
-    "<body>\n"
     "    <div id=\"rotate-msg\">Please rotate to landscape mode.</div>\n"
     "    <div id=\"gamepad\">\n"
     "        <div id=\"menu-toggle\" onclick=\"toggleMenu()\" style=\"position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); width:50px; height:50px; background:rgba(255,255,255,0.2); border-radius:50%; display:none; justify-content:center; align-items:center; z-index:9999; font-size:24px; box-shadow: 0 0 10px rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.5);\">⚙️</div>\n"
     "        <div id=\"editor-bar\">\n"
     "            <div id=\"eb-header\" style=\"padding: 10px; background: #333; border-radius: 12px 12px 0 0; display: flex; justify-content: space-between; align-items: center; cursor: move;\">\n"
     "                <span style=\"font-weight:bold; font-size:14px; color: white;\">Editor Settings</span>\n"
-    "                <button onclick=\"toggleMenu()\" style=\"background:none; border:none; color:white; font-size:16px; padding:0;\">❌</button>\n"
+    "                <button onclick=\"toggleMenu()\" style=\"background:none; border:none; color:white; font-size:22px; padding:10px; margin-right:-5px; cursor:pointer; line-height:1;\">❌</button>\n"
     "            </div>\n"
     "            <div style=\"padding: 15px; display: flex; flex-direction: column; gap: 10px;\">\n"
     "                <div style=\"color:#fff; text-align:center; font-size:14px; margin-bottom:5px;\">Drag to Move, Pinch to Resize</div>\n"
@@ -947,8 +936,8 @@ static const char EDITOR_HTML[] =
     "    for(let i=0; i<els.length; i++) {\n"
     "        for(let j=i+1; j<els.length; j++) {\n"
     "            let b1 = els[i].getBoundingClientRect(), b2 = els[j].getBoundingClientRect();\n"
-    "            let s1x = b1.width * 0.25, s1y = b1.height * 0.25;\n"
-    "            let s2x = b2.width * 0.25, s2y = b2.height * 0.25;\n"
+    "            let s1x = b1.width * 0.1, s1y = b1.height * 0.1;\n"
+    "            let s2x = b2.width * 0.1, s2y = b2.height * 0.1;\n"
     "            if (!(b1.right - s1x < b2.left + s2x || b1.left + s1x > b2.right - s2x || b1.bottom - s1y < b2.top + s2y || b1.top + s1y > b2.bottom - s2y)) {\n"
     "                els[i].classList.add('overlap'); els[j].classList.add('overlap'); hasOverlap = true;\n"
     "            }\n"
@@ -1267,6 +1256,28 @@ static bool ws_upgrade(int fd, const char *key_line) {
 
 
 // ── Serve HTML via HTTP ────────────────────────────────────────────────
+// Reusable server functions
+static void serve_http_formatted(int fd, const char *fmt, const char *arg) {
+    // Combine format with argument
+    size_t full_len = strlen(fmt) + strlen(arg) + 1;
+    char* full_content = (char*)malloc(full_len);
+    snprintf(full_content, full_len, fmt, arg);
+
+    char hdr[512];
+    int nh = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "Cache-Control: no-cache\r\n"
+        "\r\n", strlen(full_content));
+        
+    ssize_t _u1 = write(fd, hdr, nh); (void)_u1;
+    ssize_t _u2 = write(fd, full_content, strlen(full_content)); (void)_u2;
+    free(full_content);
+    close(fd);
+}
+
 static void serve_http(int fd, const char *html_content) {
     char hdr[512];
     int nh = snprintf(hdr, sizeof(hdr),
@@ -1368,10 +1379,10 @@ static void handle_web_client(int client_fd, uint16_t udp_port) {
         serve_http(client_fd, INDEX_HTML);
     } 
     else if (strstr(buf, "GET /mobile ") != nullptr) {
-        serve_http(client_fd, MOBILE_HTML);
+        serve_http_formatted(client_fd, MOBILE_HTML, MOBILE_STYLE_AND_DOM);
     }
     else if (strstr(buf, "GET /editor ") != nullptr) {
-        serve_http(client_fd, EDITOR_HTML);
+        serve_http_formatted(client_fd, EDITOR_HTML, MOBILE_STYLE_AND_DOM);
     }
     else {
         serve_404(client_fd);
