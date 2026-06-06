@@ -182,19 +182,27 @@ static void init_spi_flash(int ctrl) {
     flash[0x6013] = 0xA0;
     flash[0x601B] = 0x02;
 
+    // Factory stick calibration.  This must be packed as three 12-bit X/Y
+    // pairs.  The previous helper wrote overlapping bytes and produced invalid
+    // calibration, which can make the Switch accept buttons while ignoring
+    // analogue stick movement.
+    auto pack_stick_cal_pair = [](uint8_t* dst, uint16_t x, uint16_t y) {
+        x &= 0x0FFF;
+        y &= 0x0FFF;
+        dst[0] = x & 0xFF;
+        dst[1] = ((x >> 8) & 0x0F) | ((y & 0x0F) << 4);
+        dst[2] = (y >> 4) & 0xFF;
+    };
+
     uint8_t cal_left[9] = {};
-    pack12(0x800, cal_left[0], cal_left[1]);
-    pack12(0x800, cal_left[1], cal_left[2]);
-    pack12(0xF00, cal_left[3], cal_left[4]);
-    pack12(0xF00, cal_left[4], cal_left[5]);
-    cal_left[6] = 0x18;
+    pack_stick_cal_pair(cal_left + 0, 0x600, 0x600); // max-above-center range
+    pack_stick_cal_pair(cal_left + 3, 0x800, 0x800); // center
+    pack_stick_cal_pair(cal_left + 6, 0x600, 0x600); // min-below-center range
 
     uint8_t cal_right[9] = {};
-    pack12(0x800, cal_right[0], cal_right[1]);
-    pack12(0x800, cal_right[1], cal_right[2]);
-    pack12(0xF00, cal_right[3], cal_right[4]);
-    pack12(0xF00, cal_right[4], cal_right[5]);
-    cal_right[6] = 0x18;
+    pack_stick_cal_pair(cal_right + 0, 0x600, 0x600);
+    pack_stick_cal_pair(cal_right + 3, 0x800, 0x800);
+    pack_stick_cal_pair(cal_right + 6, 0x600, 0x600);
 
     memcpy(flash + 0x603D, cal_left, sizeof(cal_left));
     memcpy(flash + 0x6046, cal_right, sizeof(cal_right));
@@ -257,7 +265,21 @@ static void fill_neutral_controls(ProInputReport21& r) {
 }
 
 static uint16_t axis8_to_12(uint8_t v) {
-    return (uint16_t)((uint32_t)v * 4095u / 255u);
+    // Match the fake calibration above: center 0x800 with about ±0x600 range.
+    // Sending the full 0x000..0xFFF range can sit outside the advertised
+    // calibration and some Switch paths appear to flatten/ignore the stick.
+    if (v == 128) return 0x800;
+
+    int32_t delta = (int32_t)v - 128;
+    int32_t raw;
+    if (delta > 0)
+        raw = 0x800 + (delta * 0x600) / 127;
+    else
+        raw = 0x800 + (delta * 0x600) / 128;
+
+    if (raw < 0x200) raw = 0x200;
+    if (raw > 0xE00) raw = 0xE00;
+    return (uint16_t)raw;
 }
 
 static void pack_stick_12(uint8_t out[3], uint8_t x8, uint8_t y8) {
@@ -953,9 +975,10 @@ static const char INDEX_HTML[] =
     "document.getElementById('kbMode').onchange = (e) => localStorage.setItem('nswc_mode', e.target.value);\n"
     "window.addEventListener('keydown', (e) => {\n"
     "    if (activeBindKey) { e.preventDefault(); remapKey(e.code); return; }\n"
+    "    if (!['INPUT','TEXTAREA','SELECT','BUTTON'].includes((e.target && e.target.tagName) || '')) e.preventDefault();\n"
     "    keysDown.add(e.code);\n"
     "});\n"
-    "window.addEventListener('keyup', (e) => keysDown.delete(e.code));\n"
+    "window.addEventListener('keyup', (e) => { e.preventDefault(); keysDown.delete(e.code); });\n"
     "function getNeutralState() { return { buttons: 0, hat: HAT_NEUTRAL, lx: 128, ly: 128, rx: 128, ry: 128 }; }\n"
     "function getKeyboardState() {\n"
     "    let buttons = 0, hat = HAT_NEUTRAL, lx = 128, ly = 128, rx = 128, ry = 128;\n"
@@ -1015,8 +1038,10 @@ static const char INDEX_HTML[] =
     "    else if (pup) hat = HAT_N; else if (pdown) hat = HAT_S;\n"
     "    else if (pleft) hat = HAT_W; else if (pright) hat = HAT_E;\n"
     "    const applyDeadzone = (val) => { if (Math.abs(val) < 0.15) return 128; return Math.round(((val + 1) / 2) * 255); };\n"
-    "    if (pad.axes.length >= 4) {\n"
+    "    if (pad.axes.length >= 2) {\n"
     "        lx = applyDeadzone(pad.axes[0]); ly = applyDeadzone(pad.axes[1]);\n"
+    "    }\n"
+    "    if (pad.axes.length >= 4) {\n"
     "        rx = applyDeadzone(pad.axes[2]); ry = applyDeadzone(pad.axes[3]);\n"
     "    }\n"
     "    return { buttons, hat, lx, ly, rx, ry };\n"
@@ -1112,6 +1137,7 @@ static const char INDEX_HTML[] =
     "        document.getElementById('btnConnect').innerText = \"Disconnect\";\n"
     "        document.getElementById('kbMode').disabled = true;\n"
     "        document.getElementById('statusText').innerText = `Connected to Pi Proxy.`;\n"
+    "        try { window.focus(); document.body.focus(); } catch(e) {}\n"
     "        loopId = setInterval(buildAndSendPacket, 4);\n"
     "    };\n"
     "    ws.onerror = () => alert(\"Failed to connect to proxy!\");\n"
