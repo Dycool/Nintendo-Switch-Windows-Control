@@ -2777,13 +2777,28 @@ static int ws_upgrade(const char *key_line, char *resp, size_t resp_sz) {
 
 
 // ── Format HTML body (heap-allocated, caller must free) ──────────────────────
+// Do not pass raw HTML/CSS through snprintf as a format string: CSS contains
+// plenty of '%' characters such as width: 100%, transform: translate(-50%, ...),
+// and those are undefined behaviour in printf-style format strings.  This helper
+// performs a single literal %s replacement instead, preserving the rest verbatim.
 static char* html_format(const char *fmt, const char *arg, size_t *out_len) {
-    size_t len = strlen(fmt) + strlen(arg) + 1;
-    char *buf = (char*)malloc(len);
-    if (!buf) { *out_len = 0; return nullptr; }
-    int written = snprintf(buf, len, fmt, arg);
-    if (written < 0 || (size_t)written >= len) { free(buf); *out_len = 0; return nullptr; }
-    *out_len = written;
+    if (!fmt || !arg || !out_len) return nullptr;
+
+    std::string s = fmt;
+    size_t pos = s.find("%s");
+    if (pos != std::string::npos) {
+        s.replace(pos, 2, arg);
+    }
+
+    char *buf = (char*)malloc(s.size() + 1);
+    if (!buf) {
+        *out_len = 0;
+        return nullptr;
+    }
+
+    memcpy(buf, s.data(), s.size());
+    buf[s.size()] = '\0';
+    *out_len = s.size();
     return buf;
 }
 
