@@ -200,18 +200,21 @@ static void init_spi_flash(int ctrl) {
         dst[2] = (y >> 4) & 0xFF;
     };
 
-    uint8_t cal_left[9] = {};
-    pack_stick_cal_pair(cal_left + 0, 0x600, 0x600); // max-above-center range
-    pack_stick_cal_pair(cal_left + 3, 0x800, 0x800); // center
-    pack_stick_cal_pair(cal_left + 6, 0x600, 0x600); // min-below-center range
+    // The Switch expects the 18-byte stick calibration block at 0x603D as:
+    //   left:  max-offset, center, min-offset
+    //   right: center, min-offset, max-offset
+    // The previous build used the left-stick order for the right stick too.
+    // That makes the right stick calibration invalid and can also make the
+    // Switch flatten/ignore analog stick movement.
+    uint8_t cal_sticks[18] = {};
+    pack_stick_cal_pair(cal_sticks + 0,  0x600, 0x600); // left max-above-center range
+    pack_stick_cal_pair(cal_sticks + 3,  0x800, 0x800); // left center
+    pack_stick_cal_pair(cal_sticks + 6,  0x600, 0x600); // left min-below-center range
+    pack_stick_cal_pair(cal_sticks + 9,  0x800, 0x800); // right center
+    pack_stick_cal_pair(cal_sticks + 12, 0x600, 0x600); // right min-below-center range
+    pack_stick_cal_pair(cal_sticks + 15, 0x600, 0x600); // right max-above-center range
 
-    uint8_t cal_right[9] = {};
-    pack_stick_cal_pair(cal_right + 0, 0x600, 0x600);
-    pack_stick_cal_pair(cal_right + 3, 0x800, 0x800);
-    pack_stick_cal_pair(cal_right + 6, 0x600, 0x600);
-
-    memcpy(flash + 0x603D, cal_left, sizeof(cal_left));
-    memcpy(flash + 0x6046, cal_right, sizeof(cal_right));
+    memcpy(flash + 0x603D, cal_sticks, sizeof(cal_sticks));
 
     // Body/button colors. Slightly different shade per virtual pad avoids cached identity weirdness.
     uint8_t shade = (uint8_t)(0x20 + ctrl * 0x18);
@@ -289,6 +292,9 @@ static uint16_t axis8_to_12(uint8_t v) {
 }
 
 static void pack_stick_12(uint8_t out[3], uint8_t x8, uint8_t y8) {
+    // Browser/Gamepad API uses 0 = up/left and 255 = down/right after our
+    // frontend conversion. With the fixed Pro Controller calibration above,
+    // that maps correctly through the Switch calibration path.
     uint16_t x = axis8_to_12(x8);
     uint16_t y = axis8_to_12(y8);
     out[0] = x & 0xFF;
@@ -1084,7 +1090,7 @@ static const char INDEX_HTML[] =
     "    else if (pdown && pright) hat = HAT_SE; else if (pdown && pleft) hat = HAT_SW;\n"
     "    else if (pup) hat = HAT_N; else if (pdown) hat = HAT_S;\n"
     "    else if (pleft) hat = HAT_W; else if (pright) hat = HAT_E;\n"
-    "    const applyDeadzone = (val) => { if (Math.abs(val) < 0.15) return 128; return Math.round(((val + 1) / 2) * 255); };\n"
+    "    const applyDeadzone = (val) => { val = Number(val || 0); if (Math.abs(val) < 0.15) return 128; return Math.max(0, Math.min(255, Math.round(((val + 1) / 2) * 255))); };\n"
     "    if (pad.axes.length >= 2) {\n"
     "        lx = applyDeadzone(pad.axes[0]); ly = applyDeadzone(pad.axes[1]);\n"
     "    }\n"
@@ -1303,10 +1309,13 @@ static const char MOBILE_HTML[] =
     "        #btnConnect { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 15px 30px; border-radius: 30px; background: rgba(200,0,0,0.8); border:none; color:#fff; font-weight:bold; font-size: 18px; z-index: 100; box-shadow: 0 4px 12px rgba(0,0,0,0.5); }\n"
     "        #btnConnect.connected { background: rgba(0,200,0,0.8); }\n"
     "        #statusDot { display: none; position: absolute; bottom: 20px; right: 20px; width: 15px; height: 15px; background: #0f0; border-radius: 50%; box-shadow: 0 0 10px #0f0; z-index: 100; cursor: pointer; }\n"
+    "        #rumblePulse { display:none; position:absolute; inset:0; pointer-events:none; z-index:99; background:rgba(255,255,255,0.12); opacity:0; transition:opacity 80ms linear; }\n"
+    "        #rumblePulse.active { opacity:1; }\n"
     "    </style>\n"
     "    <div id=\"rotate-msg\">Please rotate to landscape mode.</div>\n"
     "    <div id=\"gamepad\">\n"
     "        <div id=\"statusDot\"></div>\n"
+    "        <div id=\"rumblePulse\"></div>\n"
     "        <button id=\"btnConnect\">Connect</button>\n"
     "        <div id=\"btn-zl\" class=\"edit-item btn-shoulder btn btn-map\" data-btn=\"64\">ZL</div>\n"
     "        <div id=\"btn-l\" class=\"edit-item btn-shoulder btn btn-map\" data-btn=\"16\">L</div>\n"
@@ -1465,6 +1474,8 @@ static const char MOBILE_HTML[] =
     "    if (!(data instanceof ArrayBuffer) || data.byteLength < 8) return;\n"
     "    const v = new DataView(data); if (v.getUint32(0, true) !== RUMBLE_MAGIC) return;\n"
     "    const low = v.getUint8(5), high = v.getUint8(6), dur = v.getUint8(7) * 10;\n"
+    "    const pulse = document.getElementById('rumblePulse');\n"
+    "    if (pulse) { pulse.style.display = (low || high) ? 'block' : 'none'; pulse.classList.add('active'); setTimeout(() => pulse.classList.remove('active'), Math.max(60, Math.min(dur || 60, 180))); }\n"
     "    if (navigator.vibrate && dur > 0 && (low || high)) navigator.vibrate(dur);\n"
     "}\n"
     "function setupJoystick(baseId, knobId, axisX, axisY) {\n"
