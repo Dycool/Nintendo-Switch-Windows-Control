@@ -4,7 +4,10 @@ set -e
 
 clang++ -std=c++17 -ObjC++ -O2 -Wall \
     ns-gui.mm \
-    -framework Cocoa -framework GameController -framework Foundation \
+    -framework Cocoa \
+    -framework GameController \
+    -framework Foundation \
+    -framework CoreHaptics \
     -o ns-gui
 echo "Built ns-gui"
 

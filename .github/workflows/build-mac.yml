@@ -19,7 +19,12 @@ jobs:
       - name: Build Terminal Client
         run: |
           cd client/mac/
-          clang++ -std=c++17 -ObjC++ -framework GameController -framework Foundation -framework CoreGraphics ns-gamepad.mm -o ns-gamepad
+          clang++ -std=c++17 -ObjC++ \
+            -framework GameController \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -framework CoreHaptics \
+            ns-gamepad.mm -o ns-gamepad
 
       - name: Build GUI App Bundle
         run: |
