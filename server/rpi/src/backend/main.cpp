@@ -1290,8 +1290,8 @@ static void base64_encode(const uint8_t *in, size_t len, char *out) {
 
 
 // ── Perform WebSocket upgrade handshake ──────────────────────────────────────
-static bool ws_upgrade(int fd, const char *key_line) {
-    // Procura pela chave ignorando maiúsculas/minúsculas
+// Returns response length, or -1 on failure.  Caller must queue via async write.
+static int ws_upgrade(const char *key_line, char *resp, size_t resp_sz) {
     const char *key_start = nullptr;
     const char *header_name = "sec-websocket-key:";
     const char *p = key_line;
@@ -1305,23 +1305,19 @@ static bool ws_upgrade(int fd, const char *key_line) {
         p++;
     }
 
-    if (!key_start) return false;
+    if (!key_start) return -1;
 
     while (*key_start == ' ') key_start++;
-
-    // Find end of line
     const char *key_end = strchr(key_start, '\r');
     if (!key_end) key_end = strchr(key_start, '\n');
-    if (!key_end) return false;
+    if (!key_end) return -1;
 
-    // Copy key
     char key[256];
     size_t klen = key_end - key_start;
-    if (klen >= sizeof(key)) return false;
+    if (klen >= sizeof(key)) return -1;
     memcpy(key, key_start, klen);
     key[klen] = '\0';
 
-    // Compute accept = base64(sha1(key + magic GUID))
     const char *magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     uint8_t sha_input[256];
     size_t slen = snprintf((char*)sha_input, sizeof(sha_input), "%s%s", key, magic);
@@ -1335,15 +1331,12 @@ static bool ws_upgrade(int fd, const char *key_line) {
     char b64out[64];
     base64_encode(digest, 20, b64out);
 
-    char resp[512];
-    int n = snprintf(resp, sizeof(resp),
+    return snprintf(resp, resp_sz,
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         "Sec-WebSocket-Accept: %s\r\n"
         "\r\n", b64out);
-
-    return write(fd, resp, n) == (ssize_t)n;
 }
 
 
@@ -1499,14 +1492,25 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
                     bool is_ws = has_header(c->http_buf, "upgrade: websocket") &&
                                  has_header(c->http_buf, "sec-websocket-key:");
                     if (is_ws) {
-                        // WS upgrade response is tiny (~200 bytes) — write directly
-                        if (ws_upgrade(c->fd, c->http_buf)) {
-                            if (g_verbose) std::puts("[web] WS upgrade ok, entering WS_ACTIVE");
-                            c->state = WebClient::WS_ACTIVE;
-                            c->ws_first = true;
-                            c->ws_seq = 0;
-                            c->ws_slot = -1;
-                            c->ws_last_rx = now_us();
+                        // Queue WS upgrade response via async write (never block on non-blocking socket)
+                        char resp[512];
+                        int n = ws_upgrade(c->http_buf, resp, sizeof(resp));
+                        if (n > 0) {
+                            c->wbuf = (uint8_t*)malloc(n);
+                            if (c->wbuf) {
+                                memcpy(c->wbuf, resp, n);
+                                c->wlen = n;
+                                c->woff = 0;
+                                c->after_write = WebClient::WS_ACTIVE;
+                                c->state = WebClient::WRITE_RESP;
+                                c->ws_first = true;
+                                c->ws_seq = 0;
+                                c->ws_slot = -1;
+                                c->ws_last_rx = now_us();
+                                if (g_verbose) std::puts("[web] WS upgrade queued");
+                            } else {
+                                c->state = WebClient::CLOSED;
+                            }
                         } else {
                             if (g_verbose) std::puts("[web] WS upgrade failed");
                             c->state = WebClient::CLOSED;
