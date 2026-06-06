@@ -188,10 +188,12 @@ static void init_spi_flash(int ctrl) {
     flash[0x6013] = 0xA0;
     flash[0x601B] = 0x02;
 
-    // Factory stick calibration.  This must be packed as three 12-bit X/Y
-    // pairs.  The previous helper wrote overlapping bytes and produced invalid
-    // calibration, which can make the Switch accept buttons while ignoring
-    // analogue stick movement.
+    // Stick calibration must be valid for BOTH sticks.  The Switch reads
+    // 9 bytes per stick.  Left and right use different field orders:
+    //   left:  max-above-center, center, min-below-center
+    //   right: center, min-below-center, max-above-center
+    // Also expose the same values as USER calibration.  This avoids a bad
+    // cached/old factory-cal path making one analogue stick get flattened.
     auto pack_stick_cal_pair = [](uint8_t* dst, uint16_t x, uint16_t y) {
         x &= 0x0FFF;
         y &= 0x0FFF;
@@ -200,21 +202,32 @@ static void init_spi_flash(int ctrl) {
         dst[2] = (y >> 4) & 0xFF;
     };
 
-    // The Switch expects the 18-byte stick calibration block at 0x603D as:
-    //   left:  max-offset, center, min-offset
-    //   right: center, min-offset, max-offset
-    // The previous build used the left-stick order for the right stick too.
-    // That makes the right stick calibration invalid and can also make the
-    // Switch flatten/ignore analog stick movement.
-    uint8_t cal_sticks[18] = {};
-    pack_stick_cal_pair(cal_sticks + 0,  0x600, 0x600); // left max-above-center range
-    pack_stick_cal_pair(cal_sticks + 3,  0x800, 0x800); // left center
-    pack_stick_cal_pair(cal_sticks + 6,  0x600, 0x600); // left min-below-center range
-    pack_stick_cal_pair(cal_sticks + 9,  0x800, 0x800); // right center
-    pack_stick_cal_pair(cal_sticks + 12, 0x600, 0x600); // right min-below-center range
-    pack_stick_cal_pair(cal_sticks + 15, 0x600, 0x600); // right max-above-center range
+    static constexpr uint16_t STICK_CENTER = 0x800;
+    static constexpr uint16_t STICK_RANGE  = 0x600;
 
-    memcpy(flash + 0x603D, cal_sticks, sizeof(cal_sticks));
+    uint8_t left_cal[9] = {};
+    uint8_t right_cal[9] = {};
+
+    // Left stick: range above center, center, range below center.
+    pack_stick_cal_pair(left_cal + 0, STICK_RANGE,  STICK_RANGE);
+    pack_stick_cal_pair(left_cal + 3, STICK_CENTER, STICK_CENTER);
+    pack_stick_cal_pair(left_cal + 6, STICK_RANGE,  STICK_RANGE);
+
+    // Right stick: center, range below center, range above center.
+    pack_stick_cal_pair(right_cal + 0, STICK_CENTER, STICK_CENTER);
+    pack_stick_cal_pair(right_cal + 3, STICK_RANGE,  STICK_RANGE);
+    pack_stick_cal_pair(right_cal + 6, STICK_RANGE,  STICK_RANGE);
+
+    // Factory calibration addresses.
+    memcpy(flash + 0x603D, left_cal,  sizeof(left_cal));
+    memcpy(flash + 0x6046, right_cal, sizeof(right_cal));
+
+    // User calibration magic + data.  The Switch/Linux driver checks 0xB2 0xA1
+    // before using the user calibration block.
+    flash[0x8010] = 0xB2; flash[0x8011] = 0xA1;
+    memcpy(flash + 0x8012, left_cal, sizeof(left_cal));
+    flash[0x801B] = 0xB2; flash[0x801C] = 0xA1;
+    memcpy(flash + 0x801D, right_cal, sizeof(right_cal));
 
     // Body/button colors. Slightly different shade per virtual pad avoids cached identity weirdness.
     uint8_t shade = (uint8_t)(0x20 + ctrl * 0x18);
@@ -296,7 +309,7 @@ static void pack_stick_12(uint8_t out[3], uint8_t x8, uint8_t y8) {
     // frontend conversion. With the fixed Pro Controller calibration above,
     // that maps correctly through the Switch calibration path.
     uint16_t x = axis8_to_12(x8);
-    uint16_t y = axis8_to_12(y8);
+    uint16_t y = axis8_to_12((uint8_t)(255 - y8));
     out[0] = x & 0xFF;
     out[1] = ((x >> 8) & 0x0F) | ((y & 0x0F) << 4);
     out[2] = (y >> 4) & 0xFF;
