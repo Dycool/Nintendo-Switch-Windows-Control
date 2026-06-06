@@ -66,6 +66,15 @@ enum KeyboardMode {
 static constexpr int MAX_SLOTS = 4;
 static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
 
+// ── Global macOS rumble / compatibility state ──────────────────────────────
+// The haptics helpers below run outside AppDelegate, so they need a small
+// process-wide map from logical player slot -> GCController/CoreHaptics state.
+// Under ARC these Objective-C object references are retained automatically.
+static bool g_legacyUdp = false; // hidden fallback: NSPC_LEGACY_UDP=1
+static __strong GCController* g_rumbleControllers[MAX_SLOTS] = {};
+static __strong CHHapticEngine* g_hapticEngines[MAX_SLOTS] = {};
+static __strong id<CHHapticPatternPlayer> g_hapticPlayers[MAX_SLOTS] = {};
+
 // ── Macro support ───────────────────────────────────────────────────────────
 // Macro grammar is intentionally strict and shared by CLI/GUI clients:
 //   WAIT 100                         -> release macro inputs for 100ms
