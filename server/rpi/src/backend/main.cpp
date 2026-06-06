@@ -182,27 +182,19 @@ static void init_spi_flash(int ctrl) {
     flash[0x6013] = 0xA0;
     flash[0x601B] = 0x02;
 
-    // Factory stick calibration.  This must be packed as three 12-bit X/Y
-    // pairs.  The previous helper wrote overlapping bytes and produced invalid
-    // calibration, which can make the Switch accept buttons while ignoring
-    // analogue stick movement.
-    auto pack_stick_cal_pair = [](uint8_t* dst, uint16_t x, uint16_t y) {
-        x &= 0x0FFF;
-        y &= 0x0FFF;
-        dst[0] = x & 0xFF;
-        dst[1] = ((x >> 8) & 0x0F) | ((y & 0x0F) << 4);
-        dst[2] = (y >> 4) & 0xFF;
-    };
-
     uint8_t cal_left[9] = {};
-    pack_stick_cal_pair(cal_left + 0, 0x600, 0x600); // max-above-center range
-    pack_stick_cal_pair(cal_left + 3, 0x800, 0x800); // center
-    pack_stick_cal_pair(cal_left + 6, 0x600, 0x600); // min-below-center range
+    pack12(0x800, cal_left[0], cal_left[1]);
+    pack12(0x800, cal_left[1], cal_left[2]);
+    pack12(0xF00, cal_left[3], cal_left[4]);
+    pack12(0xF00, cal_left[4], cal_left[5]);
+    cal_left[6] = 0x18;
 
     uint8_t cal_right[9] = {};
-    pack_stick_cal_pair(cal_right + 0, 0x600, 0x600);
-    pack_stick_cal_pair(cal_right + 3, 0x800, 0x800);
-    pack_stick_cal_pair(cal_right + 6, 0x600, 0x600);
+    pack12(0x800, cal_right[0], cal_right[1]);
+    pack12(0x800, cal_right[1], cal_right[2]);
+    pack12(0xF00, cal_right[3], cal_right[4]);
+    pack12(0xF00, cal_right[4], cal_right[5]);
+    cal_right[6] = 0x18;
 
     memcpy(flash + 0x603D, cal_left, sizeof(cal_left));
     memcpy(flash + 0x6046, cal_right, sizeof(cal_right));
@@ -265,21 +257,7 @@ static void fill_neutral_controls(ProInputReport21& r) {
 }
 
 static uint16_t axis8_to_12(uint8_t v) {
-    // Match the fake calibration above: center 0x800 with about ±0x600 range.
-    // Sending the full 0x000..0xFFF range can sit outside the advertised
-    // calibration and some Switch paths appear to flatten/ignore the stick.
-    if (v == 128) return 0x800;
-
-    int32_t delta = (int32_t)v - 128;
-    int32_t raw;
-    if (delta > 0)
-        raw = 0x800 + (delta * 0x600) / 127;
-    else
-        raw = 0x800 + (delta * 0x600) / 128;
-
-    if (raw < 0x200) raw = 0x200;
-    if (raw > 0xE00) raw = 0xE00;
-    return (uint16_t)raw;
+    return (uint16_t)((uint32_t)v * 4095u / 255u);
 }
 
 static void pack_stick_12(uint8_t out[3], uint8_t x8, uint8_t y8) {
@@ -498,7 +476,7 @@ static void writer_thread(int hz) {
         bool all_open = true;
         for (int i = 0; i < 4; ++i) {
             if (fds[i] < 0) {
-                fds[i] = open(devs[i].c_str(), O_RDWR);
+                fds[i] = open(devs[i].c_str(), O_RDWR | O_NONBLOCK);
                 if (fds[i] >= 0) {
                     rt[i].fd = fds[i];
                     rt[i].timer = 0;
@@ -560,15 +538,6 @@ static void writer_thread(int hz) {
                 if (hw_slots[h].client_idx != -1 && !active_snap[hw_slots[h].client_idx]) {
                     hw_slots[h].client_idx = -1;
                     hw_slots[h].sub_idx = -1;
-
-                    // Match the successful probe behavior: once a virtual controller is
-                    // no longer needed, stop serving that Pro Controller runtime.  The
-                    // next real input will make the port handshake again instead of
-                    // leaving a half-connected controller around.
-                    rt[h].timer = 0;
-                    rt[h].full_report_enabled = false;
-                    rt[h].pending_subcmd_reply = false;
-                    memset(&rt[h].pending_reply, 0, sizeof(rt[h].pending_reply));
                 }
             }
 
@@ -606,56 +575,27 @@ static void writer_thread(int hz) {
 
             bool ok = true;
             for (int h = 0; h < 4; ++h) {
-                const bool port_needed = (hw_slots[h].client_idx != -1);
-
                 uint8_t write_buf[PRO_REPORT_SIZE] = {};
-                bool have_report_to_write = false;
-                bool wrote_subcmd_reply = false;
-
                 if (rt[h].pending_subcmd_reply) {
                     rt[h].pending_reply.id = RID_INPUT_SUBCMD;
                     rt[h].pending_reply.timer = rt[h].timer++;
                     fill_neutral_controls(rt[h].pending_reply);
                     memcpy(write_buf, &rt[h].pending_reply, sizeof(ProInputReport21));
-                    have_report_to_write = true;
-                    wrote_subcmd_reply = true;
-                } else if (port_needed && rt[h].full_report_enabled) {
-                    // Exact successful-probe rule: do NOT stream 0x30 just because a
-                    // browser/UDP pad exists.  Wait until the Switch enables full input
-                    // reports through init cmd 0x04 and/or subcmd 0x03.
+                    rt[h].pending_subcmd_reply = false;
+                } else if (rt[h].full_report_enabled) {
                     ProInputReport30 std_in{};
                     build_standard_report(out_reports[h], rt[h].timer++, std_in);
                     memcpy(write_buf, &std_in, sizeof(ProInputReport30));
-                    have_report_to_write = true;
-                }
-
-                if (!have_report_to_write) continue;
-
-                ssize_t w = write(fds[h], write_buf, PRO_REPORT_SIZE);
-                if (w < 0) {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) ok = false;
-                    // If a subcommand reply could not be written, keep it pending.
-                    // Dropping it makes the Switch repeat commands such as 0x02 forever.
-                } else if (w == (ssize_t)PRO_REPORT_SIZE) {
-                    if (wrote_subcmd_reply) rt[h].pending_subcmd_reply = false;
-                    writes_this_second++;
-                } else if (w > 0) {
-                    // Partial HID report writes should not happen.  Treat as an error so
-                    // we reconnect cleanly rather than sending malformed controller data.
-                    ok = false;
-                }
-            }
-
-            for (int h = 0; h < 4; ++h) {
-                const bool port_needed = (hw_slots[h].client_idx != -1);
-
-                // Only handshake/serve a Pro Controller once a real browser/UDP/mobile
-                // pad has claimed that Switch port.  This prevents unused virtual
-                // controllers from fully connecting just because the gadget exists.
-                if (!port_needed && !rt[h].pending_subcmd_reply && !rt[h].full_report_enabled) {
+                } else {
                     continue;
                 }
 
+                ssize_t w = write(fds[h], write_buf, PRO_REPORT_SIZE);
+                if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) ok = false;
+                else if (w > 0) writes_this_second++;
+            }
+
+            for (int h = 0; h < 4; ++h) {
                 struct pollfd pfd = {fds[h], POLLIN, 0};
                 uint8_t read_buf[PRO_REPORT_SIZE];
                 int guard = 0;
@@ -975,10 +915,9 @@ static const char INDEX_HTML[] =
     "document.getElementById('kbMode').onchange = (e) => localStorage.setItem('nswc_mode', e.target.value);\n"
     "window.addEventListener('keydown', (e) => {\n"
     "    if (activeBindKey) { e.preventDefault(); remapKey(e.code); return; }\n"
-    "    if (!['INPUT','TEXTAREA','SELECT','BUTTON'].includes((e.target && e.target.tagName) || '')) e.preventDefault();\n"
     "    keysDown.add(e.code);\n"
     "});\n"
-    "window.addEventListener('keyup', (e) => { e.preventDefault(); keysDown.delete(e.code); });\n"
+    "window.addEventListener('keyup', (e) => keysDown.delete(e.code));\n"
     "function getNeutralState() { return { buttons: 0, hat: HAT_NEUTRAL, lx: 128, ly: 128, rx: 128, ry: 128 }; }\n"
     "function getKeyboardState() {\n"
     "    let buttons = 0, hat = HAT_NEUTRAL, lx = 128, ly = 128, rx = 128, ry = 128;\n"
@@ -1038,10 +977,8 @@ static const char INDEX_HTML[] =
     "    else if (pup) hat = HAT_N; else if (pdown) hat = HAT_S;\n"
     "    else if (pleft) hat = HAT_W; else if (pright) hat = HAT_E;\n"
     "    const applyDeadzone = (val) => { if (Math.abs(val) < 0.15) return 128; return Math.round(((val + 1) / 2) * 255); };\n"
-    "    if (pad.axes.length >= 2) {\n"
-    "        lx = applyDeadzone(pad.axes[0]); ly = applyDeadzone(pad.axes[1]);\n"
-    "    }\n"
     "    if (pad.axes.length >= 4) {\n"
+    "        lx = applyDeadzone(pad.axes[0]); ly = applyDeadzone(pad.axes[1]);\n"
     "        rx = applyDeadzone(pad.axes[2]); ry = applyDeadzone(pad.axes[3]);\n"
     "    }\n"
     "    return { buttons, hat, lx, ly, rx, ry };\n"
@@ -1137,7 +1074,6 @@ static const char INDEX_HTML[] =
     "        document.getElementById('btnConnect').innerText = \"Disconnect\";\n"
     "        document.getElementById('kbMode').disabled = true;\n"
     "        document.getElementById('statusText').innerText = `Connected to Pi Proxy.`;\n"
-    "        try { window.focus(); document.body.focus(); } catch(e) {}\n"
     "        loopId = setInterval(buildAndSendPacket, 4);\n"
     "    };\n"
     "    ws.onerror = () => alert(\"Failed to connect to proxy!\");\n"
@@ -1311,7 +1247,6 @@ static const char MOBILE_HTML[] =
     "}\n"
     "applyLayout();\n"
     "const PROTO_MAGIC = 0x4E535743, PROTO_VERSION = 5, RUMBLE_MAGIC = 0x4E535652;\n"
-    "const FLAG_SINGLE_PAD = 0x04;\n"
     "const EXT_REPORT_SIZE = 24, PACKET_SIZE = 116;\n"
     "let ws = null, loopId = null, seqCounter = 0, isConnected = false, connectTimeout = null;\n"
     "let state = { buttons: 0, hat: 8, lx: 128, ly: 128, rx: 128, ry: 128 };\n"
@@ -1447,7 +1382,7 @@ static const char MOBILE_HTML[] =
     "function sendPacket() {\n"
     "    if (!ws || ws.readyState !== WebSocket.OPEN) return;\n"
     "    const buffer = new ArrayBuffer(PACKET_SIZE), view = new DataView(buffer);\n"
-    "    view.setUint32(0, PROTO_MAGIC, true); view.setUint8(4, PROTO_VERSION); view.setUint8(5, FLAG_SINGLE_PAD);\n"
+    "    view.setUint32(0, PROTO_MAGIC, true); view.setUint8(4, PROTO_VERSION); view.setUint8(5, 0);\n"
     "    view.setUint16(6, 0, true); view.setUint32(8, seqCounter++, true); view.setBigUint64(12, BigInt(Date.now()*1000), true);\n"
     "    let off = 20;\n"
     "    view.setUint16(off, state.buttons, true); view.setUint8(off+2, state.hat);\n"
@@ -1919,14 +1854,6 @@ static size_t process_ws_frame(WebClient *c) {
         legacy_multi_to_extended(legacy, report);
     } else if (ver == WEB_PROTO_VERSION && flen == WEB_PACKET_SIZE) {
         memcpy(&report, payload + 20, sizeof(ExtendedMultiReport));
-        if (flags & FLAG_SINGLE_PAD) {
-            // The mobile touch page is one virtual controller only.  Force the
-            // unused subpads to neutral so a malformed/old cached mobile packet
-            // cannot accidentally claim Switch ports 2-4.
-            report.p2.reset();
-            report.p3.reset();
-            report.p4.reset();
-        }
     } else {
         return total;
     }
