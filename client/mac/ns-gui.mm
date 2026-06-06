@@ -6,6 +6,7 @@
 /// Build:
 ///   clang++ -std=c++17 -ObjC++ -fobjc-arc \
 ///           -framework Cocoa -framework GameController \
+///           -framework CoreHaptics \
 ///           ns-gui.mm -o ns-gui
 ///
 /// Usage:
@@ -20,6 +21,7 @@
 
 #import <Cocoa/Cocoa.h>
 #import <GameController/GameController.h>
+#import <CoreHaptics/CoreHaptics.h>
 
 #include <iostream>
 #include <string>
@@ -33,6 +35,9 @@
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
+#include <cerrno>
+#include <fcntl.h>
+#include <dispatch/dispatch.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -52,6 +57,31 @@ enum KeyboardMode {
     KB_OVERRIDE = 2
 };
 
+static constexpr int MAX_SLOTS = 4;
+static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
+static bool g_legacyUdp = false; // hidden fallback: NSPC_LEGACY_UDP=1
+
+#pragma pack(push, 1)
+struct ExtendedUdpPacket {
+    uint32_t magic;
+    uint8_t  version;
+    uint8_t  flags;
+    uint16_t reserved;
+    uint32_t seq;
+    uint64_t timestamp_us;
+    ns::ExtendedMultiReport report;
+    uint8_t  hmac[ns::HMAC_TAG_SIZE];
+};
+#pragma pack(pop)
+
+static constexpr size_t EXT_UDP_PACKET_AUTH_SIZE = 20 + sizeof(ns::ExtendedMultiReport);
+static constexpr size_t EXT_UDP_PACKET_SIZE      = EXT_UDP_PACKET_AUTH_SIZE + ns::HMAC_TAG_SIZE;
+static_assert(sizeof(ExtendedUdpPacket) == EXT_UDP_PACKET_SIZE, "ExtendedUdpPacket wire size mismatch");
+
+static GCController* g_rumbleControllers[MAX_SLOTS] = {};
+static __strong CHHapticEngine* g_hapticEngines[MAX_SLOTS] = {};
+static __strong id<CHHapticPatternPlayer> g_hapticPlayers[MAX_SLOTS] = {};
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Shared gamepad state
@@ -67,6 +97,11 @@ struct GamepadState {
     std::atomic<bool>  dpad_up{false}, dpad_down{false}, dpad_left{false}, dpad_right{false};
     std::atomic<float> lx{0.0f}, ly{0.0f}, rx{0.0f}, ry{0.0f};
 
+    // GameController motion values. Accel is in g-ish units, gyro is rad/s.
+    std::atomic<bool>  has_motion{false};
+    std::atomic<float> ax{0.0f}, ay{0.0f}, az{0.0f};
+    std::atomic<float> gx{0.0f}, gy{0.0f}, gz{0.0f};
+
     void clear_inputs() {
         btn_a = false; btn_b = false; btn_x = false; btn_y = false;
         btn_l = false; btn_r = false; zl = 0.0f; zr = 0.0f;
@@ -74,6 +109,9 @@ struct GamepadState {
         btn_lstick = false; btn_rstick = false;
         dpad_up = false; dpad_down = false; dpad_left = false; dpad_right = false;
         lx = 0.0f; ly = 0.0f; rx = 0.0f; ry = 0.0f;
+        has_motion = false;
+        ax = 0.0f; ay = 0.0f; az = 0.0f;
+        gx = 0.0f; gy = 0.0f; gz = 0.0f;
         // note: does not clear slotActive (managed separately)
     }
 
@@ -99,6 +137,13 @@ struct GamepadState {
             ly.store(other.ly.load(std::memory_order_relaxed), std::memory_order_relaxed);
             rx.store(other.rx.load(std::memory_order_relaxed), std::memory_order_relaxed);
             ry.store(other.ry.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            has_motion.store(other.has_motion.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ax.store(other.ax.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ay.store(other.ay.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            az.store(other.az.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            gx.store(other.gx.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            gy.store(other.gy.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            gz.store(other.gz.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
         return *this;
     }
@@ -118,11 +163,55 @@ static uint8_t float_to_byte(float val, bool invert = false, float dz = 0.15f) {
     return (uint8_t)(invert ? 255 - scaled : scaled);
 }
 
+static int16_t clamp_i16_from_float(float v) {
+    if (v < -32768.0f) return -32768;
+    if (v >  32767.0f) return  32767;
+    return (int16_t)std::lrintf(v);
+}
+
+static ns::MotionReport map_gc_motion_to_switch(const GamepadState& st) {
+    ns::MotionReport m;
+    m.reset();
+
+    // Match the backend's virtual IMU scale roughly: accel around 0x1000 per g,
+    // gyro kept conservative so real pads do not saturate the Switch sample.
+    m.ax = clamp_i16_from_float(st.ax.load(std::memory_order_relaxed) * 4096.0f);
+    m.ay = clamp_i16_from_float(st.ay.load(std::memory_order_relaxed) * 4096.0f);
+    m.az = clamp_i16_from_float(st.az.load(std::memory_order_relaxed) * 4096.0f);
+    m.gx = clamp_i16_from_float(st.gx.load(std::memory_order_relaxed) * 1000.0f);
+    m.gy = clamp_i16_from_float(st.gy.load(std::memory_order_relaxed) * 1000.0f);
+    m.gz = clamp_i16_from_float(st.gz.load(std::memory_order_relaxed) * 1000.0f);
+    return m;
+}
+
+static void set_pad_present_flag(ns::ExtendedHIDReport& r, bool present) {
+    // Backend/web protocol uses byte 7 of ExtendedHIDReport as the pad-present flag.
+    // This lets neutral-but-connected UDP pads claim a Switch slot and receive rumble.
+    uint8_t* raw = reinterpret_cast<uint8_t*>(&r);
+    if (present) raw[7] |= EXT_PAD_PRESENT;
+    else         raw[7] &= (uint8_t)~EXT_PAD_PRESENT;
+}
+
+static void fill_extended_pad(ns::ExtendedHIDReport& dst,
+                              const ns::HIDReport& input,
+                              bool present,
+                              const ns::MotionReport* motion) {
+    dst.reset();
+    dst.input = input;
+    set_pad_present_flag(dst, present);
+    if (present && motion) {
+        dst.motion = *motion;
+        dst.has_motion = true;
+    } else {
+        dst.has_motion = false;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  GameController integration
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void attach_handlers(GCExtendedGamepad* gp, GamepadState* st) {
+static void attach_handlers(GCController* ctrl, GCExtendedGamepad* gp, GamepadState* st) {
     st->clear_inputs();
 
     gp.buttonA.valueChangedHandler = ^(GCControllerButtonInput*, float, BOOL p) { st->btn_a.store((bool)p, std::memory_order_relaxed); };
@@ -156,6 +245,30 @@ static void attach_handlers(GCExtendedGamepad* gp, GamepadState* st) {
     gp.leftThumbstick.yAxis.valueChangedHandler  = ^(GCControllerAxisInput*, float v) { st->ly.store(v, std::memory_order_relaxed); };
     gp.rightThumbstick.xAxis.valueChangedHandler = ^(GCControllerAxisInput*, float v) { st->rx.store(v, std::memory_order_relaxed); };
     gp.rightThumbstick.yAxis.valueChangedHandler = ^(GCControllerAxisInput*, float v) { st->ry.store(v, std::memory_order_relaxed); };
+
+    if (@available(macOS 10.15, *)) {
+        GCMotion* motion = ctrl.motion;
+        if (motion) {
+            motion.valueChangedHandler = ^(GCMotion* m) {
+                GCAcceleration gravity = m.gravity;
+                GCAcceleration user    = m.userAcceleration;
+                GCRotationRate rate     = m.rotationRate;
+
+                st->ax.store((float)(gravity.x + user.x), std::memory_order_relaxed);
+                st->ay.store((float)(gravity.y + user.y), std::memory_order_relaxed);
+                st->az.store((float)(gravity.z + user.z), std::memory_order_relaxed);
+                st->gx.store((float)rate.x, std::memory_order_relaxed);
+                st->gy.store((float)rate.y, std::memory_order_relaxed);
+                st->gz.store((float)rate.z, std::memory_order_relaxed);
+                st->has_motion.store(true, std::memory_order_relaxed);
+            };
+            motion.sensorsActive = YES;
+        } else {
+            st->has_motion.store(false, std::memory_order_relaxed);
+        }
+    } else {
+        st->has_motion.store(false, std::memory_order_relaxed);
+    }
 }
 
 static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
@@ -202,6 +315,172 @@ static ns::HIDReport map_gc_to_switch(const GamepadState& st) {
     r.ry = float_to_byte(st.ry.load(std::memory_order_relaxed), true);   // inverted
 
     return r;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  UDP rumble -> GameController haptics
+// ─────────────────────────────────────────────────────────────────────────────
+static void stop_haptics_for_controller_on_main(int ctrl_idx, bool release_engine) {
+    if (ctrl_idx < 0 || ctrl_idx >= MAX_SLOTS) return;
+    if (@available(macOS 11.0, *)) {
+        NSError* err = nil;
+        if (g_hapticPlayers[ctrl_idx]) {
+            [g_hapticPlayers[ctrl_idx] stopAtTime:0 error:&err];
+            g_hapticPlayers[ctrl_idx] = nil;
+        }
+        if (release_engine && g_hapticEngines[ctrl_idx]) {
+            [g_hapticEngines[ctrl_idx] stopWithCompletionHandler:nil];
+            g_hapticEngines[ctrl_idx] = nil;
+        }
+    }
+}
+
+static void set_controller_rumble_async(int ctrl_idx, uint8_t low, uint8_t high, uint64_t duration_us) {
+    if (ctrl_idx < 0 || ctrl_idx >= MAX_SLOTS) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (@available(macOS 11.0, *)) {
+            GCController* ctrl = g_rumbleControllers[ctrl_idx];
+            if (!ctrl || !ctrl.haptics) return;
+
+            const bool neutral = ((low == 0 && high == 0) || duration_us == 0);
+            if (neutral) {
+                stop_haptics_for_controller_on_main(ctrl_idx, false);
+                return;
+            }
+
+            CHHapticEngine* engine = g_hapticEngines[ctrl_idx];
+            if (!engine) {
+                engine = [ctrl.haptics createEngineWithLocality:GCHapticsLocalityDefault];
+                if (!engine) return;
+                NSError* startErr = nil;
+                if (![engine startAndReturnError:&startErr]) {
+                    std::cerr << "GameController haptics failed to start for P" << (ctrl_idx + 1)
+                              << ": " << (startErr ? startErr.localizedDescription.UTF8String : "unknown") << "\n";
+                    return;
+                }
+                g_hapticEngines[ctrl_idx] = engine;
+            }
+
+            stop_haptics_for_controller_on_main(ctrl_idx, false);
+
+            const float intensity = std::max((float)low, (float)high) / 255.0f;
+            const float sharpness = (low || high) ? ((float)high / (float)std::max<int>(1, low + high)) : 0.0f;
+            const NSTimeInterval duration = std::max<NSTimeInterval>(0.25, (NSTimeInterval)duration_us / 1000000.0);
+
+            NSError* err = nil;
+            CHHapticEventParameter* pIntensity = [[CHHapticEventParameter alloc]
+                initWithParameterID:CHHapticEventParameterIDHapticIntensity value:intensity];
+            CHHapticEventParameter* pSharpness = [[CHHapticEventParameter alloc]
+                initWithParameterID:CHHapticEventParameterIDHapticSharpness value:sharpness];
+            CHHapticEvent* event = [[CHHapticEvent alloc]
+                initWithEventType:CHHapticEventTypeHapticContinuous
+                parameters:@[pIntensity, pSharpness]
+                relativeTime:0
+                duration:duration];
+            CHHapticPattern* pattern = [[CHHapticPattern alloc]
+                initWithEvents:@[event] parameters:@[] error:&err];
+            if (!pattern || err) {
+                std::cerr << "GameController haptic pattern failed for P" << (ctrl_idx + 1)
+                          << ": " << (err ? err.localizedDescription.UTF8String : "unknown") << "\n";
+                return;
+            }
+
+            id<CHHapticPatternPlayer> player = [engine createPlayerWithPattern:pattern error:&err];
+            if (!player || err) {
+                std::cerr << "GameController haptic player failed for P" << (ctrl_idx + 1)
+                          << ": " << (err ? err.localizedDescription.UTF8String : "unknown") << "\n";
+                return;
+            }
+            if (![player startAtTime:0 error:&err]) {
+                std::cerr << "GameController haptic start failed for P" << (ctrl_idx + 1)
+                          << ": " << (err ? err.localizedDescription.UTF8String : "unknown") << "\n";
+                return;
+            }
+            g_hapticPlayers[ctrl_idx] = player;
+        }
+    });
+}
+
+class RumbleManager {
+public:
+    void apply_packet(const ns::RumblePacket& rp, const int controller_for_slot[4]) {
+        if (rp.subpad >= 4) return;
+        const int slot = rp.subpad;
+        const uint8_t low = rp.low_freq;
+        const uint8_t high = rp.high_freq;
+        const bool neutral = (low == 0 && high == 0) || rp.duration_10ms == 0;
+        const uint64_t now = ns::now_us();
+        const uint64_t dur_us = neutral ? 0ULL : std::max<uint64_t>(250000ULL, (uint64_t)rp.duration_10ms * 10000ULL);
+
+        if (!neutral && states[slot].low == low && states[slot].high == high &&
+            now - states[slot].last_set_us < 100000ULL) {
+            states[slot].until_us = now + dur_us;
+            return;
+        }
+
+        states[slot].low = low;
+        states[slot].high = high;
+        states[slot].until_us = neutral ? 0ULL : now + dur_us;
+        states[slot].last_set_us = now;
+        set_output(slot, neutral ? 0 : low, neutral ? 0 : high, controller_for_slot[slot]);
+    }
+
+    void update_timeouts(const int controller_for_slot[4]) {
+        const uint64_t now = ns::now_us();
+        for (int i = 0; i < 4; ++i) {
+            if (states[i].until_us != 0 && now > states[i].until_us) {
+                states[i].until_us = 0;
+                states[i].low = states[i].high = 0;
+                set_output(i, 0, 0, controller_for_slot[i]);
+            }
+        }
+    }
+
+    void stop_all() {
+        for (int i = 0; i < 4; ++i) {
+            if (states[i].last_controller >= 0)
+                set_controller_rumble_async(states[i].last_controller, 0, 0, 0);
+            states[i] = SlotState{};
+        }
+    }
+
+private:
+    struct SlotState {
+        uint8_t low = 0, high = 0;
+        uint64_t until_us = 0;
+        uint64_t last_set_us = 0;
+        int last_controller = -1;
+    } states[4];
+
+    void set_output(int slot, uint8_t low, uint8_t high, int ctrl_idx) {
+        if (states[slot].last_controller != -1 && states[slot].last_controller != ctrl_idx)
+            set_controller_rumble_async(states[slot].last_controller, 0, 0, 0);
+        if (ctrl_idx >= 0)
+            set_controller_rumble_async(ctrl_idx, low, high, (low || high) ? 250000ULL : 0ULL);
+        states[slot].last_controller = ctrl_idx;
+    }
+};
+
+static void pump_udp_rumble(int sock, RumbleManager& rumble, const int controller_for_slot[4]) {
+    uint8_t buf[64];
+    for (;;) {
+        sockaddr_in from{};
+        socklen_t from_len = sizeof(from);
+        ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                std::cerr << "UDP receive error: " << strerror(errno) << "\n";
+            break;
+        }
+        if (n == (ssize_t)sizeof(ns::RumblePacket)) {
+            ns::RumblePacket rp{};
+            memcpy(&rp, buf, sizeof(rp));
+            if (rp.magic == ns::RUMBLE_MAGIC)
+                rumble.apply_packet(rp, controller_for_slot);
+        }
+    }
 }
 
 
@@ -648,6 +927,10 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
     // Elevate priority for lower input latency
     setpriority(PRIO_PROCESS, 0, -20);
     
+    // Hidden fallback for old backends. UI stays unchanged; extended UDP is default.
+    const char* legacyEnv = getenv("NSPC_LEGACY_UDP");
+    g_legacyUdp = legacyEnv && legacyEnv[0] && strcmp(legacyEnv, "0") != 0;
+
     // Keep receiving gamepad input when the window loses focus
     GCController.shouldMonitorBackgroundEvents = YES;
 
@@ -659,6 +942,9 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
 
     for (int i = 0; i < 4; ++i) {
         controllers[i] = nil;
+        g_rumbleControllers[i] = nil;
+        g_hapticEngines[i] = nil;
+        g_hapticPlayers[i] = nil;
         hwNames[i] = @"";
         slotActive[i] = false;
     }
@@ -674,9 +960,10 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
         for (int i = 0; i < 4; ++i) {
             if (self->controllers[i] == nil) {
                 self->controllers[i] = ctrl;
+                g_rumbleControllers[i] = ctrl;
                 self->slotActive[i].store(true, std::memory_order_relaxed); // FIX 1
                 self->hwNames[i] = ctrl.vendorName ?: @"Unknown Controller";
-                attach_handlers(ctrl.extendedGamepad, &self->states[i]);
+                attach_handlers(ctrl, ctrl.extendedGamepad, &self->states[i]);
                 break;
             }
         }
@@ -693,7 +980,12 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
             GCController* ctrl = (GCController*)note.object;
             for (int i = 0; i < 4; ++i) {
                 if (self->controllers[i] == ctrl) {
+                    if (@available(macOS 10.15, *)) {
+                        if (ctrl.motion) ctrl.motion.sensorsActive = NO;
+                    }
+                    stop_haptics_for_controller_on_main(i, true);
                     self->controllers[i] = nil;
+                    g_rumbleControllers[i] = nil;
                     self->slotActive[i].store(false, std::memory_order_relaxed); // FIX 1
                     self->states[i].clear_inputs();
                     self->hwNames[i] = @"";
@@ -818,7 +1110,7 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
         self->sock = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (self->sock < 0) return;
 
-        // Bind to a fixed local port so the backend identifies reconnects as the same PC
+        // Bind to a fixed local port so the backend identifies reconnects as the same PC.
         int opt = 1;
         setsockopt(self->sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         setsockopt(self->sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
@@ -828,13 +1120,16 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
         local_bind.sin_port = htons(42069);
         ::bind(self->sock, (struct sockaddr*)&local_bind, sizeof(local_bind));
 
+        int flags = fcntl(self->sock, F_GETFL, 0);
+        if (flags >= 0) fcntl(self->sock, F_SETFL, flags | O_NONBLOCK);
+
         struct addrinfo hints{}, *res = nullptr;
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_DGRAM;
         char portStr[8]; snprintf(portStr, sizeof(portStr), "%u", port);
         
         if (getaddrinfo(stdIp.c_str(), portStr, &hints, &res) != 0 || !res) {
-            close(self->sock); return;
+            close(self->sock); self->sock = -1; return;
         }
         
         sockaddr_in dest{};
@@ -843,25 +1138,30 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
 
         uint32_t seqCounter = 0;
         bool first_packet = true;
+        RumbleManager rumble;
 
         while (self->senderRunning.load(std::memory_order_relaxed)) {
-            ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet)); 
-            pkt.magic         = ns::PROTO_MAGIC;
-            pkt.version       = ns::PROTO_VERSION;
-            pkt.flags         = first_packet ? ns::FLAG_RESET : ns::FLAG_NONE;
-            first_packet      = false;
-            pkt.seq           = seqCounter++;
-            pkt.ts_us         = ns::now_us();
+            ns::HIDReport logical_reports[4];
+            ns::MotionReport logical_motion[4];
+            bool present[4] = {false, false, false, false};
+            bool has_motion[4] = {false, false, false, false};
+            int controller_for_slot[4] = {-1, -1, -1, -1};
+            for (int i = 0; i < 4; ++i) {
+                logical_reports[i].reset();
+                logical_motion[i].reset();
+            }
 
-            pkt.report.reset(); // Hardware-neutral init
-
-            ns::HIDReport* out_reports[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
             int active_count = 0;
-
             bool c1 = false, c2 = false, c3 = false, c4 = false;
             for (int i = 0; i < 4; ++i) {
                 if (!self->slotActive[i].load(std::memory_order_relaxed)) continue;
-                *out_reports[i] = map_gc_to_switch(self->states[i]);
+                logical_reports[i] = map_gc_to_switch(self->states[i]);
+                present[i] = true;
+                controller_for_slot[i] = i;
+                if (self->states[i].has_motion.load(std::memory_order_relaxed)) {
+                    logical_motion[i] = map_gc_motion_to_switch(self->states[i]);
+                    has_motion[i] = true;
+                }
                 active_count++;
                 if (i == 0) c1 = true;
                 else if (i == 1) c2 = true;
@@ -872,36 +1172,84 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
             // Keyboard overrides Player 1
             int km = self->keyboardMode.load();
             if (km == KB_SINGLE) {
-                if (c1) {
-                    // ONLY modify the outgoing reports, never the slotActive state
-                    if (!c2) { *out_reports[1] = *out_reports[0]; c2 = true; active_count++; }
-                    else if (!c3) { *out_reports[2] = *out_reports[0]; c3 = true; active_count++; }
-                    else if (!c4) { *out_reports[3] = *out_reports[0]; c4 = true; active_count++; }
+                if (present[0]) {
+                    int target = -1;
+                    for (int s = 1; s < 4; ++s) {
+                        if (!present[s]) { target = s; break; }
+                    }
+                    if (target >= 0) {
+                        logical_reports[target] = logical_reports[0];
+                        logical_motion[target] = logical_motion[0];
+                        has_motion[target] = has_motion[0];
+                        present[target] = true;
+                        controller_for_slot[target] = controller_for_slot[0];
+                        active_count++;
+                    }
                 }
-                out_reports[0]->reset();
-                apply_keyboard_to_report_mac(*out_reports[0], self->keyBindings, false);
+                logical_reports[0].reset();
+                logical_motion[0].reset();
+                apply_keyboard_to_report_mac(logical_reports[0], self->keyBindings, false);
+                present[0] = true;
+                has_motion[0] = false;
+                controller_for_slot[0] = -1;
                 active_count = std::max(active_count, 1);
             } else if (km == KB_OVERRIDE) {
-                apply_keyboard_to_report_mac(*out_reports[0], self->keyBindings, true);
+                apply_keyboard_to_report_mac(logical_reports[0], self->keyBindings, true);
+                present[0] = true;
                 active_count = std::max(active_count, 1);
             }
 
-            {
+            if (g_legacyUdp) {
+                ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet));
+                pkt.magic         = ns::PROTO_MAGIC;
+                pkt.version       = ns::PROTO_VERSION;
+                pkt.flags         = first_packet ? ns::FLAG_RESET : ns::FLAG_NONE;
+                first_packet      = false;
+                pkt.seq           = seqCounter++;
+                pkt.ts_us         = ns::now_us();
+                pkt.report.reset();
+
+                ns::HIDReport* pads[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
+                for (int i = 0; i < 4; ++i) *pads[i] = logical_reports[i];
+
                 uint8_t full_hmac[32];
                 hmac_sha256(self->hmacKey, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
                 memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+                sendto(self->sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
+            } else {
+                ExtendedUdpPacket pkt; memset(&pkt, 0, sizeof(pkt));
+                pkt.magic        = ns::PROTO_MAGIC;
+                pkt.version      = ns::PROTO_VERSION;
+                pkt.flags        = first_packet ? ns::FLAG_RESET : ns::FLAG_NONE;
+                first_packet     = false;
+                pkt.seq          = seqCounter++;
+                pkt.timestamp_us = ns::now_us();
+                pkt.report.reset();
+
+                ns::ExtendedHIDReport* pads[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
+                for (int i = 0; i < 4; ++i)
+                    fill_extended_pad(*pads[i], logical_reports[i], present[i], has_motion[i] ? &logical_motion[i] : nullptr);
+
+                uint8_t full_hmac[32];
+                hmac_sha256(self->hmacKey, 32, (const uint8_t*)&pkt, EXT_UDP_PACKET_AUTH_SIZE, full_hmac);
+                memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+                sendto(self->sock, &pkt, sizeof(pkt), 0, (struct sockaddr*)&dest, sizeof(dest));
+
+                pump_udp_rumble(self->sock, rumble, controller_for_slot);
+                rumble.update_timeouts(controller_for_slot);
             }
 
-            sendto(self->sock, &pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
             self->packetCount++;
 
-            // FIX 3: Sleep instead of busy-waiting so we don't burn a full CPU core.
             auto interval = (active_count > 0)
-        ? std::chrono::milliseconds(4)
-            : std::chrono::milliseconds(50); // keep connection alive below watchdog timeout
+                ? std::chrono::milliseconds(4)
+                : std::chrono::milliseconds(50); // keep connection alive below watchdog timeout
             std::this_thread::sleep_for(interval);
         }
+
+        rumble.stop_all();
         close(self->sock);
+        self->sock = -1;
     });
 
     [connectBtn setTitle:@"Disconnect"];
@@ -915,7 +1263,10 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
 - (void)disconnect {
     connected = false;
     senderRunning = false;
-    if (senderThread.joinable()) senderThread.detach();
+    if (senderThread.joinable()) senderThread.join();
+
+    for (int i = 0; i < 4; ++i)
+        stop_haptics_for_controller_on_main(i, false);
 
     [connectBtn setTitle:@"Connect"];
     [ipField setEnabled:YES];

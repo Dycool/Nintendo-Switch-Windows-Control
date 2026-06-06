@@ -26,6 +26,8 @@
 #include <cctype>
 #include <cmath>
 #include <mutex>
+#include <cerrno>
+
 
 #include <SDL2/SDL.h>
 
@@ -34,12 +36,32 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/resource.h>
 
 #include "../../server/rpi/include/sha256.h"
 
-// Import external protocol structures (Version 4 with MultiReport)
+// Import external protocol structures (Version 4 with MultiReport + ExtendedMultiReport)
 #include "../../server/rpi/include/protocol.hpp"
+
+static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
+
+#pragma pack(push, 1)
+struct ExtendedUdpPacket {
+    uint32_t magic;
+    uint8_t  version;
+    uint8_t  flags;
+    uint16_t reserved;
+    uint32_t seq;
+    uint64_t timestamp_us;
+    ns::ExtendedMultiReport report;
+    uint8_t  hmac[ns::HMAC_TAG_SIZE];
+};
+#pragma pack(pop)
+
+static constexpr size_t EXT_UDP_PACKET_AUTH_SIZE = 20 + sizeof(ns::ExtendedMultiReport);
+static constexpr size_t EXT_UDP_PACKET_SIZE      = EXT_UDP_PACKET_AUTH_SIZE + ns::HMAC_TAG_SIZE;
+static_assert(sizeof(ExtendedUdpPacket) == EXT_UDP_PACKET_SIZE, "ExtendedUdpPacket wire size mismatch");
 
 // ── Config path helpers ──
 static std::string get_config_dir() {
@@ -84,6 +106,9 @@ static uint8_t g_hmacKey[32]{};
 static SDL_GameController* g_pads[4] = {nullptr, nullptr, nullptr, nullptr};
 static char         g_hw_names[4][128]; // Stored safely for the GTK thread to read
 static std::mutex   g_hw_mtx;           // Protects hardware string arrays
+static bool         g_pad_accel_enabled[4] = {false, false, false, false};
+static bool         g_pad_gyro_enabled[4]  = {false, false, false, false};
+static bool         g_legacy_udp = false; // hidden fallback: NSPC_LEGACY_UDP=1
 
 // ── Axis conversion ──
 static uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8000) {
@@ -95,7 +120,56 @@ static uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8
     return (uint8_t)(invert ? (255 - scaled) : scaled);
 }
 
-// ── SDL2 Discovery & Input ──
+static int16_t clamp_i16_from_float(float v) {
+    if (v < -32768.0f) return -32768;
+    if (v >  32767.0f) return  32767;
+    return (int16_t)std::lrintf(v);
+}
+
+static void set_pad_present_flag(ns::ExtendedHIDReport& r, bool present) {
+    // ExtendedHIDReport starts with HIDReport. Byte +7 is the pad-present
+    // flag used by the backend/web protocol, so neutral connected pads still
+    // claim a Switch port and can receive rumble.
+    uint8_t* raw = reinterpret_cast<uint8_t*>(&r);
+    if (present) raw[7] |= EXT_PAD_PRESENT;
+    else         raw[7] &= (uint8_t)~EXT_PAD_PRESENT;
+}
+
+static void fill_extended_pad(ns::ExtendedHIDReport& dst,
+                              const ns::HIDReport& input,
+                              bool present,
+                              const ns::MotionReport* motion) {
+    dst.reset();
+    dst.input = input;
+    set_pad_present_flag(dst, present);
+    if (present && motion) {
+        dst.motion = *motion;
+        dst.has_motion = true;
+    } else {
+        dst.has_motion = false;
+    }
+}
+
+// ── SDL2 Discovery, Input, Sensors, Rumble ──
+
+static void enable_pad_sensors(int slot, SDL_GameController* pad) {
+    g_pad_accel_enabled[slot] = false;
+    g_pad_gyro_enabled[slot] = false;
+
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    if (SDL_GameControllerHasSensor(pad, SDL_SENSOR_ACCEL)) {
+        if (SDL_GameControllerSetSensorEnabled(pad, SDL_SENSOR_ACCEL, SDL_TRUE) == 0)
+            g_pad_accel_enabled[slot] = true;
+    }
+    if (SDL_GameControllerHasSensor(pad, SDL_SENSOR_GYRO)) {
+        if (SDL_GameControllerSetSensorEnabled(pad, SDL_SENSOR_GYRO, SDL_TRUE) == 0)
+            g_pad_gyro_enabled[slot] = true;
+    }
+#else
+    (void)slot;
+    (void)pad;
+#endif
+}
 
 static void scan_for_gamepads() {
     static uint64_t last_scan = 0;
@@ -134,6 +208,8 @@ static void scan_for_gamepads() {
                     g_pads[p] = pad;
                     const char* name = SDL_GameControllerName(pad);
                     strncpy(g_hw_names[p], name ? name : "Unknown", sizeof(g_hw_names[p]) - 1);
+                    g_hw_names[p][sizeof(g_hw_names[p]) - 1] = '\0';
+                    enable_pad_sensors(p, pad);
                 }
                 break;
             }
@@ -152,6 +228,8 @@ static void read_pad(int index, ns::HIDReport& rep, bool& conn) {
         SDL_GameControllerClose(pad);
         g_pads[index] = nullptr;
         g_hw_names[index][0] = '\0';
+        g_pad_accel_enabled[index] = false;
+        g_pad_gyro_enabled[index] = false;
         conn = false;
         return;
     }
@@ -207,12 +285,149 @@ static void read_pad(int index, ns::HIDReport& rep, bool& conn) {
     rep.ry = apply_deadzone(ry, false);
 }
 
+static bool read_pad_motion(int index, ns::MotionReport& motion) {
+    motion.reset();
+    SDL_GameController* pad = g_pads[index];
+    if (!pad) return false;
+
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    bool any = false;
+
+    if (g_pad_accel_enabled[index]) {
+        float accel[3] = {0, 0, 0};
+        if (SDL_GameControllerGetSensorData(pad, SDL_SENSOR_ACCEL, accel, 3) == 0) {
+            constexpr float ACCEL_SCALE = 4096.0f / 9.80665f;
+            motion.ax = clamp_i16_from_float(accel[0] * ACCEL_SCALE);
+            motion.ay = clamp_i16_from_float(accel[1] * ACCEL_SCALE);
+            motion.az = clamp_i16_from_float(accel[2] * ACCEL_SCALE);
+            any = true;
+        }
+    }
+
+    if (g_pad_gyro_enabled[index]) {
+        float gyro[3] = {0, 0, 0};
+        if (SDL_GameControllerGetSensorData(pad, SDL_SENSOR_GYRO, gyro, 3) == 0) {
+            // SDL gyro is rad/s. Keep the scale conservative, matching the other clients.
+            motion.gx = clamp_i16_from_float(gyro[0] * 1000.0f);
+            motion.gy = clamp_i16_from_float(gyro[1] * 1000.0f);
+            motion.gz = clamp_i16_from_float(gyro[2] * 1000.0f);
+            any = true;
+        }
+    }
+
+    return any;
+#else
+    (void)index;
+    return false;
+#endif
+}
+
+static void set_pad_rumble(int index, uint8_t low, uint8_t high, uint32_t duration_ms) {
+    if (index < 0 || index >= 4) return;
+    SDL_GameController* pad = g_pads[index];
+    if (!pad) return;
+
+#if SDL_VERSION_ATLEAST(2, 0, 9)
+    if (!SDL_GameControllerGetAttached(pad)) return;
+    if (!SDL_GameControllerHasRumble(pad)) return;
+
+    uint16_t low16  = (uint16_t)low  * 257u;
+    uint16_t high16 = (uint16_t)high * 257u;
+    if (SDL_GameControllerRumble(pad, low16, high16, duration_ms) != 0 && (low || high)) {
+        static bool warned = false;
+        if (!warned) {
+            std::cerr << "SDL rumble failed: " << SDL_GetError() << "\n";
+            warned = true;
+        }
+    }
+#else
+    (void)low;
+    (void)high;
+    (void)duration_ms;
+#endif
+}
+
+class RumbleManager {
+public:
+    void apply_packet(const ns::RumblePacket& rp, const int controller_for_slot[4]) {
+        if (rp.subpad >= 4) return;
+        const int slot = rp.subpad;
+        const uint8_t low = rp.low_freq;
+        const uint8_t high = rp.high_freq;
+        const bool neutral = (low == 0 && high == 0) || rp.duration_10ms == 0;
+        const uint64_t now = ns::now_us();
+        const uint64_t dur_us = neutral ? 0ULL : std::max<uint64_t>(250000ULL, (uint64_t)rp.duration_10ms * 10000ULL);
+
+        if (!neutral && states[slot].low == low && states[slot].high == high &&
+            now - states[slot].last_set_us < 100000ULL) {
+            states[slot].until_us = now + dur_us;
+            return;
+        }
+
+        states[slot].low = low;
+        states[slot].high = high;
+        states[slot].until_us = neutral ? 0ULL : now + dur_us;
+        states[slot].last_set_us = now;
+        set_output(slot, neutral ? 0 : low, neutral ? 0 : high, controller_for_slot[slot]);
+    }
+
+    void update_timeouts(const int controller_for_slot[4]) {
+        const uint64_t now = ns::now_us();
+        for (int i = 0; i < 4; ++i) {
+            if (states[i].until_us != 0 && now > states[i].until_us) {
+                states[i].until_us = 0;
+                states[i].low = states[i].high = 0;
+                set_output(i, 0, 0, controller_for_slot[i]);
+            }
+        }
+    }
+
+private:
+    struct SlotState {
+        uint8_t low = 0, high = 0;
+        uint64_t until_us = 0;
+        uint64_t last_set_us = 0;
+        int last_controller = -1;
+    } states[4];
+
+    void set_output(int slot, uint8_t low, uint8_t high, int pad_idx) {
+        if (states[slot].last_controller != -1 && states[slot].last_controller != pad_idx)
+            set_pad_rumble(states[slot].last_controller, 0, 0, 0);
+        if (pad_idx >= 0)
+            set_pad_rumble(pad_idx, low, high, (low || high) ? 250 : 0);
+        states[slot].last_controller = pad_idx;
+    }
+};
+
+static void pump_udp_rumble(int sock, RumbleManager& rumble, const int controller_for_slot[4]) {
+    uint8_t buf[64];
+    for (;;) {
+        sockaddr_in from{};
+        socklen_t from_len = sizeof(from);
+        ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                std::cerr << "UDP receive error: " << strerror(errno) << "\n";
+            break;
+        }
+        if (n == (ssize_t)sizeof(ns::RumblePacket)) {
+            ns::RumblePacket rp{};
+            memcpy(&rp, buf, sizeof(rp));
+            if (rp.magic == ns::RUMBLE_MAGIC)
+                rumble.apply_packet(rp, controller_for_slot);
+        }
+    }
+}
+
 // ── Network Sender Thread ──
 static void SenderThread(std::string host, uint16_t port) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) return;
 
-    struct addrinfo hints{}, *res;
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags >= 0) fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
     char port_str[8]; snprintf(port_str, sizeof(port_str), "%u", port);
@@ -227,45 +442,91 @@ static void SenderThread(std::string host, uint16_t port) {
 
     uint32_t seq = 0;
     auto next_tick = std::chrono::steady_clock::now();
+    RumbleManager rumble;
 
     while (g_senderRunning.load()) {
         while (std::chrono::steady_clock::now() < next_tick)
-            std::atomic_thread_fence(std::memory_order_relaxed);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
 
         scan_for_gamepads();
 
-        ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet)); 
-        pkt.magic         = ns::PROTO_MAGIC;
-        pkt.version       = ns::PROTO_VERSION;
-        pkt.flags         = ns::FLAG_NONE;
-        pkt.seq           = seq++;
-        pkt.ts_us         = ns::now_us();
-        pkt.report.reset(); 
+        ns::HIDReport reports[4];
+        ns::MotionReport motions[4];
+        bool present[4] = {false, false, false, false};
+        bool has_motion[4] = {false, false, false, false};
+        int controller_for_slot[4] = {-1, -1, -1, -1};
+        for (int i = 0; i < 4; ++i) {
+            reports[i].reset();
+            motions[i].reset();
+        }
 
-        ns::HIDReport* out_reports[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
         int active_count = 0;
-
         for (int i = 0; i < 4; ++i) {
             bool is_conn = false;
-            read_pad(i, *out_reports[i], is_conn);
+            read_pad(i, reports[i], is_conn);
             if (is_conn) {
+                present[i] = true;
+                controller_for_slot[i] = i;
+                has_motion[i] = read_pad_motion(i, motions[i]);
                 active_count++;
             }
         }
 
-        {
+        if (g_legacy_udp) {
+            ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet));
+            pkt.magic         = ns::PROTO_MAGIC;
+            pkt.version       = ns::PROTO_VERSION;
+            pkt.flags         = ns::FLAG_NONE;
+            pkt.seq           = seq++;
+            pkt.ts_us         = ns::now_us();
+            pkt.report.reset();
+
+            ns::HIDReport* out_reports[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
+            for (int i = 0; i < 4; ++i)
+                *out_reports[i] = reports[i];
+
             uint8_t full_hmac[32];
             hmac_sha256(g_hmacKey, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
             memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+
+            sendto(sock, (const char*)&pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
+        } else {
+            ExtendedUdpPacket pkt; memset(&pkt, 0, sizeof(pkt));
+            pkt.magic        = ns::PROTO_MAGIC;
+            pkt.version      = ns::PROTO_VERSION;
+            pkt.flags        = ns::FLAG_NONE;
+            pkt.seq          = seq++;
+            pkt.timestamp_us = ns::now_us();
+            pkt.report.reset();
+
+            ns::ExtendedHIDReport* out_reports[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
+            for (int i = 0; i < 4; ++i)
+                fill_extended_pad(*out_reports[i], reports[i], present[i], has_motion[i] ? &motions[i] : nullptr);
+
+            uint8_t full_hmac[32];
+            hmac_sha256(g_hmacKey, 32, (const uint8_t*)&pkt, EXT_UDP_PACKET_AUTH_SIZE, full_hmac);
+            memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+
+            sendto(sock, (const char*)&pkt, (int)sizeof(pkt), 0, (struct sockaddr*)&dest, sizeof(dest));
+
+            pump_udp_rumble(sock, rumble, controller_for_slot);
+            rumble.update_timeouts(controller_for_slot);
         }
 
-        sendto(sock, (const char*)&pkt, ns::PACKET_SIZE, 0, (struct sockaddr*)&dest, sizeof(dest));
         if (active_count > 0) next_tick += std::chrono::milliseconds(4);
-        else next_tick += std::chrono::milliseconds(500);
+        else next_tick += std::chrono::milliseconds(50);
     }
 
+
     for (int i = 0; i < 4; ++i) {
-        if (g_pads[i]) { SDL_GameControllerClose(g_pads[i]); g_pads[i] = nullptr; g_hw_names[i][0] = '\0'; }
+        if (g_pads[i]) {
+            set_pad_rumble(i, 0, 0, 0);
+            SDL_GameControllerClose(g_pads[i]);
+            g_pads[i] = nullptr;
+            g_hw_names[i][0] = '\0';
+            g_pad_accel_enabled[i] = false;
+            g_pad_gyro_enabled[i] = false;
+        }
     }
     close(sock);
 }
@@ -301,7 +562,16 @@ extern "C" void on_connect_clicked(GtkWidget*, gpointer) {
     derive_key(ns::DEFAULT_SECRET, g_hmacKey);
     g_connected = true;
 
-    for (int i=0; i<4; ++i) { g_hw_names[i][0] = '\0'; g_pads[i] = nullptr; }
+    for (int i=0; i<4; ++i) {
+        if (g_pads[i]) {
+            set_pad_rumble(i, 0, 0, 0);
+            SDL_GameControllerClose(g_pads[i]);
+        }
+        g_hw_names[i][0] = '\0';
+        g_pads[i] = nullptr;
+        g_pad_accel_enabled[i] = false;
+        g_pad_gyro_enabled[i] = false;
+    }
 
     g_senderRunning = true;
     g_senderThread = std::thread(SenderThread, std::string(ipBuf), (uint16_t)port);
@@ -348,6 +618,18 @@ static std::string get_exe_dir() {
 
 extern "C" void on_window_destroy(GtkWidget*, gpointer) {
     if (g_connected) { g_senderRunning = false; if (g_senderThread.joinable()) g_senderThread.join(); }
+    else {
+        for (int i = 0; i < 4; ++i) {
+            if (g_pads[i]) {
+                set_pad_rumble(i, 0, 0, 0);
+                SDL_GameControllerClose(g_pads[i]);
+                g_pads[i] = nullptr;
+                g_hw_names[i][0] = '\0';
+                g_pad_accel_enabled[i] = false;
+                g_pad_gyro_enabled[i] = false;
+            }
+        }
+    }
     gtk_main_quit();
 }
 
@@ -356,9 +638,19 @@ int main(int argc, char* argv[]) {
     // Elevate priority
     setpriority(PRIO_PROCESS, 0, -20);
 
-    // Initialise SDL2 GameController subsystem
+    const char* legacy_env = getenv("NSPC_LEGACY_UDP");
+    g_legacy_udp = legacy_env && legacy_env[0] && strcmp(legacy_env, "0") != 0;
+
+    // Initialise SDL2 GameController subsystem, plus sensors/haptics when available.
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    if (SDL_Init(SDL_INIT_GAMECONTROLLER) < 0) {
+    Uint32 sdl_flags = SDL_INIT_GAMECONTROLLER;
+#ifdef SDL_INIT_SENSOR
+    sdl_flags |= SDL_INIT_SENSOR;
+#endif
+#ifdef SDL_INIT_HAPTIC
+    sdl_flags |= SDL_INIT_HAPTIC;
+#endif
+    if (SDL_Init(sdl_flags) < 0) {
         std::cerr << "Failed to initialise SDL2: " << SDL_GetError() << "\n";
         return 1;
     }

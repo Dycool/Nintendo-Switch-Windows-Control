@@ -21,10 +21,543 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdio>
+#include <cstring>
+#include <array>
+#include <mutex>
+#include <atomic>
+#include <cmath>
+#include <memory>
+#include <hidsdi.h>
+#include <setupapi.h>
 #include "../../server/rpi/include/sha256.h"
 
 // Import external protocol structures
 #include "../../server/rpi/include/protocol.hpp"
+
+
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "xinput.lib")
+#pragma comment(lib, "hid.lib")
+#pragma comment(lib, "setupapi.lib")
+
+static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
+
+#pragma pack(push, 1)
+struct ExtendedUdpPacket {
+    uint32_t magic;
+    uint8_t  version;
+    uint8_t  flags;
+    uint16_t reserved;
+    uint32_t seq;
+    uint64_t timestamp_us;
+    ns::ExtendedMultiReport report;
+    uint8_t  hmac[ns::HMAC_TAG_SIZE];
+};
+#pragma pack(pop)
+
+static constexpr size_t EXT_UDP_PACKET_AUTH_SIZE = 20 + sizeof(ns::ExtendedMultiReport);
+static constexpr size_t EXT_UDP_PACKET_SIZE      = EXT_UDP_PACKET_AUTH_SIZE + ns::HMAC_TAG_SIZE;
+static_assert(sizeof(ExtendedUdpPacket) == EXT_UDP_PACKET_SIZE, "ExtendedUdpPacket wire size mismatch");
+
+static int16_t read_le16(const uint8_t* p) {
+    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+
+static void set_pad_present_flag(ns::ExtendedHIDReport& r, bool present) {
+    // ExtendedHIDReport wire layout starts with the 7-byte HIDReport.
+    // Byte +7 is the pad-present flag used by the backend/web protocol.
+    uint8_t* raw = reinterpret_cast<uint8_t*>(&r);
+    if (present) raw[7] |= EXT_PAD_PRESENT;
+    else         raw[7] &= (uint8_t)~EXT_PAD_PRESENT;
+}
+
+static void fill_extended_pad(ns::ExtendedHIDReport& dst,
+                              const ns::HIDReport& input,
+                              bool present,
+                              const ns::MotionReport* motion) {
+    dst.reset();
+    dst.input = input;
+    set_pad_present_flag(dst, present);
+    if (present && motion) {
+        dst.motion = *motion;
+        dst.has_motion = true;
+    } else {
+        dst.has_motion = false;
+    }
+}
+
+static uint8_t raw12_to_axis8(uint16_t raw) {
+    int delta = (int)raw - 0x800;
+    int v = 128;
+    if (delta > 0) v = 128 + (delta * 127) / 0x600;
+    else if (delta < 0) v = 128 + (delta * 128) / 0x600;
+    return (uint8_t)std::clamp(v, 0, 255);
+}
+
+static uint8_t invert_axis8_centered(uint8_t v) {
+    return v == 128 ? 128 : (uint8_t)(255 - v);
+}
+
+static void sony_dpad_to_hat(uint8_t dpad, ns::HIDReport& r) {
+    switch (dpad & 0x0F) {
+        case 0: r.hat = ns::HAT_N;  break;
+        case 1: r.hat = ns::HAT_NE; break;
+        case 2: r.hat = ns::HAT_E;  break;
+        case 3: r.hat = ns::HAT_SE; break;
+        case 4: r.hat = ns::HAT_S;  break;
+        case 5: r.hat = ns::HAT_SW; break;
+        case 6: r.hat = ns::HAT_W;  break;
+        case 7: r.hat = ns::HAT_NW; break;
+        default: r.hat = ns::HAT_NEUTRAL; break;
+    }
+}
+
+struct RawPadState {
+    bool connected = false;
+    ns::HIDReport input{};
+    ns::MotionReport motion{};
+    bool has_motion = false;
+    uint16_t vid = 0;
+    uint16_t pid = 0;
+    std::string name;
+};
+
+struct RawHidDeviceInfo {
+    std::string path;
+    uint16_t vid = 0;
+    uint16_t pid = 0;
+    USHORT input_len = 64;
+    USHORT output_len = 64;
+};
+
+class RawHidManager {
+public:
+    void start() {
+        running.store(true);
+        auto infos = enumerate_supported_devices();
+        int slot = 0;
+        for (const auto& info : infos) {
+            if (slot >= 4) break;
+            auto dev = std::make_unique<Device>();
+            dev->slot = slot;
+            dev->info = info;
+            dev->handle = CreateFileA(info.path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (dev->handle == INVALID_HANDLE_VALUE) {
+                dev->handle = CreateFileA(info.path.c_str(), GENERIC_READ,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            }
+            if (dev->handle == INVALID_HANDLE_VALUE) continue;
+
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                states[slot].connected = true;
+                states[slot].vid = info.vid;
+                states[slot].pid = info.pid;
+                states[slot].name = device_name(info.vid, info.pid);
+            }
+
+            std::cout << "Raw HID controller P" << (slot + 1) << ": "
+                      << device_name(info.vid, info.pid)
+                      << " (VID 0x" << std::hex << info.vid
+                      << " PID 0x" << info.pid << std::dec << ")\n";
+
+            dev->thread = std::thread([this, d = dev.get()] { read_loop(d); });
+            devices.push_back(std::move(dev));
+            slot++;
+        }
+        if (slot == 0)
+            std::cout << "No raw HID gyro controllers detected. XInput still works.\n";
+    }
+
+    std::array<RawPadState, 4> snapshot() {
+        std::lock_guard<std::mutex> lk(mtx);
+        return states;
+    }
+
+    int count_connected() {
+        std::lock_guard<std::mutex> lk(mtx);
+        int n = 0;
+        for (auto& s : states) if (s.connected) n++;
+        return n;
+    }
+
+    void set_rumble(int raw_slot, uint8_t low, uint8_t high) {
+        if (raw_slot < 0 || raw_slot >= (int)devices.size()) return;
+        Device* d = devices[raw_slot].get();
+        if (!d || d->handle == INVALID_HANDLE_VALUE) return;
+
+        if (is_ds4(d->info.vid, d->info.pid)) {
+            // DualShock 4 USB output report 0x05. Bluetooth rumble needs CRC and is
+            // intentionally not attempted here; USB is reliable and app-independent.
+            uint8_t out[32] = {};
+            out[0] = 0x05;
+            out[1] = 0xFF;
+            out[4] = high; // small/high-frequency motor
+            out[5] = low;  // large/low-frequency motor
+            DWORD written = 0;
+            WriteFile(d->handle, out, sizeof(out), &written, nullptr);
+            HidD_SetOutputReport(d->handle, out, sizeof(out));
+        } else if (is_dualsense(d->info.vid, d->info.pid)) {
+            // Best-effort DualSense USB rumble. Different firmware/BT modes may need
+            // fuller output reports, but this works for many wired devices.
+            uint8_t out[48] = {};
+            out[0] = 0x02;
+            out[1] = 0xFF;
+            out[2] = 0x04;
+            out[3] = high;
+            out[4] = low;
+            DWORD written = 0;
+            WriteFile(d->handle, out, sizeof(out), &written, nullptr);
+            HidD_SetOutputReport(d->handle, out, sizeof(out));
+        }
+    }
+
+private:
+    struct Device {
+        HANDLE handle = INVALID_HANDLE_VALUE;
+        RawHidDeviceInfo info{};
+        int slot = -1;
+        std::thread thread;
+        ~Device() {
+            if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+            if (thread.joinable()) thread.detach();
+        }
+    };
+
+    std::atomic<bool> running{false};
+    std::mutex mtx;
+    std::array<RawPadState, 4> states{};
+    std::vector<std::unique_ptr<Device>> devices;
+
+    static bool is_ds4(uint16_t vid, uint16_t pid) {
+        return vid == 0x054C && (pid == 0x05C4 || pid == 0x09CC);
+    }
+    static bool is_dualsense(uint16_t vid, uint16_t pid) {
+        return vid == 0x054C && (pid == 0x0CE6 || pid == 0x0DF2);
+    }
+    static bool is_switch_pro(uint16_t vid, uint16_t pid) {
+        return vid == 0x057E && pid == 0x2009;
+    }
+    static bool is_supported(uint16_t vid, uint16_t pid) {
+        return is_ds4(vid, pid) || is_dualsense(vid, pid) || is_switch_pro(vid, pid);
+    }
+    static std::string device_name(uint16_t vid, uint16_t pid) {
+        if (is_ds4(vid, pid)) return "DualShock 4 / DS4-compatible";
+        if (is_dualsense(vid, pid)) return "DualSense";
+        if (is_switch_pro(vid, pid)) return "Nintendo Switch Pro Controller";
+        return "Raw HID controller";
+    }
+
+    static std::vector<RawHidDeviceInfo> enumerate_supported_devices() {
+        std::vector<RawHidDeviceInfo> out;
+        GUID hid_guid;
+        HidD_GetHidGuid(&hid_guid);
+        HDEVINFO devs = SetupDiGetClassDevsA(&hid_guid, nullptr, nullptr,
+                                             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (devs == INVALID_HANDLE_VALUE) return out;
+
+        for (DWORD i = 0; ; ++i) {
+            SP_DEVICE_INTERFACE_DATA ifdata{};
+            ifdata.cbSize = sizeof(ifdata);
+            if (!SetupDiEnumDeviceInterfaces(devs, nullptr, &hid_guid, i, &ifdata)) break;
+
+            DWORD needed = 0;
+            SetupDiGetDeviceInterfaceDetailA(devs, &ifdata, nullptr, 0, &needed, nullptr);
+            if (!needed) continue;
+            std::vector<uint8_t> detail_buf(needed);
+            auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_A*>(detail_buf.data());
+            detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+            if (!SetupDiGetDeviceInterfaceDetailA(devs, &ifdata, detail, needed, nullptr, nullptr)) continue;
+
+            HANDLE h = CreateFileA(detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                h = CreateFileA(detail->DevicePath, GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            }
+            if (h == INVALID_HANDLE_VALUE) continue;
+
+            HIDD_ATTRIBUTES attr{};
+            attr.Size = sizeof(attr);
+            if (!HidD_GetAttributes(h, &attr) || !is_supported(attr.VendorID, attr.ProductID)) {
+                CloseHandle(h);
+                continue;
+            }
+
+            RawHidDeviceInfo info;
+            info.path = detail->DevicePath;
+            info.vid = attr.VendorID;
+            info.pid = attr.ProductID;
+
+            PHIDP_PREPARSED_DATA pp = nullptr;
+            if (HidD_GetPreparsedData(h, &pp)) {
+                HIDP_CAPS caps{};
+                if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS) {
+                    info.input_len = caps.InputReportByteLength ? caps.InputReportByteLength : 64;
+                    info.output_len = caps.OutputReportByteLength ? caps.OutputReportByteLength : 64;
+                }
+                HidD_FreePreparsedData(pp);
+            }
+            CloseHandle(h);
+            out.push_back(info);
+        }
+        SetupDiDestroyDeviceInfoList(devs);
+        return out;
+    }
+
+    static bool parse_ds4(const uint8_t* b, DWORD len, ns::HIDReport& r, ns::MotionReport& m, bool& has_motion) {
+        r.reset(); m.reset(); has_motion = false;
+        int o = -1, motion_o = -1;
+        if (len >= 25 && b[0] == 0x01) { o = 0; motion_o = 13; }       // USB
+        else if (len >= 78 && b[0] == 0x11) { o = 2; motion_o = 15; }  // BT-ish best effort
+        else return false;
+
+        r.lx = b[o + 1]; r.ly = b[o + 2]; r.rx = b[o + 3]; r.ry = b[o + 4];
+        uint8_t btn0 = b[o + 5], btn1 = b[o + 6], btn2 = b[o + 7];
+        sony_dpad_to_hat(btn0, r);
+        if (btn0 & 0x10) r.buttons |= ns::BTN_Y; // Square
+        if (btn0 & 0x20) r.buttons |= ns::BTN_B; // Cross
+        if (btn0 & 0x40) r.buttons |= ns::BTN_A; // Circle
+        if (btn0 & 0x80) r.buttons |= ns::BTN_X; // Triangle
+        if (btn1 & 0x01) r.buttons |= ns::BTN_L;
+        if (btn1 & 0x02) r.buttons |= ns::BTN_R;
+        if ((btn1 & 0x04) || b[o + 8] > 128) r.buttons |= ns::BTN_ZL;
+        if ((btn1 & 0x08) || b[o + 9] > 128) r.buttons |= ns::BTN_ZR;
+        if (btn1 & 0x10) r.buttons |= ns::BTN_MINUS;
+        if (btn1 & 0x20) r.buttons |= ns::BTN_PLUS;
+        if (btn1 & 0x40) r.buttons |= ns::BTN_LSTICK;
+        if (btn1 & 0x80) r.buttons |= ns::BTN_RSTICK;
+        if (btn2 & 0x01) r.buttons |= ns::BTN_HOME;
+        if (btn2 & 0x02) r.buttons |= ns::BTN_CAPTURE; // touchpad click
+
+        if ((int)len >= motion_o + 12) {
+            m.gx = read_le16(b + motion_o + 0);
+            m.gy = read_le16(b + motion_o + 2);
+            m.gz = read_le16(b + motion_o + 4);
+            m.ax = read_le16(b + motion_o + 6);
+            m.ay = read_le16(b + motion_o + 8);
+            m.az = read_le16(b + motion_o + 10);
+            has_motion = true;
+        }
+        return true;
+    }
+
+    static bool parse_dualsense(const uint8_t* b, DWORD len, ns::HIDReport& r, ns::MotionReport& m, bool& has_motion) {
+        r.reset(); m.reset(); has_motion = false;
+        int o = -1, motion_o = -1;
+        if (len >= 40 && b[0] == 0x01) { o = 0; motion_o = 16; }       // USB
+        else if (len >= 78 && b[0] == 0x31) { o = 1; motion_o = 17; }  // BT-ish best effort
+        else return false;
+
+        r.lx = b[o + 1]; r.ly = b[o + 2]; r.rx = b[o + 3]; r.ry = b[o + 4];
+        uint8_t l2 = b[o + 5], r2 = b[o + 6];
+        uint8_t btn0 = b[o + 8], btn1 = b[o + 9], btn2 = b[o + 10];
+        sony_dpad_to_hat(btn0, r);
+        if (btn0 & 0x10) r.buttons |= ns::BTN_Y; // Square
+        if (btn0 & 0x20) r.buttons |= ns::BTN_B; // Cross
+        if (btn0 & 0x40) r.buttons |= ns::BTN_A; // Circle
+        if (btn0 & 0x80) r.buttons |= ns::BTN_X; // Triangle
+        if (btn1 & 0x01) r.buttons |= ns::BTN_L;
+        if (btn1 & 0x02) r.buttons |= ns::BTN_R;
+        if ((btn1 & 0x04) || l2 > 128) r.buttons |= ns::BTN_ZL;
+        if ((btn1 & 0x08) || r2 > 128) r.buttons |= ns::BTN_ZR;
+        if (btn1 & 0x10) r.buttons |= ns::BTN_MINUS;
+        if (btn1 & 0x20) r.buttons |= ns::BTN_PLUS;
+        if (btn1 & 0x40) r.buttons |= ns::BTN_LSTICK;
+        if (btn1 & 0x80) r.buttons |= ns::BTN_RSTICK;
+        if (btn2 & 0x01) r.buttons |= ns::BTN_HOME;
+        if (btn2 & 0x02) r.buttons |= ns::BTN_CAPTURE;
+
+        if ((int)len >= motion_o + 12) {
+            m.gx = read_le16(b + motion_o + 0);
+            m.gy = read_le16(b + motion_o + 2);
+            m.gz = read_le16(b + motion_o + 4);
+            m.ax = read_le16(b + motion_o + 6);
+            m.ay = read_le16(b + motion_o + 8);
+            m.az = read_le16(b + motion_o + 10);
+            has_motion = true;
+        }
+        return true;
+    }
+
+    static bool parse_switch_pro(const uint8_t* b, DWORD len, ns::HIDReport& r, ns::MotionReport& m, bool& has_motion) {
+        r.reset(); m.reset(); has_motion = false;
+        if (len < 25 || b[0] != 0x30) return false;
+
+        uint8_t br = b[3], bm = b[4], bl = b[5];
+        if (br & 0x01) r.buttons |= ns::BTN_Y;
+        if (br & 0x02) r.buttons |= ns::BTN_X;
+        if (br & 0x04) r.buttons |= ns::BTN_B;
+        if (br & 0x08) r.buttons |= ns::BTN_A;
+        if (br & 0x40) r.buttons |= ns::BTN_R;
+        if (br & 0x80) r.buttons |= ns::BTN_ZR;
+        if (bm & 0x01) r.buttons |= ns::BTN_MINUS;
+        if (bm & 0x02) r.buttons |= ns::BTN_PLUS;
+        if (bm & 0x04) r.buttons |= ns::BTN_RSTICK;
+        if (bm & 0x08) r.buttons |= ns::BTN_LSTICK;
+        if (bm & 0x10) r.buttons |= ns::BTN_HOME;
+        if (bm & 0x20) r.buttons |= ns::BTN_CAPTURE;
+        if (bl & 0x40) r.buttons |= ns::BTN_L;
+        if (bl & 0x80) r.buttons |= ns::BTN_ZL;
+
+        bool down = bl & 0x01, up = bl & 0x02, right = bl & 0x04, left = bl & 0x08;
+        if (up && right) r.hat = ns::HAT_NE; else if (up && left) r.hat = ns::HAT_NW;
+        else if (down && right) r.hat = ns::HAT_SE; else if (down && left) r.hat = ns::HAT_SW;
+        else if (up) r.hat = ns::HAT_N; else if (down) r.hat = ns::HAT_S;
+        else if (left) r.hat = ns::HAT_W; else if (right) r.hat = ns::HAT_E;
+
+        uint16_t lx = (uint16_t)b[6] | (((uint16_t)b[7] & 0x0F) << 8);
+        uint16_t ly = (((uint16_t)b[7] >> 4) & 0x0F) | ((uint16_t)b[8] << 4);
+        uint16_t rx = (uint16_t)b[9] | (((uint16_t)b[10] & 0x0F) << 8);
+        uint16_t ry = (((uint16_t)b[10] >> 4) & 0x0F) | ((uint16_t)b[11] << 4);
+        r.lx = raw12_to_axis8(lx);
+        r.ly = invert_axis8_centered(raw12_to_axis8(ly));
+        r.rx = raw12_to_axis8(rx);
+        r.ry = invert_axis8_centered(raw12_to_axis8(ry));
+
+        m.ax = read_le16(b + 13); m.ay = read_le16(b + 15); m.az = read_le16(b + 17);
+        m.gx = read_le16(b + 19); m.gy = read_le16(b + 21); m.gz = read_le16(b + 23);
+        has_motion = true;
+        return true;
+    }
+
+    void read_loop(Device* d) {
+        std::vector<uint8_t> buf(std::max<USHORT>(d->info.input_len, 64));
+        while (running.load()) {
+            DWORD got = 0;
+            if (!ReadFile(d->handle, buf.data(), (DWORD)buf.size(), &got, nullptr) || got == 0) {
+                Sleep(5);
+                continue;
+            }
+
+            ns::HIDReport input;
+            ns::MotionReport motion;
+            bool has_motion = false;
+            bool ok = false;
+            if (is_ds4(d->info.vid, d->info.pid))
+                ok = parse_ds4(buf.data(), got, input, motion, has_motion);
+            else if (is_dualsense(d->info.vid, d->info.pid))
+                ok = parse_dualsense(buf.data(), got, input, motion, has_motion);
+            else if (is_switch_pro(d->info.vid, d->info.pid))
+                ok = parse_switch_pro(buf.data(), got, input, motion, has_motion);
+
+            if (!ok) continue;
+            std::lock_guard<std::mutex> lk(mtx);
+            states[d->slot].connected = true;
+            states[d->slot].input = input;
+            states[d->slot].motion = motion;
+            states[d->slot].has_motion = has_motion;
+        }
+    }
+};
+
+class RumbleManager {
+public:
+    void apply_packet(const ns::RumblePacket& rp,
+                      const int xinput_for_slot[4],
+                      const int raw_for_slot[4],
+                      RawHidManager& raw_hid) {
+        if (rp.subpad >= 4) return;
+        const int slot = rp.subpad;
+        uint8_t low = rp.low_freq;
+        uint8_t high = rp.high_freq;
+        bool neutral = (low == 0 && high == 0) || rp.duration_10ms == 0;
+        uint64_t now = ns::now_us();
+        uint64_t dur_us = neutral ? 0ULL : std::max<uint64_t>(250000ULL, (uint64_t)rp.duration_10ms * 10000ULL);
+
+        if (!neutral && states[slot].low == low && states[slot].high == high &&
+            now - states[slot].last_set_us < 100000ULL) {
+            states[slot].until_us = now + dur_us;
+            return;
+        }
+
+        states[slot].low = low;
+        states[slot].high = high;
+        states[slot].until_us = neutral ? 0 : now + dur_us;
+        states[slot].last_set_us = now;
+        set_output(slot, neutral ? 0 : low, neutral ? 0 : high,
+                   xinput_for_slot[slot], raw_for_slot[slot], raw_hid);
+    }
+
+    void update_timeouts(const int xinput_for_slot[4], const int raw_for_slot[4], RawHidManager& raw_hid) {
+        uint64_t now = ns::now_us();
+        for (int i = 0; i < 4; ++i) {
+            if (states[i].until_us != 0 && now > states[i].until_us) {
+                states[i].until_us = 0;
+                states[i].low = states[i].high = 0;
+                set_output(i, 0, 0, xinput_for_slot[i], raw_for_slot[i], raw_hid);
+            }
+        }
+    }
+
+private:
+    struct SlotState {
+        uint8_t low = 0, high = 0;
+        uint64_t until_us = 0;
+        uint64_t last_set_us = 0;
+        int last_xinput = -1;
+        int last_raw = -1;
+    } states[4];
+
+    static WORD motor_word(uint8_t v) {
+        return (WORD)((uint32_t)v * 65535u / 255u);
+    }
+
+    void stop_previous_if_moved(int slot, int xinput_idx, int raw_idx, RawHidManager& raw_hid) {
+        if (states[slot].last_xinput != -1 && states[slot].last_xinput != xinput_idx) {
+            XINPUT_VIBRATION z{};
+            XInputSetState((DWORD)states[slot].last_xinput, &z);
+        }
+        if (states[slot].last_raw != -1 && states[slot].last_raw != raw_idx)
+            raw_hid.set_rumble(states[slot].last_raw, 0, 0);
+    }
+
+    void set_output(int slot, uint8_t low, uint8_t high, int xinput_idx, int raw_idx, RawHidManager& raw_hid) {
+        stop_previous_if_moved(slot, xinput_idx, raw_idx, raw_hid);
+        if (xinput_idx >= 0 && xinput_idx < 4) {
+            XINPUT_VIBRATION vib{};
+            vib.wLeftMotorSpeed = motor_word(low);   // low/large motor
+            vib.wRightMotorSpeed = motor_word(high); // high/small motor
+            XInputSetState((DWORD)xinput_idx, &vib);
+        }
+        if (raw_idx >= 0)
+            raw_hid.set_rumble(raw_idx, low, high);
+        states[slot].last_xinput = xinput_idx;
+        states[slot].last_raw = raw_idx;
+    }
+};
+
+static void pump_udp_rumble(SOCKET sock,
+                            RumbleManager& rumble,
+                            const int xinput_for_slot[4],
+                            const int raw_for_slot[4],
+                            RawHidManager& raw_hid) {
+    uint8_t buf[64];
+    sockaddr_in from{};
+    int from_len = sizeof(from);
+    for (;;) {
+        int n = recvfrom(sock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+                         reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (n == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (e != WSAEWOULDBLOCK && e != WSAEINTR)
+                std::cerr << "UDP receive error: " << e << "\n";
+            break;
+        }
+        if (n == (int)sizeof(ns::RumblePacket)) {
+            ns::RumblePacket rp{};
+            memcpy(&rp, buf, sizeof(rp));
+            if (rp.magic == ns::RUMBLE_MAGIC)
+                rumble.apply_packet(rp, xinput_for_slot, raw_for_slot, raw_hid);
+        }
+    }
+}
 
 // Applies deadzone to an analog stick axis
 uint8_t apply_deadzone(SHORT val, bool invert = false, int deadzone = 8000) {
@@ -284,16 +817,24 @@ int main(int argc, char** argv) {
     timeBeginPeriod(1);
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP[:PORT]> [-k [single|override]]\n";
-        std::cerr << "  -k  Enable keyboard mode (default: single)\n";
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP[:PORT]> [-k [single|override]] [--legacy] [--no-raw]\n";
+        std::cerr << "  -k          Enable keyboard mode (default: single)\n";
+        std::cerr << "  --legacy    Send old input-only UDP packets; disables UDP rumble/gyro\n";
+        std::cerr << "  --no-raw    Disable raw HID DS4/DualSense/Switch-Pro support\n";
         timeEndPeriod(1); return 1;
     }
 
     std::string host;
     int port = ns::DEFAULT_PORT;
+    bool legacy_udp = false;
+    bool raw_hid_enabled = true;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-k") == 0) {
+        if (strcmp(argv[i], "--legacy") == 0) {
+            legacy_udp = true;
+        } else if (strcmp(argv[i], "--no-raw") == 0) {
+            raw_hid_enabled = false;
+        } else if (strcmp(argv[i], "-k") == 0) {
             keyboard_mode = 1;
             if (i + 1 < argc && argv[i+1][0] != '-') {
                 if (strcmp(argv[i+1], "override") == 0) keyboard_mode = 2;
@@ -314,7 +855,7 @@ int main(int argc, char** argv) {
     }
 
     if (host.empty()) {
-        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP[:PORT]> [-k]\n";
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP[:PORT]> [-k [single|override]] [--legacy] [--no-raw]\n";
         timeEndPeriod(1); return 1;
     }
 
@@ -326,12 +867,26 @@ int main(int argc, char** argv) {
         std::cout << (keyboard_mode == 1 ? "replaces" : "augments") << " Player 1\n";
     }
 
+    RawHidManager raw_hid;
+    if (raw_hid_enabled) {
+        raw_hid.start();
+    } else {
+        std::cout << "Raw HID support disabled; using XInput only.\n";
+    }
+    if (legacy_udp) {
+        std::cout << "Legacy UDP mode: input only. UDP rumble and gyro are disabled.\n";
+    } else {
+        std::cout << "Extended UDP mode: rumble replies + gyro/motion enabled.\n";
+    }
+
     uint8_t hmac_key[32]; derive_key(ns::DEFAULT_SECRET, hmac_key);
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     WSADATA wsa{}; WSAStartup(MAKEWORD(2, 2), &wsa); 
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+    u_long nonblocking = 1;
+    ioctlsocket(sock, FIONBIO, &nonblocking);
     
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM; 
@@ -347,65 +902,131 @@ int main(int argc, char** argv) {
 
     std::cout << "Started... Press Ctrl+C to stop\n";
     uint32_t seq = 0;
+    RumbleManager rumble;
 
     while (true) {
-        ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet)); 
-        pkt.magic   = ns::PROTO_MAGIC;
-        pkt.version = ns::PROTO_VERSION;
-        pkt.flags   = ns::FLAG_NONE;
-        pkt.seq     = seq++;
-        pkt.ts_us   = ns::now_us();
+        ns::HIDReport logical_reports[4];
+        ns::MotionReport logical_motion[4];
+        bool present[4] = {false, false, false, false};
+        bool has_motion[4] = {false, false, false, false};
+        int xinput_for_slot[4] = {-1, -1, -1, -1};
+        int raw_for_slot[4] = {-1, -1, -1, -1};
+        for (int i = 0; i < 4; ++i) {
+            logical_reports[i].reset();
+            logical_motion[i].reset();
+        }
 
-        // VERY IMPORTANT: Initialize all 4 slots to hardware-neutral (128 for sticks, 8 for hat)
-        // If left at pure 0 from memset, the Pi reads it as analog sticks pushed Top-Left!
-        pkt.report.reset();
-
-        ns::HIDReport* out_reports[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
         int active_count = 0;
-        
         static bool no_controllers_printed = false;
-        
-        // Scan all 4 XInput slots and assign to fixed physical slot
-        bool c1 = false, c2 = false, c3 = false, c4 = false;
+
+        // Raw HID first: lets DS4/DualSense/Switch Pro work without DS4Windows.
+        if (raw_hid_enabled) {
+            auto raw = raw_hid.snapshot();
+            for (int i = 0; i < 4; ++i) {
+                if (!raw[i].connected) continue;
+                logical_reports[i] = raw[i].input;
+                present[i] = true;
+                raw_for_slot[i] = i;
+                if (raw[i].has_motion) {
+                    logical_motion[i] = raw[i].motion;
+                    has_motion[i] = true;
+                }
+                active_count++;
+            }
+        }
+
+        // XInput fallback / extra controllers. If a raw controller already claimed
+        // a logical slot, put XInput into the next free slot to avoid overwriting it.
         for (DWORD i = 0; i < 4; ++i) {
             ns::HIDReport temp_rep;
             bool is_conn = false;
             fetch_pad_throttled(i, temp_rep, is_conn);
-            
-            if (is_conn) {
-                *out_reports[i] = temp_rep; // Slot matches physical controller
-                active_count++;
-                if (i == 0) c1 = true;
-                else if (i == 1) c2 = true;
-                else if (i == 2) c3 = true;
-                else if (i == 3) c4 = true;
+            if (!is_conn) continue;
+
+            int target = (int)i;
+            if (present[target]) {
+                target = -1;
+                for (int s = 0; s < 4; ++s) {
+                    if (!present[s]) { target = s; break; }
+                }
             }
+            if (target < 0) continue;
+
+            logical_reports[target] = temp_rep;
+            present[target] = true;
+            xinput_for_slot[target] = (int)i;
+            active_count++;
         }
 
-        // Keyboard overrides Player 1
+        // Keyboard overrides Player 1, preserving the previous P1 controller in
+        // another slot when possible, matching the older client behavior.
         if (kb.mode == 1) {
-            if (c1) {
-                if (!c2) { *out_reports[1] = *out_reports[0]; c2 = true; active_count++; }
-                else if (!c3) { *out_reports[2] = *out_reports[0]; c3 = true; active_count++; }
-                else if (!c4) { *out_reports[3] = *out_reports[0]; c4 = true; active_count++; }
+            if (present[0]) {
+                int target = -1;
+                for (int s = 1; s < 4; ++s) {
+                    if (!present[s]) { target = s; break; }
+                }
+                if (target >= 0) {
+                    logical_reports[target] = logical_reports[0];
+                    logical_motion[target] = logical_motion[0];
+                    has_motion[target] = has_motion[0];
+                    present[target] = true;
+                    xinput_for_slot[target] = xinput_for_slot[0];
+                    raw_for_slot[target] = raw_for_slot[0];
+                    active_count++;
+                }
             }
-            out_reports[0]->reset();
-            kb.apply(*out_reports[0]);
+            logical_reports[0].reset();
+            logical_motion[0].reset();
+            kb.apply(logical_reports[0]);
+            present[0] = true;
+            has_motion[0] = false;
+            xinput_for_slot[0] = -1;
+            raw_for_slot[0] = -1;
             active_count = std::max(active_count, 1);
         } else if (kb.mode == 2) {
-            kb.apply(*out_reports[0]);
+            kb.apply(logical_reports[0]);
+            present[0] = true;
             active_count = std::max(active_count, 1);
         }
 
-        // Sign packet
-        {
+        if (legacy_udp) {
+            ns::Packet pkt; memset(&pkt, 0, sizeof(pkt));
+            pkt.magic   = ns::PROTO_MAGIC;
+            pkt.version = ns::PROTO_VERSION;
+            pkt.flags   = ns::FLAG_NONE;
+            pkt.seq     = seq++;
+            pkt.ts_us   = ns::now_us();
+            pkt.report.reset();
+            ns::HIDReport* legacy_pads[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
+            for (int i = 0; i < 4; ++i) *legacy_pads[i] = logical_reports[i];
+
             uint8_t full_hmac[32];
             hmac_sha256(hmac_key, 32, (const uint8_t*)&pkt, ns::PACKET_AUTH_SIZE, full_hmac);
             memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+            sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));
+        } else {
+            ExtendedUdpPacket pkt; memset(&pkt, 0, sizeof(pkt));
+            pkt.magic = ns::PROTO_MAGIC;
+            pkt.version = ns::PROTO_VERSION;
+            pkt.flags = ns::FLAG_NONE;
+            pkt.seq = seq++;
+            pkt.timestamp_us = ns::now_us();
+            pkt.report.reset();
+            ns::ExtendedHIDReport* ext_pads[4] = { &pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4 };
+            for (int i = 0; i < 4; ++i) {
+                fill_extended_pad(*ext_pads[i], logical_reports[i], present[i], has_motion[i] ? &logical_motion[i] : nullptr);
+            }
+
+            uint8_t full_hmac[32];
+            hmac_sha256(hmac_key, 32, (const uint8_t*)&pkt, EXT_UDP_PACKET_AUTH_SIZE, full_hmac);
+            memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+            sendto(sock, (const char*)&pkt, (int)sizeof(pkt), 0, (const sockaddr*)&dest, sizeof(dest));
+
+            pump_udp_rumble(sock, rumble, xinput_for_slot, raw_for_slot, raw_hid);
+            rumble.update_timeouts(xinput_for_slot, raw_for_slot, raw_hid);
         }
 
-        sendto(sock, (const char*)&pkt, (int)ns::PACKET_SIZE, 0, (const sockaddr*)&dest, sizeof(dest));
-        
         // Sleep to throttle transmission (~250Hz when active, 2Hz when idle)
         if (active_count > 0) {
             no_controllers_printed = false;
