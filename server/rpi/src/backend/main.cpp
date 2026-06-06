@@ -82,6 +82,7 @@ struct ClientSession {
     // the Switch port only maps after a non-neutral input, so early rumble can
     // be dropped before the browser has a rumble target.
     bool        pad_present[4]{};
+    uint64_t    pad_last_present_us[4]{};
     bool        uses_pad_presence = false;
 };
 
@@ -103,6 +104,11 @@ static constexpr int PRO_ACTIVE_REPORT_HZ = 250;
 static constexpr int PRO_IDLE_REPORT_HZ = 30;
 static constexpr uint64_t PRO_IDLE_REPORT_INTERVAL_US = 1'000'000ULL / PRO_IDLE_REPORT_HZ;
 static constexpr uint64_t PRO_RELEASE_NEUTRAL_US = 250'000ULL;
+// Web/Gamepad APIs can occasionally report a connected pad as absent for one
+// frame (especially while another tab/client is closing).  Do not release the
+// Switch port instantly on a single absent sample, or held buttons like R get
+// chopped into tiny taps.
+static constexpr uint64_t WEB_PAD_ABSENT_RELEASE_US = 750'000ULL;
 static constexpr uint8_t RID_INPUT_STANDARD = 0x30;
 static constexpr uint8_t RID_INPUT_SUBCMD   = 0x21;
 static constexpr uint8_t RID_OUTPUT_RUMBLE  = 0x10;
@@ -939,6 +945,7 @@ static void writer_thread(int hz) {
             bool active_snap[MAX_CLIENTS] = {};
             bool uses_presence_snap[MAX_CLIENTS] = {};
             bool present_snap[MAX_CLIENTS][4] = {};
+            uint64_t last_present_snap[MAX_CLIENTS][4] = {};
             ExtendedHIDReport report_snap[MAX_CLIENTS][4];
             for (int c = 0; c < MAX_CLIENTS; ++c)
                 for (int s = 0; s < 4; ++s)
@@ -957,8 +964,10 @@ static void writer_thread(int hz) {
                 }
                 active_snap[c] = g_clients[c].active;
                 uses_presence_snap[c] = g_clients[c].uses_pad_presence;
-                for (int s = 0; s < 4; ++s)
+                for (int s = 0; s < 4; ++s) {
                     present_snap[c][s] = g_clients[c].pad_present[s];
+                    last_present_snap[c][s] = g_clients[c].pad_last_present_us[s];
+                }
                 report_snap[c][0] = g_clients[c].report.p1;
                 report_snap[c][1] = g_clients[c].report.p2;
                 report_snap[c][2] = g_clients[c].report.p3;
@@ -966,10 +975,18 @@ static void writer_thread(int hz) {
             }
 
             for (int h = 0; h < 4; ++h) {
-                if (hw_slots[h].client_idx != -1 &&
-                    (!active_snap[hw_slots[h].client_idx] ||
-                     (uses_presence_snap[hw_slots[h].client_idx] &&
-                      !present_snap[hw_slots[h].client_idx][hw_slots[h].sub_idx]))) {
+                if (hw_slots[h].client_idx == -1) continue;
+
+                int cidx = hw_slots[h].client_idx;
+                int sidx = hw_slots[h].sub_idx;
+                bool absent_too_long = false;
+                if (uses_presence_snap[cidx] && !present_snap[cidx][sidx]) {
+                    uint64_t last_seen = last_present_snap[cidx][sidx];
+                    absent_too_long = (last_seen == 0) ||
+                                      (now_stamp - last_seen >= WEB_PAD_ABSENT_RELEASE_US);
+                }
+
+                if (!active_snap[cidx] || absent_too_long) {
                     hw_slots[h].client_idx = -1;
                     hw_slots[h].sub_idx = -1;
 
@@ -2617,9 +2634,10 @@ static size_t process_ws_frame(WebClient *c) {
 
     uint64_t now = now_us();
 
-    if (c->ws_slot >= 0 && (now - c->ws_last_rx > WATCHDOG_MS * 1000ULL))
-        c->ws_slot = -1;
-
+    // Keep the WebSocket pinned to its backend session while that session is
+    // still alive.  Dropping c->ws_slot here after a short receive gap can
+    // orphan the old session and remap the same browser to another Switch
+    // port, which looks like held buttons flickering.
     if (c->ws_slot >= 0) {
         std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
         if (!g_clients[c->ws_slot].active)
@@ -2634,8 +2652,10 @@ static size_t process_ws_frame(WebClient *c) {
                 g_clients[i].first_pkt = true;
                 g_clients[i].report.reset();
                 g_clients[i].uses_pad_presence = true;
-                for (int s = 0; s < 4; ++s)
+                for (int s = 0; s < 4; ++s) {
                     g_clients[i].pad_present[s] = false;
+                    g_clients[i].pad_last_present_us[s] = 0;
+                }
                 g_clients[i].last_rx_us = now;
                 for (int s = 0; s < 4; ++s)
                     c->last_rumble_seq[s] = g_clients[i].rumble_seq[s];
@@ -2645,14 +2665,39 @@ static size_t process_ws_frame(WebClient *c) {
     }
     if (c->ws_slot >= 0) {
         std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
+
+        ExtendedHIDReport* dst_pads[4] = {
+            &g_clients[c->ws_slot].report.p1,
+            &g_clients[c->ws_slot].report.p2,
+            &g_clients[c->ws_slot].report.p3,
+            &g_clients[c->ws_slot].report.p4,
+        };
+        const ExtendedHIDReport* src_pads[4] = {
+            &report.p1, &report.p2, &report.p3, &report.p4,
+        };
+
         if (is_reset) {
             g_clients[c->ws_slot].report.reset();
-            for (int s = 0; s < 4; ++s)
+            for (int s = 0; s < 4; ++s) {
                 g_clients[c->ws_slot].pad_present[s] = false;
+                g_clients[c->ws_slot].pad_last_present_us[s] = 0;
+            }
         } else {
-            g_clients[c->ws_slot].report = report;
-            for (int s = 0; s < 4; ++s)
-                g_clients[c->ws_slot].pad_present[s] = pad_present[s];
+            for (int s = 0; s < 4; ++s) {
+                if (pad_present[s]) {
+                    *dst_pads[s] = *src_pads[s];
+                    g_clients[c->ws_slot].pad_present[s] = true;
+                    g_clients[c->ws_slot].pad_last_present_us[s] = now;
+                } else {
+                    // Treat an absent web/gamepad slot as a debounced disconnect,
+                    // not as an immediate neutral frame.  That prevents one bad
+                    // navigator.getGamepads() sample from releasing held R/ZR/etc.
+                    g_clients[c->ws_slot].pad_present[s] = false;
+                    uint64_t last_seen = g_clients[c->ws_slot].pad_last_present_us[s];
+                    if (last_seen == 0 || now - last_seen >= WEB_PAD_ABSENT_RELEASE_US)
+                        dst_pads[s]->reset();
+                }
+            }
         }
         g_clients[c->ws_slot].last_rx_us = now;
     }
@@ -3044,8 +3089,10 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
                         g_clients[clients[i].ws_slot].active = false;
                         g_clients[clients[i].ws_slot].report.reset();
                         g_clients[clients[i].ws_slot].uses_pad_presence = false;
-                        for (int s = 0; s < 4; ++s)
+                        for (int s = 0; s < 4; ++s) {
                             g_clients[clients[i].ws_slot].pad_present[s] = false;
+                            g_clients[clients[i].ws_slot].pad_last_present_us[s] = 0;
+                        }
                     }
                 }
                 if (g_verbose) std::printf("[web] client %d closed\n", clients[i].fd);
@@ -3070,8 +3117,10 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
                     g_clients[clients[i].ws_slot].active = false;
                     g_clients[clients[i].ws_slot].report.reset();
                     g_clients[clients[i].ws_slot].uses_pad_presence = false;
-                    for (int s = 0; s < 4; ++s)
+                    for (int s = 0; s < 4; ++s) {
                         g_clients[clients[i].ws_slot].pad_present[s] = false;
+                        g_clients[clients[i].ws_slot].pad_last_present_us[s] = 0;
+                    }
                 }
             }
             close(clients[i].fd);
@@ -3209,8 +3258,10 @@ int main(int argc, char** argv) {
                     g_clients[i].first_pkt = true;
                     g_clients[i].report.reset();
                     g_clients[i].uses_pad_presence = false;
-                    for (int s = 0; s < 4; ++s)
+                    for (int s = 0; s < 4; ++s) {
                         g_clients[i].pad_present[s] = false;
+                        g_clients[i].pad_last_present_us[s] = 0;
+                    }
                     g_clients[i].last_rx_us = now;
                     if (g_verbose) std::printf("New PC accepted into Server Slot %d/4\n", i+1);
                     break;
