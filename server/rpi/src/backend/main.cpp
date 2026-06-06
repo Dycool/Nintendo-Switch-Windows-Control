@@ -1132,7 +1132,7 @@ struct WebClient {
         WRITE_RESP,  // writing HTTP / WS upgrade response (POLLOUT)
         WS_ACTIVE,   // WebSocket mode (frames)
         CLOSED
-    } state = READ_HTTP;
+    } state = CLOSED;
 
     // HTTP headers (null-terminated)
     char http_buf[8192];
