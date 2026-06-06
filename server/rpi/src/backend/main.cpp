@@ -167,14 +167,14 @@ static_assert(sizeof(ProInputReport21) == PRO_REPORT_SIZE, "ProInputReport21 mus
 // 02 is a locally-administered unicast address, so these are intentionally
 // private/stable virtual MACs rather than pretending to be real hardware.
 static const uint8_t CTRL_MAC_BE[4][6] = {
-    {0x02, 0x4E, 0x53, 0x26, 0x06, 0x60},
-    {0x02, 0x4E, 0x53, 0x26, 0x06, 0x61},
-    {0x02, 0x4E, 0x53, 0x26, 0x06, 0x62},
-    {0x02, 0x4E, 0x53, 0x26, 0x06, 0x63},
+    {0x02, 0x4E, 0x53, 0x26, 0x06, 0xA0},
+    {0x02, 0x4E, 0x53, 0x26, 0x06, 0xA1},
+    {0x02, 0x4E, 0x53, 0x26, 0x06, 0xA2},
+    {0x02, 0x4E, 0x53, 0x26, 0x06, 0xA3},
 };
 
 static const char* CTRL_SERIAL[4] = {
-    "NSGP26060660", "NSGP26060661", "NSGP26060662", "NSGP26060663"
+    "NSGP260606A0", "NSGP260606A1", "NSGP260606A2", "NSGP260606A3"
 };
 
 static constexpr size_t SPI_FLASH_SIZE = 0x10000;
@@ -274,12 +274,20 @@ static void init_spi_flash(int ctrl) {
     pack_stick_cal_pair(stick_params + 3, STICK_DEADZONE, STICK_RANGE_RATIO);
     memcpy(flash + 0x6086, stick_params, sizeof(stick_params));
 
-    // Body/button colors. Slightly different shade per virtual pad avoids cached identity weirdness.
-    uint8_t shade = (uint8_t)(0x20 + ctrl * 0x18);
-    flash[0x6050] = shade; flash[0x6051] = shade; flash[0x6052] = shade;
-    flash[0x6053] = 0xFF;  flash[0x6054] = 0xFF;  flash[0x6055] = 0xFF;
-    flash[0x6056] = shade; flash[0x6057] = shade; flash[0x6058] = shade;
-    flash[0x6059] = 0xFF;  flash[0x605A] = 0xFF;  flash[0x605B] = 0xFF;
+    // Body/grip colors per virtual Pro Controller:
+    //   1 = red, 2 = yellow, 3 = blue, 4 = green.
+    // Buttons stay white for readability in the Switch UI.
+    static const uint8_t BODY_RGB[4][3] = {
+        {0xE6, 0x00, 0x12}, // red
+        {0xFF, 0xCC, 0x00}, // yellow
+        {0x00, 0x64, 0xFF}, // blue
+        {0x00, 0xC8, 0x53}, // green
+    };
+    const uint8_t* body = BODY_RGB[ctrl];
+    flash[0x6050] = body[0]; flash[0x6051] = body[1]; flash[0x6052] = body[2];
+    flash[0x6053] = 0xFF;    flash[0x6054] = 0xFF;    flash[0x6055] = 0xFF;
+    flash[0x6056] = body[0]; flash[0x6057] = body[1]; flash[0x6058] = body[2];
+    flash[0x6059] = 0xFF;    flash[0x605A] = 0xFF;    flash[0x605B] = 0xFF;
     flash[0x605C] = 0x00;
 
     struct { int16_t val; uint16_t addr; } imu_cal[] = {
@@ -825,7 +833,7 @@ static bool setup_gadget_builtin(bool force, const char* reason) {
     if (!write_text_file(join_path(GADGET_DIR, "bDeviceProtocol").c_str(), "0x00")) return false;
 
     // USB descriptor serial belongs here, not in the controller SPI area.
-    if (!write_text_file(join_path(strings_dir, "serialnumber").c_str(), "NSGP26060660")) return false;
+    if (!write_text_file(join_path(strings_dir, "serialnumber").c_str(), "NSGP260606A0")) return false;
     if (!write_text_file(join_path(strings_dir, "manufacturer").c_str(), "Nintendo Co., Ltd.")) return false;
     if (!write_text_file(join_path(strings_dir, "product").c_str(), "Pro Controller")) return false;
 
@@ -1536,43 +1544,65 @@ static const char INDEX_HTML[] =
     "    }\n"
     "    return buttons;\n"
     "}\n"
-    "function freshGamepadForSlot(index) {\n"
-    "    const bySlot = rumbleTargets[index];\n"
-    "    const byRecent = lastActivePads[index];\n"
-    "    const pads = navigator.getGamepads ? navigator.getGamepads() : [];\n"
-    "    const storedIndex = rumbleTargetIndexes[index];\n"
-    "    if (storedIndex >= 0 && pads[storedIndex]) return pads[storedIndex];\n"
-    "    const src = bySlot || byRecent;\n"
-    "    if (src && typeof src.index === 'number' && pads[src.index]) return pads[src.index];\n"
-    "    return src || null;\n"
+    "function clamp01(v) { return Math.max(0.0, Math.min(1.0, v)); }\n"
+    "function freshGamepadForSlot(subpadIndex, gamepads) {\n"
+    "    // navigator.getGamepads() returns snapshots, so this function must only\n"
+    "    // be called with a freshly-polled array from the current rumble event.\n"
+    "    const storedIndex = rumbleTargetIndexes[subpadIndex];\n"
+    "    if (storedIndex >= 0 && gamepads[storedIndex]) return gamepads[storedIndex];\n"
+    "    if (gamepads[subpadIndex]) return gamepads[subpadIndex];\n"
+    "    const bySlot = rumbleTargets[subpadIndex];\n"
+    "    if (bySlot && typeof bySlot.index === 'number' && gamepads[bySlot.index]) return gamepads[bySlot.index];\n"
+    "    return null;\n"
     "}\n"
-    "async function rumbleOnePad(pad, strong, weak, duration) {\n"
-    "    if (!pad || pad.connected === false) return false;\n"
-    "    try {\n"
-    "        const va = pad.vibrationActuator;\n"
-    "        if (va && typeof va.playEffect === 'function') {\n"
-    "            await va.playEffect('dual-rumble', { startDelay: 0, duration, strongMagnitude: strong, weakMagnitude: weak });\n"
+    "async function rumbleOnePad(pad, weakFloat, strongFloat, durationMs) {\n"
+    "    if (!pad || pad.connected === false || durationMs <= 0) return false;\n"
+    "    if (pad.vibrationActuator && typeof pad.vibrationActuator.playEffect === 'function') {\n"
+    "        try {\n"
+    "            await pad.vibrationActuator.playEffect('dual-rumble', {\n"
+    "                startDelay: 0,\n"
+    "                duration: durationMs,\n"
+    "                weakMagnitude: weakFloat,\n"
+    "                strongMagnitude: strongFloat\n"
+    "            });\n"
     "            return true;\n"
-    "        }\n"
-    "        if (pad.hapticActuators && pad.hapticActuators[0] && typeof pad.hapticActuators[0].pulse === 'function') {\n"
-    "            await pad.hapticActuators[0].pulse(Math.max(strong, weak), duration);\n"
-    "            return true;\n"
-    "        }\n"
-    "    } catch(e) { console.warn('Rumble failed for', pad.id || pad.index, e); }\n"
-    "    return false;\n"
-    "}\n"
-    "async function playRumble(index, low, high, durationMs) {\n"
-    "    const strong = Math.max(low, high) / 255;\n"
-    "    const weak = Math.min(low, high) / 255;\n"
-    "    const duration = Math.max(80, durationMs || 0);\n"
-    "    let ok = await rumbleOnePad(freshGamepadForSlot(index), strong, weak, duration);\n"
-    "    if (!ok && (low || high)) {\n"
-    "        const pads = navigator.getGamepads ? navigator.getGamepads() : [];\n"
-    "        for (const pad of pads) {\n"
-    "            if (pad && await rumbleOnePad(pad, strong, weak, duration)) { ok = true; break; }\n"
+    "        } catch (err) {\n"
+    "            console.error('Browser blocked rumble:', err, pad.id || pad.index);\n"
     "        }\n"
     "    }\n"
-    "    if (!ok && navigator.vibrate && durationMs > 0 && (low || high)) navigator.vibrate(duration);\n"
+    "    if (pad.hapticActuators && pad.hapticActuators[0] && typeof pad.hapticActuators[0].pulse === 'function') {\n"
+    "        try {\n"
+    "            await pad.hapticActuators[0].pulse(Math.max(weakFloat, strongFloat), durationMs);\n"
+    "            return true;\n"
+    "        } catch (err) {\n"
+    "            console.error('Browser blocked haptic pulse:', err, pad.id || pad.index);\n"
+    "        }\n"
+    "    }\n"
+    "    return false;\n"
+    "}\n"
+    "async function triggerRumble(subpadIndex, low255, high255, duration10ms) {\n"
+    "    // 1. Fresh snapshot right now; never use a cached Gamepad object for rumble.\n"
+    "    const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];\n"
+    "\n"
+    "    // 2. C++ sends uint8_t 0..255. The Web Gamepad API requires 0.0..1.0.\n"
+    "    const weakFloat = clamp01(low255 / 255.0);\n"
+    "    const strongFloat = clamp01(high255 / 255.0);\n"
+    "    const durationMs = Math.max(0, (duration10ms || 0) * 10);\n"
+    "    if (durationMs <= 0 || (!low255 && !high255)) return false;\n"
+    "\n"
+    "    // Prefer the logical slot mapping, then the direct same-index pad, then\n"
+    "    // fall back to every connected pad so browser index quirks do not kill rumble.\n"
+    "    let ok = await rumbleOnePad(freshGamepadForSlot(subpadIndex, gamepads), weakFloat, strongFloat, durationMs);\n"
+    "    if (!ok) {\n"
+    "        const directPad = gamepads[subpadIndex];\n"
+    "        if (directPad) ok = await rumbleOnePad(directPad, weakFloat, strongFloat, durationMs);\n"
+    "    }\n"
+    "    if (!ok) {\n"
+    "        for (const pad of gamepads) {\n"
+    "            if (pad && await rumbleOnePad(pad, weakFloat, strongFloat, durationMs)) { ok = true; break; }\n"
+    "        }\n"
+    "    }\n"
+    "    if (!ok && navigator.vibrate) navigator.vibrate(durationMs);\n"
     "    return ok;\n"
     "}\n"
     "function clamp16(v) { v = Math.round(v || 0); return Math.max(-32768, Math.min(32767, v)); }\n"
@@ -1623,8 +1653,8 @@ static const char INDEX_HTML[] =
     "    if (!(data instanceof ArrayBuffer) || data.byteLength < 8) return;\n"
     "    const v = new DataView(data);\n"
     "    if (v.getUint32(0, true) !== RUMBLE_MAGIC) return;\n"
-    "    const idx = v.getUint8(4), low = v.getUint8(5), high = v.getUint8(6), dur = v.getUint8(7) * 10;\n"
-    "    playRumble(idx, low, high, dur);\n"
+    "    const idx = v.getUint8(4), low = v.getUint8(5), high = v.getUint8(6), dur10 = v.getUint8(7);\n"
+    "    triggerRumble(idx, low, high, dur10);\n"
     "}\n"
     "function makeWsUrl() {\n"
     "    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';\n"
@@ -2062,13 +2092,18 @@ static const char MOBILE_HTML[] =
     "    if (motionPerm !== 'denied') installDeviceMotionListener();\n"
     "    if (orientPerm !== 'denied') installDeviceOrientationFallback();\n"
     "}\n"
+    "function clamp01(v) { return Math.max(0.0, Math.min(1.0, v)); }\n"
     "function handleRumbleMessage(data) {\n"
     "    if (!(data instanceof ArrayBuffer) || data.byteLength < 8) return;\n"
     "    const v = new DataView(data); if (v.getUint32(0, true) !== RUMBLE_MAGIC) return;\n"
-    "    const low = v.getUint8(5), high = v.getUint8(6), dur = Math.max(60, v.getUint8(7) * 10);\n"
+    "    const low255 = v.getUint8(5), high255 = v.getUint8(6), dur10 = v.getUint8(7);\n"
+    "    const weakFloat = clamp01(low255 / 255.0), strongFloat = clamp01(high255 / 255.0);\n"
+    "    const dur = Math.max(60, dur10 * 10);\n"
     "    const pulse = document.getElementById('rumblePulse');\n"
-    "    if (pulse) { pulse.style.display = (low || high) ? 'block' : 'none'; pulse.classList.add('active'); setTimeout(() => pulse.classList.remove('active'), Math.max(60, Math.min(dur, 220))); }\n"
-    "    if (navigator.vibrate && dur > 0 && (low || high)) navigator.vibrate([dur]);\n"
+    "    if (pulse) { pulse.style.display = (low255 || high255) ? 'block' : 'none'; pulse.classList.add('active'); setTimeout(() => pulse.classList.remove('active'), Math.max(60, Math.min(dur, 220))); }\n"
+    "    if (navigator.vibrate && dur > 0 && (weakFloat || strongFloat)) {\n"
+    "        try { navigator.vibrate([dur]); } catch (err) { console.error('Browser blocked mobile vibration:', err); }\n"
+    "    }\n"
     "}\n"
     "function makeWsUrl() {\n"
     "    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';\n"
