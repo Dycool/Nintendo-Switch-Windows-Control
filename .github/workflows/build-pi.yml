@@ -35,18 +35,42 @@ jobs:
           make -j$(nproc)
           make install
 
-      - name: Build Pi Server
+      - name: Build Hori Server
         run: |
           cd server/rpi
-          mkdir build && cd build
+          mkdir -p build-hori && cd build-hori
           cmake .. \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
             -DMINIUPNPC_INCLUDE_DIRS=/tmp/miniupnpc/include \
-            -DMINIUPNPC_LIBRARIES=/tmp/miniupnpc/lib/libminiupnpc.a
+            -DMINIUPNPC_LIBRARIES=/tmp/miniupnpc/lib/libminiupnpc.a \
+            -DBACKEND_SOURCE=src/backend/hori-main.cpp
           make -j$(nproc)
           cp ../setup_gadget.sh .
-          
+          mkdir hori-server
+          cp ns-backend setup_gadget.sh hori-server/
+          cd hori-server && zip -r ../hori-server.zip .
+
+      - name: Build Pro Server
+        run: |
+          cd server/rpi
+          mkdir -p build-pro && cd build-pro
+          cmake .. \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DMINIUPNPC_INCLUDE_DIRS=/tmp/miniupnpc/include \
+            -DMINIUPNPC_LIBRARIES=/tmp/miniupnpc/lib/libminiupnpc.a \
+            -DBACKEND_SOURCE=src/backend/pro-main.cpp
+          make -j$(nproc)
+          cp ../setup_gadget.sh .
+          mkdir pro-server
+          cp ns-backend setup_gadget.sh pro-server/
+          cd pro-server && zip -r ../pro-server.zip .
+
       - uses: actions/upload-artifact@v6
         with:
-          name: pi-backend
-          path: server/rpi/build/ns-backend
+          name: hori-server
+          path: server/rpi/build-hori/hori-server.zip
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pro-server
+          path: server/rpi/build-pro/pro-server.zip
