@@ -462,7 +462,7 @@ static std::string macro_pretty_json(const std::string& raw_text, const std::str
     return out;
 }
 
-static bool macro_validate_to_pretty_json(const std::string& raw_text, std::string& pretty, std::string& err, const std::string& fallback_name = "Macro") {
+[[maybe_unused]] static bool macro_validate_to_pretty_json(const std::string& raw_text, std::string& pretty, std::string& err, const std::string& fallback_name = "Macro") {
     std::vector<MacroStep> steps;
     if (!macro_validate_text(raw_text, steps, nullptr)) { err = macro_last_error(); return false; }
     pretty = macro_pretty_json(raw_text, fallback_name);

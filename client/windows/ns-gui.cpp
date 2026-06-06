@@ -2,6 +2,12 @@
 #  define WIN32_LEAN_AND_MEAN
 #endif
 #define _WIN32_WINNT 0x0601
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#ifndef _CRT_SECURE_NO_WARNINGS
+#  define _CRT_SECURE_NO_WARNINGS
+#endif
 #define UNICODE
 #define _UNICODE
 
@@ -585,6 +591,509 @@ static constexpr size_t EXT_UDP_PACKET_AUTH_SIZE = 20 + sizeof(ns::ExtendedMulti
 static constexpr size_t EXT_UDP_PACKET_SIZE      = EXT_UDP_PACKET_AUTH_SIZE + ns::HMAC_TAG_SIZE;
 static_assert(sizeof(ExtendedUdpPacket) == EXT_UDP_PACKET_SIZE, "ExtendedUdpPacket wire layout changed");
 
+
+
+static void set_pad_present_flag(ns::ExtendedHIDReport& r, bool present) {
+    // This project keeps the pad-present bit in HIDReport::vendor (byte 7)
+    // so old HORI-compatible HIDReport stays exactly 8 bytes.
+    if (present) r.input.vendor |= EXT_PAD_PRESENT;
+    else         r.input.vendor &= (uint8_t)~EXT_PAD_PRESENT;
+}
+
+static void fill_extended_pad(ns::ExtendedHIDReport& dst,
+                              const ns::HIDReport& input,
+                              bool present,
+                              const ns::MotionReport* motion) {
+    dst.reset();
+    dst.input = input;
+    set_pad_present_flag(dst, present);
+    if (present && motion) {
+        dst.motion = *motion;
+        dst.has_motion = 1;
+    }
+}
+
+static uint8_t raw12_to_axis8(uint16_t raw) {
+    int delta = (int)raw - 0x800;
+    int v = 128;
+    if (delta > 0) v = 128 + (delta * 127) / 0x600;
+    else if (delta < 0) v = 128 + (delta * 128) / 0x600;
+    return (uint8_t)std::clamp(v, 0, 255);
+}
+
+static uint8_t invert_axis8_centered(uint8_t v) {
+    return v == 128 ? 128 : (uint8_t)(255 - v);
+}
+
+static void sony_dpad_to_hat(uint8_t dpad, ns::HIDReport& r) {
+    switch (dpad & 0x0F) {
+        case 0: r.hat = ns::HAT_N;  break;
+        case 1: r.hat = ns::HAT_NE; break;
+        case 2: r.hat = ns::HAT_E;  break;
+        case 3: r.hat = ns::HAT_SE; break;
+        case 4: r.hat = ns::HAT_S;  break;
+        case 5: r.hat = ns::HAT_SW; break;
+        case 6: r.hat = ns::HAT_W;  break;
+        case 7: r.hat = ns::HAT_NW; break;
+        default: r.hat = ns::HAT_NEUTRAL; break;
+    }
+}
+
+struct RawPadState {
+    bool connected = false;
+    ns::HIDReport input{};
+    ns::MotionReport motion{};
+    bool has_motion = false;
+    uint16_t vid = 0;
+    uint16_t pid = 0;
+    std::string name;
+};
+
+struct RawHidDeviceInfo {
+    std::string path;
+    uint16_t vid = 0;
+    uint16_t pid = 0;
+    USHORT input_len = 64;
+    USHORT output_len = 64;
+};
+
+class RawHidManager {
+public:
+    void start() {
+        // Safe to call more than once. If startup happened before the pad was
+        // plugged in, a later Connect/device-change can rescan silently.
+        if (running.load() && !devices.empty()) return;
+        running.store(true);
+        if (!devices.empty()) return;
+        auto infos = enumerate_supported_devices();
+        int slot = 0;
+        for (const auto& info : infos) {
+            if (slot >= 4) break;
+            auto dev = std::make_unique<Device>();
+            dev->slot = slot;
+            dev->info = info;
+            dev->handle = CreateFileA(info.path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (dev->handle == INVALID_HANDLE_VALUE) {
+                dev->handle = CreateFileA(info.path.c_str(), GENERIC_READ,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            }
+            if (dev->handle == INVALID_HANDLE_VALUE) continue;
+
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+                states[slot].connected = true;
+                states[slot].vid = info.vid;
+                states[slot].pid = info.pid;
+                states[slot].name = device_name(info.vid, info.pid);
+            }
+
+            dev->thread = std::thread([this, d = dev.get()] { read_loop(d); });
+            devices.push_back(std::move(dev));
+            slot++;
+        }
+    }
+
+    std::array<RawPadState, 4> snapshot() {
+        std::lock_guard<std::mutex> lk(mtx);
+        return states;
+    }
+
+    int count_connected() {
+        std::lock_guard<std::mutex> lk(mtx);
+        int n = 0;
+        for (auto& s : states) if (s.connected) n++;
+        return n;
+    }
+
+    void set_rumble(int raw_slot, uint8_t low, uint8_t high) {
+        if (raw_slot < 0 || raw_slot >= (int)devices.size()) return;
+        Device* d = devices[raw_slot].get();
+        if (!d || d->handle == INVALID_HANDLE_VALUE) return;
+
+        if (is_ds4(d->info.vid, d->info.pid)) {
+            uint8_t out[32] = {};
+            out[0] = 0x05;
+            out[1] = 0xFF;
+            out[4] = high;
+            out[5] = low;
+            DWORD written = 0;
+            WriteFile(d->handle, out, sizeof(out), &written, nullptr);
+            HidD_SetOutputReport(d->handle, out, sizeof(out));
+        } else if (is_dualsense(d->info.vid, d->info.pid)) {
+            uint8_t out[48] = {};
+            out[0] = 0x02;
+            out[1] = 0xFF;
+            out[2] = 0x04;
+            out[3] = high;
+            out[4] = low;
+            DWORD written = 0;
+            WriteFile(d->handle, out, sizeof(out), &written, nullptr);
+            HidD_SetOutputReport(d->handle, out, sizeof(out));
+        }
+    }
+
+private:
+    struct Device {
+        HANDLE handle = INVALID_HANDLE_VALUE;
+        RawHidDeviceInfo info{};
+        int slot = -1;
+        std::thread thread;
+        ~Device() {
+            if (thread.joinable()) thread.detach();
+            if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+        }
+    };
+
+    std::atomic<bool> running{false};
+    std::mutex mtx;
+    std::array<RawPadState, 4> states{};
+    std::vector<std::unique_ptr<Device>> devices;
+
+    static bool is_ds4(uint16_t vid, uint16_t pid) {
+        return vid == 0x054C && (pid == 0x05C4 || pid == 0x09CC);
+    }
+    static bool is_dualsense(uint16_t vid, uint16_t pid) {
+        return vid == 0x054C && (pid == 0x0CE6 || pid == 0x0DF2);
+    }
+    static bool is_switch_pro(uint16_t vid, uint16_t pid) {
+        return vid == 0x057E && pid == 0x2009;
+    }
+    static bool is_supported(uint16_t vid, uint16_t pid) {
+        return is_ds4(vid, pid) || is_dualsense(vid, pid) || is_switch_pro(vid, pid);
+    }
+    static std::string device_name(uint16_t vid, uint16_t pid) {
+        if (is_ds4(vid, pid)) return "DualShock 4 / DS4-compatible";
+        if (is_dualsense(vid, pid)) return "DualSense";
+        if (is_switch_pro(vid, pid)) return "Nintendo Switch Pro Controller";
+        return "Raw HID controller";
+    }
+
+    static std::vector<RawHidDeviceInfo> enumerate_supported_devices() {
+        std::vector<RawHidDeviceInfo> out;
+        GUID hid_guid;
+        HidD_GetHidGuid(&hid_guid);
+        HDEVINFO devs = SetupDiGetClassDevsA(&hid_guid, nullptr, nullptr,
+                                             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (devs == INVALID_HANDLE_VALUE) return out;
+
+        for (DWORD i = 0; ; ++i) {
+            SP_DEVICE_INTERFACE_DATA ifdata{};
+            ifdata.cbSize = sizeof(ifdata);
+            if (!SetupDiEnumDeviceInterfaces(devs, nullptr, &hid_guid, i, &ifdata)) break;
+
+            DWORD needed = 0;
+            SetupDiGetDeviceInterfaceDetailA(devs, &ifdata, nullptr, 0, &needed, nullptr);
+            if (!needed) continue;
+            std::vector<uint8_t> detail_buf(needed);
+            auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_A*>(detail_buf.data());
+            detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+            if (!SetupDiGetDeviceInterfaceDetailA(devs, &ifdata, detail, needed, nullptr, nullptr)) continue;
+
+            HANDLE h = CreateFileA(detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                h = CreateFileA(detail->DevicePath, GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            }
+            if (h == INVALID_HANDLE_VALUE) continue;
+
+            HIDD_ATTRIBUTES attr{};
+            attr.Size = sizeof(attr);
+            if (!HidD_GetAttributes(h, &attr) || !is_supported(attr.VendorID, attr.ProductID)) {
+                CloseHandle(h);
+                continue;
+            }
+
+            RawHidDeviceInfo info;
+            info.path = detail->DevicePath;
+            info.vid = attr.VendorID;
+            info.pid = attr.ProductID;
+
+            PHIDP_PREPARSED_DATA pp = nullptr;
+            if (HidD_GetPreparsedData(h, &pp)) {
+                HIDP_CAPS caps{};
+                if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS) {
+                    info.input_len = caps.InputReportByteLength ? caps.InputReportByteLength : 64;
+                    info.output_len = caps.OutputReportByteLength ? caps.OutputReportByteLength : 64;
+                }
+                HidD_FreePreparsedData(pp);
+            }
+            CloseHandle(h);
+            out.push_back(info);
+        }
+        SetupDiDestroyDeviceInfoList(devs);
+        return out;
+    }
+
+    static bool parse_ds4(const uint8_t* b, DWORD len, ns::HIDReport& r, ns::MotionReport& m, bool& has_motion) {
+        r.reset(); m.reset(); has_motion = false;
+        int o = -1, motion_o = -1;
+        if (len >= 25 && b[0] == 0x01) { o = 0; motion_o = 13; }
+        else if (len >= 78 && b[0] == 0x11) { o = 2; motion_o = 15; }
+        else return false;
+
+        r.lx = b[o + 1]; r.ly = b[o + 2]; r.rx = b[o + 3]; r.ry = b[o + 4];
+        uint8_t btn0 = b[o + 5], btn1 = b[o + 6], btn2 = b[o + 7];
+        sony_dpad_to_hat(btn0, r);
+        if (btn0 & 0x10) r.buttons |= ns::BTN_Y;
+        if (btn0 & 0x20) r.buttons |= ns::BTN_B;
+        if (btn0 & 0x40) r.buttons |= ns::BTN_A;
+        if (btn0 & 0x80) r.buttons |= ns::BTN_X;
+        if (btn1 & 0x01) r.buttons |= ns::BTN_L;
+        if (btn1 & 0x02) r.buttons |= ns::BTN_R;
+        if ((btn1 & 0x04) || b[o + 8] > 128) r.buttons |= ns::BTN_ZL;
+        if ((btn1 & 0x08) || b[o + 9] > 128) r.buttons |= ns::BTN_ZR;
+        if (btn1 & 0x10) r.buttons |= ns::BTN_MINUS;
+        if (btn1 & 0x20) r.buttons |= ns::BTN_PLUS;
+        if (btn1 & 0x40) r.buttons |= ns::BTN_LSTICK;
+        if (btn1 & 0x80) r.buttons |= ns::BTN_RSTICK;
+        if (btn2 & 0x01) r.buttons |= ns::BTN_HOME;
+        if (btn2 & 0x02) r.buttons |= ns::BTN_CAPTURE;
+
+        if ((int)len >= motion_o + 12) {
+            m.gx = read_le16(b + motion_o + 0);
+            m.gy = read_le16(b + motion_o + 2);
+            m.gz = read_le16(b + motion_o + 4);
+            m.ax = read_le16(b + motion_o + 6);
+            m.ay = read_le16(b + motion_o + 8);
+            m.az = read_le16(b + motion_o + 10);
+            has_motion = true;
+        }
+        return true;
+    }
+
+    static bool parse_dualsense(const uint8_t* b, DWORD len, ns::HIDReport& r, ns::MotionReport& m, bool& has_motion) {
+        r.reset(); m.reset(); has_motion = false;
+        int o = -1, motion_o = -1;
+        if (len >= 40 && b[0] == 0x01) { o = 0; motion_o = 16; }
+        else if (len >= 78 && b[0] == 0x31) { o = 1; motion_o = 17; }
+        else return false;
+
+        r.lx = b[o + 1]; r.ly = b[o + 2]; r.rx = b[o + 3]; r.ry = b[o + 4];
+        uint8_t l2 = b[o + 5], r2 = b[o + 6];
+        uint8_t btn0 = b[o + 8], btn1 = b[o + 9], btn2 = b[o + 10];
+        sony_dpad_to_hat(btn0, r);
+        if (btn0 & 0x10) r.buttons |= ns::BTN_Y;
+        if (btn0 & 0x20) r.buttons |= ns::BTN_B;
+        if (btn0 & 0x40) r.buttons |= ns::BTN_A;
+        if (btn0 & 0x80) r.buttons |= ns::BTN_X;
+        if (btn1 & 0x01) r.buttons |= ns::BTN_L;
+        if (btn1 & 0x02) r.buttons |= ns::BTN_R;
+        if ((btn1 & 0x04) || l2 > 128) r.buttons |= ns::BTN_ZL;
+        if ((btn1 & 0x08) || r2 > 128) r.buttons |= ns::BTN_ZR;
+        if (btn1 & 0x10) r.buttons |= ns::BTN_MINUS;
+        if (btn1 & 0x20) r.buttons |= ns::BTN_PLUS;
+        if (btn1 & 0x40) r.buttons |= ns::BTN_LSTICK;
+        if (btn1 & 0x80) r.buttons |= ns::BTN_RSTICK;
+        if (btn2 & 0x01) r.buttons |= ns::BTN_HOME;
+        if (btn2 & 0x02) r.buttons |= ns::BTN_CAPTURE;
+
+        if ((int)len >= motion_o + 12) {
+            m.gx = read_le16(b + motion_o + 0);
+            m.gy = read_le16(b + motion_o + 2);
+            m.gz = read_le16(b + motion_o + 4);
+            m.ax = read_le16(b + motion_o + 6);
+            m.ay = read_le16(b + motion_o + 8);
+            m.az = read_le16(b + motion_o + 10);
+            has_motion = true;
+        }
+        return true;
+    }
+
+    static bool parse_switch_pro(const uint8_t* b, DWORD len, ns::HIDReport& r, ns::MotionReport& m, bool& has_motion) {
+        r.reset(); m.reset(); has_motion = false;
+        if (len < 25 || b[0] != 0x30) return false;
+
+        uint8_t br = b[3], bm = b[4], bl = b[5];
+        if (br & 0x01) r.buttons |= ns::BTN_Y;
+        if (br & 0x02) r.buttons |= ns::BTN_X;
+        if (br & 0x04) r.buttons |= ns::BTN_B;
+        if (br & 0x08) r.buttons |= ns::BTN_A;
+        if (br & 0x40) r.buttons |= ns::BTN_R;
+        if (br & 0x80) r.buttons |= ns::BTN_ZR;
+        if (bm & 0x01) r.buttons |= ns::BTN_MINUS;
+        if (bm & 0x02) r.buttons |= ns::BTN_PLUS;
+        if (bm & 0x04) r.buttons |= ns::BTN_RSTICK;
+        if (bm & 0x08) r.buttons |= ns::BTN_LSTICK;
+        if (bm & 0x10) r.buttons |= ns::BTN_HOME;
+        if (bm & 0x20) r.buttons |= ns::BTN_CAPTURE;
+        if (bl & 0x40) r.buttons |= ns::BTN_L;
+        if (bl & 0x80) r.buttons |= ns::BTN_ZL;
+
+        bool down = bl & 0x01, up = bl & 0x02, right = bl & 0x04, left = bl & 0x08;
+        if (up && right) r.hat = ns::HAT_NE; else if (up && left) r.hat = ns::HAT_NW;
+        else if (down && right) r.hat = ns::HAT_SE; else if (down && left) r.hat = ns::HAT_SW;
+        else if (up) r.hat = ns::HAT_N; else if (down) r.hat = ns::HAT_S;
+        else if (left) r.hat = ns::HAT_W; else if (right) r.hat = ns::HAT_E;
+
+        uint16_t lx = (uint16_t)b[6] | (((uint16_t)b[7] & 0x0F) << 8);
+        uint16_t ly = (((uint16_t)b[7] >> 4) & 0x0F) | ((uint16_t)b[8] << 4);
+        uint16_t rx = (uint16_t)b[9] | (((uint16_t)b[10] & 0x0F) << 8);
+        uint16_t ry = (((uint16_t)b[10] >> 4) & 0x0F) | ((uint16_t)b[11] << 4);
+        r.lx = raw12_to_axis8(lx);
+        r.ly = invert_axis8_centered(raw12_to_axis8(ly));
+        r.rx = raw12_to_axis8(rx);
+        r.ry = invert_axis8_centered(raw12_to_axis8(ry));
+
+        m.ax = read_le16(b + 13); m.ay = read_le16(b + 15); m.az = read_le16(b + 17);
+        m.gx = read_le16(b + 19); m.gy = read_le16(b + 21); m.gz = read_le16(b + 23);
+        has_motion = true;
+        return true;
+    }
+
+    void read_loop(Device* d) {
+        std::vector<uint8_t> buf(std::max<USHORT>(d->info.input_len, 64));
+        while (running.load()) {
+            DWORD got = 0;
+            if (!ReadFile(d->handle, buf.data(), (DWORD)buf.size(), &got, nullptr) || got == 0) {
+                DWORD err = GetLastError();
+                if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_INVALID_HANDLE || err == ERROR_OPERATION_ABORTED) {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    states[d->slot].connected = false;
+                    break;
+                }
+                Sleep(5);
+                continue;
+            }
+
+            ns::HIDReport input;
+            ns::MotionReport motion;
+            bool has_motion = false;
+            bool ok = false;
+            if (is_ds4(d->info.vid, d->info.pid))
+                ok = parse_ds4(buf.data(), got, input, motion, has_motion);
+            else if (is_dualsense(d->info.vid, d->info.pid))
+                ok = parse_dualsense(buf.data(), got, input, motion, has_motion);
+            else if (is_switch_pro(d->info.vid, d->info.pid))
+                ok = parse_switch_pro(buf.data(), got, input, motion, has_motion);
+
+            if (!ok) continue;
+            std::lock_guard<std::mutex> lk(mtx);
+            states[d->slot].connected = true;
+            states[d->slot].input = input;
+            states[d->slot].motion = motion;
+            states[d->slot].has_motion = has_motion;
+        }
+    }
+};
+
+static RawHidManager g_rawHid;
+
+class RumbleManager {
+public:
+    void apply_packet(const ns::RumblePacket& rp,
+                      const int xinput_for_slot[4],
+                      const int raw_for_slot[4]) {
+        if (rp.subpad >= 4) return;
+        const int slot = rp.subpad;
+        uint8_t low = rp.low_freq;
+        uint8_t high = rp.high_freq;
+        bool neutral = (low == 0 && high == 0) || rp.duration_10ms == 0;
+        uint64_t now = ns::now_us();
+        uint64_t dur_us = neutral ? 0ULL : std::max<uint64_t>(250000ULL, (uint64_t)rp.duration_10ms * 10000ULL);
+
+        if (!neutral && states[slot].low == low && states[slot].high == high &&
+            now - states[slot].last_set_us < 100000ULL) {
+            states[slot].until_us = now + dur_us;
+            return;
+        }
+
+        states[slot].low = low;
+        states[slot].high = high;
+        states[slot].until_us = neutral ? 0 : now + dur_us;
+        states[slot].last_set_us = now;
+        set_output(slot, neutral ? 0 : low, neutral ? 0 : high,
+                   xinput_for_slot[slot], raw_for_slot[slot]);
+    }
+
+    void update_timeouts(const int xinput_for_slot[4], const int raw_for_slot[4]) {
+        uint64_t now = ns::now_us();
+        for (int i = 0; i < 4; ++i) {
+            if (states[i].until_us != 0 && now > states[i].until_us) {
+                states[i].until_us = 0;
+                states[i].low = states[i].high = 0;
+                set_output(i, 0, 0, xinput_for_slot[i], raw_for_slot[i]);
+            }
+        }
+    }
+
+    void stop_all() {
+        for (int i = 0; i < 4; ++i) {
+            if (states[i].last_xinput >= 0) {
+                XINPUT_VIBRATION z{};
+                XInputSetState((DWORD)states[i].last_xinput, &z);
+            }
+            if (states[i].last_raw >= 0)
+                g_rawHid.set_rumble(states[i].last_raw, 0, 0);
+            states[i] = SlotState{};
+        }
+    }
+
+private:
+    struct SlotState {
+        uint8_t low = 0, high = 0;
+        uint64_t until_us = 0;
+        uint64_t last_set_us = 0;
+        int last_xinput = -1;
+        int last_raw = -1;
+    } states[4];
+
+    static WORD motor_word(uint8_t v) {
+        return (WORD)((uint32_t)v * 65535u / 255u);
+    }
+
+    void stop_previous_if_moved(int slot, int xinput_idx, int raw_idx) {
+        if (states[slot].last_xinput != -1 && states[slot].last_xinput != xinput_idx) {
+            XINPUT_VIBRATION z{};
+            XInputSetState((DWORD)states[slot].last_xinput, &z);
+        }
+        if (states[slot].last_raw != -1 && states[slot].last_raw != raw_idx)
+            g_rawHid.set_rumble(states[slot].last_raw, 0, 0);
+    }
+
+    void set_output(int slot, uint8_t low, uint8_t high, int xinput_idx, int raw_idx) {
+        stop_previous_if_moved(slot, xinput_idx, raw_idx);
+        if (xinput_idx >= 0 && xinput_idx < 4) {
+            XINPUT_VIBRATION vib{};
+            vib.wLeftMotorSpeed = motor_word(low);
+            vib.wRightMotorSpeed = motor_word(high);
+            XInputSetState((DWORD)xinput_idx, &vib);
+        }
+        if (raw_idx >= 0)
+            g_rawHid.set_rumble(raw_idx, low, high);
+        states[slot].last_xinput = xinput_idx;
+        states[slot].last_raw = raw_idx;
+    }
+};
+
+static void pump_udp_rumble(SOCKET sock,
+                            RumbleManager& rumble,
+                            const int xinput_for_slot[4],
+                            const int raw_for_slot[4]) {
+    uint8_t buf[64];
+    for (;;) {
+        sockaddr_in from{};
+        int from_len = sizeof(from);
+        int n = recvfrom(sock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+                         reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (n == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (e == WSAEWOULDBLOCK || e == WSAEINTR) break;
+            break;
+        }
+        if (n == (int)sizeof(ns::RumblePacket)) {
+            ns::RumblePacket rp{};
+            memcpy(&rp, buf, sizeof(rp));
+            if (rp.magic == ns::RUMBLE_MAGIC)
+                rumble.apply_packet(rp, xinput_for_slot, raw_for_slot);
+        }
+    }
+}
 
 
 // ── Server-side macro upload packet ─────────────────────────────────────────
