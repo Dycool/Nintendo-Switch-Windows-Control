@@ -613,6 +613,11 @@ static void fill_extended_pad(ns::ExtendedHIDReport& dst,
     }
 }
 
+static int16_t read_le16(const uint8_t* p) {
+    return static_cast<int16_t>(static_cast<uint16_t>(p[0]) |
+                                (static_cast<uint16_t>(p[1]) << 8));
+}
+
 static uint8_t raw12_to_axis8(uint16_t raw) {
     int delta = (int)raw - 0x800;
     int v = 128;
