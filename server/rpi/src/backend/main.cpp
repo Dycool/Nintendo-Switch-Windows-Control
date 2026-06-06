@@ -476,7 +476,7 @@ static void writer_thread(int hz) {
         bool all_open = true;
         for (int i = 0; i < 4; ++i) {
             if (fds[i] < 0) {
-                fds[i] = open(devs[i].c_str(), O_RDWR | O_NONBLOCK);
+                fds[i] = open(devs[i].c_str(), O_RDWR);
                 if (fds[i] >= 0) {
                     rt[i].fd = fds[i];
                     rt[i].timer = 0;
@@ -538,6 +538,15 @@ static void writer_thread(int hz) {
                 if (hw_slots[h].client_idx != -1 && !active_snap[hw_slots[h].client_idx]) {
                     hw_slots[h].client_idx = -1;
                     hw_slots[h].sub_idx = -1;
+
+                    // Match the successful probe behavior: once a virtual controller is
+                    // no longer needed, stop serving that Pro Controller runtime.  The
+                    // next real input will make the port handshake again instead of
+                    // leaving a half-connected controller around.
+                    rt[h].timer = 0;
+                    rt[h].full_report_enabled = false;
+                    rt[h].pending_subcmd_reply = false;
+                    memset(&rt[h].pending_reply, 0, sizeof(rt[h].pending_reply));
                 }
             }
 
@@ -575,33 +584,56 @@ static void writer_thread(int hz) {
 
             bool ok = true;
             for (int h = 0; h < 4; ++h) {
+                const bool port_needed = (hw_slots[h].client_idx != -1);
+
                 uint8_t write_buf[PRO_REPORT_SIZE] = {};
+                bool have_report_to_write = false;
+                bool wrote_subcmd_reply = false;
+
                 if (rt[h].pending_subcmd_reply) {
                     rt[h].pending_reply.id = RID_INPUT_SUBCMD;
                     rt[h].pending_reply.timer = rt[h].timer++;
                     fill_neutral_controls(rt[h].pending_reply);
                     memcpy(write_buf, &rt[h].pending_reply, sizeof(ProInputReport21));
-                    rt[h].pending_subcmd_reply = false;
-                } else if (rt[h].full_report_enabled || hw_slots[h].client_idx != -1) {
-                    // Normally the Switch enables 0x30 standard reports via init cmd 0x04
-                    // and/or subcmd 0x03.  In practice, if the backend starts after the
-                    // gadget has already enumerated, those output packets can be missed by
-                    // /dev/hidgX.  The web/UDP side may still be receiving real input, but
-                    // rt[h].full_report_enabled stays false, causing pro_hid_writes/sec=0.
-                    // Once a virtual pad is mapped to this hardware slot, stream 0x30 anyway.
+                    have_report_to_write = true;
+                    wrote_subcmd_reply = true;
+                } else if (port_needed && rt[h].full_report_enabled) {
+                    // Exact successful-probe rule: do NOT stream 0x30 just because a
+                    // browser/UDP pad exists.  Wait until the Switch enables full input
+                    // reports through init cmd 0x04 and/or subcmd 0x03.
                     ProInputReport30 std_in{};
                     build_standard_report(out_reports[h], rt[h].timer++, std_in);
                     memcpy(write_buf, &std_in, sizeof(ProInputReport30));
-                } else {
-                    continue;
+                    have_report_to_write = true;
                 }
 
+                if (!have_report_to_write) continue;
+
                 ssize_t w = write(fds[h], write_buf, PRO_REPORT_SIZE);
-                if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) ok = false;
-                else if (w > 0) writes_this_second++;
+                if (w < 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) ok = false;
+                    // If a subcommand reply could not be written, keep it pending.
+                    // Dropping it makes the Switch repeat commands such as 0x02 forever.
+                } else if (w == (ssize_t)PRO_REPORT_SIZE) {
+                    if (wrote_subcmd_reply) rt[h].pending_subcmd_reply = false;
+                    writes_this_second++;
+                } else if (w > 0) {
+                    // Partial HID report writes should not happen.  Treat as an error so
+                    // we reconnect cleanly rather than sending malformed controller data.
+                    ok = false;
+                }
             }
 
             for (int h = 0; h < 4; ++h) {
+                const bool port_needed = (hw_slots[h].client_idx != -1);
+
+                // Only handshake/serve a Pro Controller once a real browser/UDP/mobile
+                // pad has claimed that Switch port.  This prevents unused virtual
+                // controllers from fully connecting just because the gadget exists.
+                if (!port_needed && !rt[h].pending_subcmd_reply && !rt[h].full_report_enabled) {
+                    continue;
+                }
+
                 struct pollfd pfd = {fds[h], POLLIN, 0};
                 uint8_t read_buf[PRO_REPORT_SIZE];
                 int guard = 0;
