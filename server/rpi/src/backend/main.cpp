@@ -77,6 +77,12 @@ struct ClientSession {
     ExtendedMultiReport report{}; // Inputs + optional motion coming from this specific PC/WebSocket
     RumblePacket rumble[4]{};
     uint32_t    rumble_seq[4]{};
+
+    // Web/mobile packets set this even when the pad is neutral.  Without it,
+    // the Switch port only maps after a non-neutral input, so early rumble can
+    // be dropped before the browser has a rumble target.
+    bool        pad_present[4]{};
+    bool        uses_pad_presence = false;
 };
 
 static std::mutex    g_mtx[MAX_CLIENTS];
@@ -555,6 +561,12 @@ static void publish_rumble_event(int client_idx, int sub_idx, const uint8_t* pac
     ev.high_freq = neutral ? 0 : high;
     ev.duration_10ms = neutral ? 0 : 6;
     g_clients[client_idx].rumble_seq[sub_idx]++;
+
+    if (g_verbose) {
+        std::printf("[rumble] client=%d pad=%d low=%u high=%u duration=%u neutral=%s\n",
+                    client_idx + 1, sub_idx + 1, ev.low_freq, ev.high_freq,
+                    ev.duration_10ms, neutral ? "yes" : "no");
+    }
 }
 
 
@@ -925,6 +937,8 @@ static void writer_thread(int hz) {
 
             uint64_t now_stamp = now_us();
             bool active_snap[MAX_CLIENTS] = {};
+            bool uses_presence_snap[MAX_CLIENTS] = {};
+            bool present_snap[MAX_CLIENTS][4] = {};
             ExtendedHIDReport report_snap[MAX_CLIENTS][4];
             for (int c = 0; c < MAX_CLIENTS; ++c)
                 for (int s = 0; s < 4; ++s)
@@ -942,6 +956,9 @@ static void writer_thread(int hz) {
                     timeout_printed[c] = false;
                 }
                 active_snap[c] = g_clients[c].active;
+                uses_presence_snap[c] = g_clients[c].uses_pad_presence;
+                for (int s = 0; s < 4; ++s)
+                    present_snap[c][s] = g_clients[c].pad_present[s];
                 report_snap[c][0] = g_clients[c].report.p1;
                 report_snap[c][1] = g_clients[c].report.p2;
                 report_snap[c][2] = g_clients[c].report.p3;
@@ -949,7 +966,10 @@ static void writer_thread(int hz) {
             }
 
             for (int h = 0; h < 4; ++h) {
-                if (hw_slots[h].client_idx != -1 && !active_snap[hw_slots[h].client_idx]) {
+                if (hw_slots[h].client_idx != -1 &&
+                    (!active_snap[hw_slots[h].client_idx] ||
+                     (uses_presence_snap[hw_slots[h].client_idx] &&
+                      !present_snap[hw_slots[h].client_idx][hw_slots[h].sub_idx]))) {
                     hw_slots[h].client_idx = -1;
                     hw_slots[h].sub_idx = -1;
 
@@ -973,7 +993,14 @@ static void writer_thread(int hz) {
                         }
                     }
 
-                    if (mapped || extended_is_neutral(report_snap[c][s])) continue;
+                    // A browser/mobile pad that is connected but currently neutral still
+                    // needs to claim its Switch port so rumble has a target immediately.
+                    if (mapped) continue;
+                    if (uses_presence_snap[c]) {
+                        if (!present_snap[c][s]) continue;
+                    } else if (extended_is_neutral(report_snap[c][s])) {
+                        continue;
+                    }
 
                     // Preserve logical pad order.  The previous "first free port" mapper
                     // let Pad 2 steal Switch Port 1 whenever keyboard/mobile Pad 1 was
@@ -1350,6 +1377,7 @@ static const char INDEX_HTML[] =
     "const PROTO_MAGIC = 0x4E535743;\n"
     "const PROTO_VERSION = 5;\n"
     "const RUMBLE_MAGIC = 0x4E535652;\n"
+    "const PAD_PRESENT = 1;\n"
     "const SECRET = \"nsc-R2xvCy7Eyw2nfbZIOGyKZPnostpaRY\";\n"
     "const EXT_REPORT_SIZE = 24;\n"
     "const PACKET_SIZE = 116;\n"
@@ -1365,6 +1393,7 @@ static const char INDEX_HTML[] =
     "let seqCounter = 0;\n"
     "let lastActivePads = [];\n"
     "let rumbleTargets = [null, null, null, null];\n"
+    "let rumbleTargetIndexes = [-1, -1, -1, -1];\n"
     "let motion = { enabled:false, ax:0, ay:0, az:0, gx:0, gy:0, gz:0 };\n"
     "let motionListenerInstalled = false, orientationListenerInstalled = false, lastDeviceMotionMs = 0;\n"
     "const keysDown = new Set();\n"
@@ -1490,50 +1519,88 @@ static const char INDEX_HTML[] =
     "    }\n"
     "    return buttons;\n"
     "}\n"
+    "function freshGamepadForSlot(index) {\n"
+    "    const bySlot = rumbleTargets[index];\n"
+    "    const byRecent = lastActivePads[index];\n"
+    "    const pads = navigator.getGamepads ? navigator.getGamepads() : [];\n"
+    "    const storedIndex = rumbleTargetIndexes[index];\n"
+    "    if (storedIndex >= 0 && pads[storedIndex]) return pads[storedIndex];\n"
+    "    const src = bySlot || byRecent;\n"
+    "    if (src && typeof src.index === 'number' && pads[src.index]) return pads[src.index];\n"
+    "    return src || null;\n"
+    "}\n"
+    "async function rumbleOnePad(pad, strong, weak, duration) {\n"
+    "    if (!pad || pad.connected === false) return false;\n"
+    "    try {\n"
+    "        const va = pad.vibrationActuator;\n"
+    "        if (va && typeof va.playEffect === 'function') {\n"
+    "            await va.playEffect('dual-rumble', { startDelay: 0, duration, strongMagnitude: strong, weakMagnitude: weak });\n"
+    "            return true;\n"
+    "        }\n"
+    "        if (pad.hapticActuators && pad.hapticActuators[0] && typeof pad.hapticActuators[0].pulse === 'function') {\n"
+    "            await pad.hapticActuators[0].pulse(Math.max(strong, weak), duration);\n"
+    "            return true;\n"
+    "        }\n"
+    "    } catch(e) { console.warn('Rumble failed for', pad.id || pad.index, e); }\n"
+    "    return false;\n"
+    "}\n"
     "async function playRumble(index, low, high, durationMs) {\n"
     "    const strong = Math.max(low, high) / 255;\n"
     "    const weak = Math.min(low, high) / 255;\n"
     "    const duration = Math.max(80, durationMs || 0);\n"
-    "    const pad = rumbleTargets[index] || lastActivePads[index];\n"
-    "    try {\n"
-    "        const va = pad && pad.vibrationActuator;\n"
-    "        if (va && va.playEffect) {\n"
-    "            const effects = va.effects || ['dual-rumble'];\n"
-    "            const effect = effects.includes('dual-rumble') ? 'dual-rumble' : (effects[0] || 'dual-rumble');\n"
-    "            await va.playEffect(effect, { startDelay: 0, duration, strongMagnitude: strong, weakMagnitude: weak });\n"
-    "            return;\n"
+    "    let ok = await rumbleOnePad(freshGamepadForSlot(index), strong, weak, duration);\n"
+    "    if (!ok && (low || high)) {\n"
+    "        const pads = navigator.getGamepads ? navigator.getGamepads() : [];\n"
+    "        for (const pad of pads) {\n"
+    "            if (pad && await rumbleOnePad(pad, strong, weak, duration)) { ok = true; break; }\n"
     "        }\n"
-    "        if (pad && pad.hapticActuators && pad.hapticActuators[0] && pad.hapticActuators[0].pulse) {\n"
-    "            await pad.hapticActuators[0].pulse(Math.max(strong, weak), duration);\n"
-    "            return;\n"
-    "        }\n"
-    "    } catch(e) {\n"
-    "        console.warn('Rumble failed', e);\n"
     "    }\n"
-    "    if (navigator.vibrate && durationMs > 0 && (low || high)) navigator.vibrate(duration);\n"
+    "    if (!ok && navigator.vibrate && durationMs > 0 && (low || high)) navigator.vibrate(duration);\n"
+    "    return ok;\n"
     "}\n"
     "function clamp16(v) { v = Math.round(v || 0); return Math.max(-32768, Math.min(32767, v)); }\n"
+    "async function requestSensorPermission(apiName) {\n"
+    "    const Api = window[apiName];\n"
+    "    if (typeof Api === 'undefined') return 'unavailable';\n"
+    "    if (typeof Api.requestPermission === 'function') {\n"
+    "        try { return await Api.requestPermission(); } catch(e) { console.warn('[motion permission]', apiName, e); return 'error'; }\n"
+    "    }\n"
+    "    return 'granted';\n"
+    "}\n"
+    "function installDeviceMotionListener() {\n"
+    "    if (motionListenerInstalled || typeof DeviceMotionEvent === 'undefined') return;\n"
+    "    motionListenerInstalled = true;\n"
+    "    window.addEventListener('devicemotion', e => {\n"
+    "        lastDeviceMotionMs = Date.now();\n"
+    "        const a = e.accelerationIncludingGravity || e.acceleration || {};\n"
+    "        const rr = e.rotationRate || {};\n"
+    "        motion.enabled = true;\n"
+    "        motion.ax = clamp16((a.x || 0) / 9.80665 * 4096);\n"
+    "        motion.ay = clamp16((a.y || 0) / 9.80665 * 4096);\n"
+    "        motion.az = clamp16((a.z || 0) / 9.80665 * 4096);\n"
+    "        motion.gx = clamp16((rr.beta  || 0) * 16);\n"
+    "        motion.gy = clamp16((rr.gamma || 0) * 16);\n"
+    "        motion.gz = clamp16((rr.alpha || 0) * 16);\n"
+    "    }, {passive:true});\n"
+    "}\n"
+    "function installDeviceOrientationFallback() {\n"
+    "    if (orientationListenerInstalled || typeof DeviceOrientationEvent === 'undefined') return;\n"
+    "    orientationListenerInstalled = true;\n"
+    "    window.addEventListener('deviceorientation', e => {\n"
+    "        if (Date.now() - lastDeviceMotionMs < 250) return;\n"
+    "        motion.enabled = true;\n"
+    "        motion.gx = clamp16((e.beta  || 0) * 16);\n"
+    "        motion.gy = clamp16((e.gamma || 0) * 16);\n"
+    "        motion.gz = clamp16((e.alpha || 0) * 16);\n"
+    "    }, {passive:true});\n"
+    "}\n"
     "async function enableMotion() {\n"
-    "    if (motionListenerInstalled) return;\n"
-    "    try {\n"
-    "        if (typeof DeviceMotionEvent === 'undefined') return;\n"
-    "        if (DeviceMotionEvent.requestPermission) {\n"
-    "            const r = await DeviceMotionEvent.requestPermission();\n"
-    "            if (r !== 'granted') return;\n"
-    "        }\n"
-    "        motionListenerInstalled = true;\n"
-    "        window.addEventListener('devicemotion', e => {\n"
-    "            const a = e.accelerationIncludingGravity || e.acceleration || {};\n"
-    "            const rr = e.rotationRate || {};\n"
-    "            motion.enabled = true;\n"
-    "            motion.ax = clamp16((a.x || 0) / 9.80665 * 4096);\n"
-    "            motion.ay = clamp16((a.y || 0) / 9.80665 * 4096);\n"
-    "            motion.az = clamp16((a.z || 0) / 9.80665 * 4096);\n"
-    "            motion.gx = clamp16((rr.beta  || 0) * 16);\n"
-    "            motion.gy = clamp16((rr.gamma || 0) * 16);\n"
-    "            motion.gz = clamp16((rr.alpha || 0) * 16);\n"
-    "        }, {passive:true});\n"
-    "    } catch(e) {}\n"
+    "    const motionPerm = await requestSensorPermission('DeviceMotionEvent');\n"
+    "    const orientPerm = await requestSensorPermission('DeviceOrientationEvent');\n"
+    "    // Install best-effort listeners even on plain HTTP.  Some browsers expose\n"
+    "    // sensor data without a secure context, and the listener is harmless if not.\n"
+    "    if (motionPerm !== 'denied') installDeviceMotionListener();\n"
+    "    if (orientPerm !== 'denied') installDeviceOrientationFallback();\n"
     "}\n"
     "function handleRumbleMessage(data) {\n"
     "    if (!(data instanceof ArrayBuffer) || data.byteLength < 8) return;\n"
@@ -1541,6 +1608,10 @@ static const char INDEX_HTML[] =
     "    if (v.getUint32(0, true) !== RUMBLE_MAGIC) return;\n"
     "    const idx = v.getUint8(4), low = v.getUint8(5), high = v.getUint8(6), dur = v.getUint8(7) * 10;\n"
     "    playRumble(idx, low, high, dur);\n"
+    "}\n"
+    "function makeWsUrl() {\n"
+    "    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';\n"
+    "    return `${proto}//${window.location.host}/`;\n"
     "}\n"
     "function buildAndSendPacket() {\n"
     "    if (!ws || ws.readyState !== WebSocket.OPEN) return;\n"
@@ -1553,21 +1624,27 @@ static const char INDEX_HTML[] =
     "    let slotStates = [null, null, null, null];\n"
     "    let uiText = [\"\", \"\", \"\", \"\"];\n"
     "    let nextRumbleTargets = [null, null, null, null];\n"
+    "    let nextRumbleTargetIndexes = [-1, -1, -1, -1];\n"
+    "    let slotPresent = [false, false, false, false];\n"
     "    if (mode === 0) {\n"
     "        for (let i = 0; i < 4; i++) {\n"
     "            let pad = activePads[i];\n"
     "            let gp = getGamepadState(pad);\n"
     "            slotStates[i] = gp || getNeutralState();\n"
     "            nextRumbleTargets[i] = gp ? pad : null;\n"
+    "            nextRumbleTargetIndexes[i] = gp ? pad.index : -1;\n"
+    "            slotPresent[i] = !!gp;\n"
     "            uiText[i] = gp ? \"Connected\" : \"Not connected\";\n"
     "        }\n"
     "    } else if (mode === 1) {\n"
-    "        slotStates[0] = kbState; uiText[0] = `Keyboard (Connected)`;\n"
+    "        slotStates[0] = kbState; slotPresent[0] = true; uiText[0] = `Keyboard (Connected)`;\n"
     "        for (let i = 1; i < 4; i++) {\n"
     "            let pad = activePads[i - 1];\n"
     "            let gp = getGamepadState(pad);\n"
     "            slotStates[i] = gp || getNeutralState();\n"
     "            nextRumbleTargets[i] = gp ? pad : null;\n"
+    "            nextRumbleTargetIndexes[i] = gp ? pad.index : -1;\n"
+    "            slotPresent[i] = !!gp;\n"
     "            uiText[i] = gp ? \"Connected\" : \"Not connected\";\n"
     "        }\n"
     "    } else if (mode === 2) {\n"
@@ -1575,16 +1652,21 @@ static const char INDEX_HTML[] =
     "        let gp0 = getGamepadState(pad0);\n"
     "        slotStates[0] = mergeStates(kbState, gp0 || getNeutralState());\n"
     "        nextRumbleTargets[0] = gp0 ? pad0 : null;\n"
+    "        nextRumbleTargetIndexes[0] = gp0 ? pad0.index : -1;\n"
+    "        slotPresent[0] = true;\n"
     "        uiText[0] = `${gp0 ? \"Connected\" : \"Not connected\"} \\ Keyboard`;\n"
     "        for (let i = 1; i < 4; i++) {\n"
     "            let pad = activePads[i];\n"
     "            let gp = getGamepadState(pad);\n"
     "            slotStates[i] = gp || getNeutralState();\n"
     "            nextRumbleTargets[i] = gp ? pad : null;\n"
+    "            nextRumbleTargetIndexes[i] = gp ? pad.index : -1;\n"
+    "            slotPresent[i] = !!gp;\n"
     "            uiText[i] = gp ? \"Connected\" : \"Not connected\";\n"
     "        }\n"
     "    }\n"
     "    rumbleTargets = nextRumbleTargets;\n"
+    "    rumbleTargetIndexes = nextRumbleTargetIndexes;\n"
     "    const buffer = new ArrayBuffer(PACKET_SIZE), view = new DataView(buffer);\n"
     "    view.setUint32(0, PROTO_MAGIC, true); view.setUint8(4, PROTO_VERSION); view.setUint8(5, 0);\n"
     "    view.setUint16(6, 0, true); view.setUint32(8, seqCounter++, true); view.setBigUint64(12, BigInt(Date.now() * 1000), true);\n"
@@ -1596,7 +1678,7 @@ static const char INDEX_HTML[] =
     "        view.setUint8(offset + 2, slotStates[p].hat);\n"
     "        view.setUint8(offset + 3, slotStates[p].lx); view.setUint8(offset + 4, slotStates[p].ly);\n"
     "        view.setUint8(offset + 5, slotStates[p].rx); view.setUint8(offset + 6, slotStates[p].ry);\n"
-    "        view.setUint8(offset + 7, 0);\n"
+    "        view.setUint8(offset + 7, slotPresent[p] ? PAD_PRESENT : 0);\n"
     "        if (p === 0 && motion.enabled) {\n"
     "            view.setInt16(offset + 8, motion.ax, true); view.setInt16(offset + 10, motion.ay, true); view.setInt16(offset + 12, motion.az, true);\n"
     "            view.setInt16(offset + 14, motion.gx, true); view.setInt16(offset + 16, motion.gy, true); view.setInt16(offset + 18, motion.gz, true);\n"
@@ -1616,7 +1698,7 @@ static const char INDEX_HTML[] =
     "        return;\n"
     "    }\n"
     "    await enableMotion();\n"
-    "    const wsUrl = window.location.protocol === 'https:' ? `wss://${window.location.host}` : `ws://${window.location.host}`;\n"
+    "    const wsUrl = makeWsUrl();\n"
     "    ws = new WebSocket(wsUrl); ws.binaryType = \"arraybuffer\";\n"
     "    ws.onmessage = (ev) => handleRumbleMessage(ev.data);\n"
     "    ws.onopen = () => {\n"
@@ -1802,6 +1884,7 @@ static const char MOBILE_HTML[] =
     "}\n"
     "applyLayout();\n"
     "const PROTO_MAGIC = 0x4E535743, PROTO_VERSION = 5, RUMBLE_MAGIC = 0x4E535652;\n"
+    "const PAD_PRESENT = 1;\n"
     "const FLAG_SINGLE_PAD = 0x04;\n"
     "const EXT_REPORT_SIZE = 24, PACKET_SIZE = 116;\n"
     "const BTN_MINUS = 1<<8, BTN_PLUS = 1<<9, BTN_LSTICK = 1<<10, BTN_RSTICK = 1<<11;\n"
@@ -1922,11 +2005,13 @@ static const char MOBILE_HTML[] =
     "async function requestSensorPermission(apiName) {\n"
     "    const Api = window[apiName];\n"
     "    if (typeof Api === 'undefined') return 'unavailable';\n"
-    "    if (typeof Api.requestPermission === 'function') return await Api.requestPermission();\n"
+    "    if (typeof Api.requestPermission === 'function') {\n"
+    "        try { return await Api.requestPermission(); } catch(e) { motionWarn(`${apiName} permission error: ${e && e.message ? e.message : e}`); return 'error'; }\n"
+    "    }\n"
     "    return 'granted';\n"
     "}\n"
     "function installDeviceMotionListener() {\n"
-    "    if (motionListenerInstalled) return;\n"
+    "    if (motionListenerInstalled || typeof DeviceMotionEvent === 'undefined') return;\n"
     "    motionListenerInstalled = true;\n"
     "    window.addEventListener('devicemotion', e => {\n"
     "        lastDeviceMotionMs = Date.now();\n"
@@ -1942,12 +2027,9 @@ static const char MOBILE_HTML[] =
     "    }, {passive:true});\n"
     "}\n"
     "function installDeviceOrientationFallback() {\n"
-    "    if (orientationListenerInstalled) return;\n"
+    "    if (orientationListenerInstalled || typeof DeviceOrientationEvent === 'undefined') return;\n"
     "    orientationListenerInstalled = true;\n"
     "    window.addEventListener('deviceorientation', e => {\n"
-    "        // Prefer real devicemotion.rotationRate when it is flowing.  This fallback\n"
-    "        // still makes iOS WebKit send changing gyro-ish values on devices/browsers\n"
-    "        // where rotationRate is missing but orientation is available.\n"
     "        if (Date.now() - lastDeviceMotionMs < 250) return;\n"
     "        motion.enabled = true;\n"
     "        motion.gx = clamp16((e.beta  || 0) * 16);\n"
@@ -1956,30 +2038,24 @@ static const char MOBILE_HTML[] =
     "    }, {passive:true});\n"
     "}\n"
     "async function enableMotion() {\n"
-    "    try {\n"
-    "        if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {\n"
-    "            alert('Gyroscope needs HTTPS on iPhone. Open the HTTPS address for this page.');\n"
-    "            return;\n"
-    "        }\n"
-    "        const motionPerm = await requestSensorPermission('DeviceMotionEvent');\n"
-    "        const orientPerm = await requestSensorPermission('DeviceOrientationEvent');\n"
-    "        if (motionPerm === 'granted') installDeviceMotionListener();\n"
-    "        if (orientPerm === 'granted') installDeviceOrientationFallback();\n"
-    "        if (motionPerm !== 'granted' && orientPerm !== 'granted') {\n"
-    "            alert('Motion/orientation permission was not granted, so gyro will stay disabled.');\n"
-    "        }\n"
-    "    } catch(e) {\n"
-    "        motionWarn(e && e.message ? e.message : e);\n"
-    "        alert('Could not enable motion sensors. On iPhone, allow Motion & Orientation Access for Safari and use HTTPS.');\n"
-    "    }\n"
+    "    const motionPerm = await requestSensorPermission('DeviceMotionEvent');\n"
+    "    const orientPerm = await requestSensorPermission('DeviceOrientationEvent');\n"
+    "    // Best-effort on both HTTP and HTTPS.  If a browser allows sensors on HTTP,\n"
+    "    // this will use them; if it does not, the events simply will not fire.\n"
+    "    if (motionPerm !== 'denied') installDeviceMotionListener();\n"
+    "    if (orientPerm !== 'denied') installDeviceOrientationFallback();\n"
     "}\n"
     "function handleRumbleMessage(data) {\n"
     "    if (!(data instanceof ArrayBuffer) || data.byteLength < 8) return;\n"
     "    const v = new DataView(data); if (v.getUint32(0, true) !== RUMBLE_MAGIC) return;\n"
-    "    const low = v.getUint8(5), high = v.getUint8(6), dur = v.getUint8(7) * 10;\n"
+    "    const low = v.getUint8(5), high = v.getUint8(6), dur = Math.max(60, v.getUint8(7) * 10);\n"
     "    const pulse = document.getElementById('rumblePulse');\n"
-    "    if (pulse) { pulse.style.display = (low || high) ? 'block' : 'none'; pulse.classList.add('active'); setTimeout(() => pulse.classList.remove('active'), Math.max(60, Math.min(dur || 60, 180))); }\n"
-    "    if (navigator.vibrate && dur > 0 && (low || high)) navigator.vibrate(dur);\n"
+    "    if (pulse) { pulse.style.display = (low || high) ? 'block' : 'none'; pulse.classList.add('active'); setTimeout(() => pulse.classList.remove('active'), Math.max(60, Math.min(dur, 220))); }\n"
+    "    if (navigator.vibrate && dur > 0 && (low || high)) navigator.vibrate([dur]);\n"
+    "}\n"
+    "function makeWsUrl() {\n"
+    "    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';\n"
+    "    return `${proto}//${window.location.host}/`;\n"
     "}\n"
     "function setupJoystick(baseId, knobId, axisX, axisY) {\n"
     "    const base = document.getElementById(baseId), knob = document.getElementById(knobId);\n"
@@ -2026,7 +2102,7 @@ static const char MOBILE_HTML[] =
     "    let off = 20;\n"
     "    const sendButtons = normalizeSystemShortcuts(state.buttons);\n"
     "    view.setUint16(off, sendButtons, true); view.setUint8(off+2, state.hat);\n"
-    "    view.setUint8(off+3, state.lx); view.setUint8(off+4, state.ly); view.setUint8(off+5, state.rx); view.setUint8(off+6, state.ry); view.setUint8(off+7, 0);\n"
+    "    view.setUint8(off+3, state.lx); view.setUint8(off+4, state.ly); view.setUint8(off+5, state.rx); view.setUint8(off+6, state.ry); view.setUint8(off+7, PAD_PRESENT);\n"
     "    view.setInt16(off+8, motion.ax, true); view.setInt16(off+10, motion.ay, true); view.setInt16(off+12, motion.az, true);\n"
     "    view.setInt16(off+14, motion.gx, true); view.setInt16(off+16, motion.gy, true); view.setInt16(off+18, motion.gz, true);\n"
     "    view.setUint8(off+20, motion.enabled ? 1 : 0); view.setUint8(off+21, 0); view.setUint8(off+22, 0); view.setUint8(off+23, 0);\n"
@@ -2041,7 +2117,7 @@ static const char MOBILE_HTML[] =
     "    if (isConnected) { ws.close(); return; }\n"
     "    await enableMotion();\n"
     "    if (document.documentElement.requestFullscreen) { document.documentElement.requestFullscreen().catch(()=>{}); }\n"
-    "    const wsUrl = window.location.protocol === 'https:' ? `wss://${window.location.host}` : `ws://${window.location.host}`;\n"
+    "    const wsUrl = makeWsUrl();\n"
     "    ws = new WebSocket(wsUrl); ws.binaryType = \"arraybuffer\";\n"
     "    ws.onmessage = (ev) => handleRumbleMessage(ev.data);\n"
     "    ws.onopen = () => {\n"
@@ -2505,13 +2581,20 @@ static size_t process_ws_frame(WebClient *c) {
 
     ExtendedMultiReport report;
     report.reset();
+    bool pad_present[4] = {};
 
     if (ver == PROTO_VERSION && flen == PACKET_SIZE) {
         MultiReport legacy;
         memcpy(&legacy, payload + 20, sizeof(MultiReport));
         legacy_multi_to_extended(legacy, report);
+        pad_present[0] = !extended_is_neutral(report.p1);
+        pad_present[1] = !extended_is_neutral(report.p2);
+        pad_present[2] = !extended_is_neutral(report.p3);
+        pad_present[3] = !extended_is_neutral(report.p4);
     } else if (ver == WEB_PROTO_VERSION && flen == WEB_PACKET_SIZE) {
         memcpy(&report, payload + 20, sizeof(ExtendedMultiReport));
+        for (int s = 0; s < 4; ++s)
+            pad_present[s] = (payload[20 + s * sizeof(ExtendedHIDReport) + 7] & 0x01) != 0;
         if (flags & FLAG_SINGLE_PAD) {
             // The mobile touch page is one virtual controller only.  Force the
             // unused subpads to neutral so a malformed/old cached mobile packet
@@ -2519,6 +2602,10 @@ static size_t process_ws_frame(WebClient *c) {
             report.p2.reset();
             report.p3.reset();
             report.p4.reset();
+            pad_present[0] = true;
+            pad_present[1] = false;
+            pad_present[2] = false;
+            pad_present[3] = false;
         }
     } else {
         return total;
@@ -2546,6 +2633,9 @@ static size_t process_ws_frame(WebClient *c) {
                 g_clients[i].active = true;
                 g_clients[i].first_pkt = true;
                 g_clients[i].report.reset();
+                g_clients[i].uses_pad_presence = true;
+                for (int s = 0; s < 4; ++s)
+                    g_clients[i].pad_present[s] = false;
                 g_clients[i].last_rx_us = now;
                 for (int s = 0; s < 4; ++s)
                     c->last_rumble_seq[s] = g_clients[i].rumble_seq[s];
@@ -2555,10 +2645,15 @@ static size_t process_ws_frame(WebClient *c) {
     }
     if (c->ws_slot >= 0) {
         std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
-        if (is_reset)
+        if (is_reset) {
             g_clients[c->ws_slot].report.reset();
-        else
+            for (int s = 0; s < 4; ++s)
+                g_clients[c->ws_slot].pad_present[s] = false;
+        } else {
             g_clients[c->ws_slot].report = report;
+            for (int s = 0; s < 4; ++s)
+                g_clients[c->ws_slot].pad_present[s] = pad_present[s];
+        }
         g_clients[c->ws_slot].last_rx_us = now;
     }
     c->ws_last_rx = now;
@@ -2945,8 +3040,13 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
                 clients[i].wbuf = nullptr;
                 if (clients[i].ws_slot >= 0) {
                     std::lock_guard<std::mutex> lk(g_mtx[clients[i].ws_slot]);
-                    if (g_clients[clients[i].ws_slot].last_rx_us == clients[i].ws_last_rx)
+                    if (g_clients[clients[i].ws_slot].last_rx_us == clients[i].ws_last_rx) {
                         g_clients[clients[i].ws_slot].active = false;
+                        g_clients[clients[i].ws_slot].report.reset();
+                        g_clients[clients[i].ws_slot].uses_pad_presence = false;
+                        for (int s = 0; s < 4; ++s)
+                            g_clients[clients[i].ws_slot].pad_present[s] = false;
+                    }
                 }
                 if (g_verbose) std::printf("[web] client %d closed\n", clients[i].fd);
                 close(clients[i].fd);
@@ -2966,8 +3066,13 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
             free(clients[i].wbuf);
             if (clients[i].ws_slot >= 0) {
                 std::lock_guard<std::mutex> lk(g_mtx[clients[i].ws_slot]);
-                if (g_clients[clients[i].ws_slot].last_rx_us == clients[i].ws_last_rx)
+                if (g_clients[clients[i].ws_slot].last_rx_us == clients[i].ws_last_rx) {
                     g_clients[clients[i].ws_slot].active = false;
+                    g_clients[clients[i].ws_slot].report.reset();
+                    g_clients[clients[i].ws_slot].uses_pad_presence = false;
+                    for (int s = 0; s < 4; ++s)
+                        g_clients[clients[i].ws_slot].pad_present[s] = false;
+                }
             }
             close(clients[i].fd);
         }
@@ -3103,6 +3208,9 @@ int main(int argc, char** argv) {
                     g_clients[i].addr = sender;
                     g_clients[i].first_pkt = true;
                     g_clients[i].report.reset();
+                    g_clients[i].uses_pad_presence = false;
+                    for (int s = 0; s < 4; ++s)
+                        g_clients[i].pad_present[s] = false;
                     g_clients[i].last_rx_us = now;
                     if (g_verbose) std::printf("New PC accepted into Server Slot %d/4\n", i+1);
                     break;
