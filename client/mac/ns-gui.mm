@@ -1038,6 +1038,143 @@ static void pump_udp_rumble(int sock, RumbleManager& rumble, const int controlle
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Mac GUI macro storage / upload / live recording helpers
+// ─────────────────────────────────────────────────────────────────────────────
+static std::mutex g_macroUploadMutex;
+static std::string g_macroUploadPending;
+
+static std::mutex g_macroRecordMutex;
+static bool g_macroRecording = false;
+static uint16_t g_macroRecordLastButtons = 0xFFFF;
+static uint64_t g_macroRecordLastChangeUs = 0;
+static std::string g_macroRecordCommands;
+
+static NSString* const kMacroDefaultsKey = @"macrosJson";
+
+static std::string LoadMacroTextMac() {
+    NSString* saved = [[NSUserDefaults standardUserDefaults] stringForKey:kMacroDefaultsKey];
+    if (!saved) return std::string();
+    return std::string([saved UTF8String]);
+}
+
+static void ShowMacroErrorMac(const std::string& msg) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSAlert* a = [[NSAlert alloc] init];
+        [a setMessageText:@"Macro validation"];
+        [a setInformativeText:[NSString stringWithUTF8String:msg.c_str()]];
+        [a addButtonWithTitle:@"OK"];
+        [a runModal];
+    });
+}
+
+static bool SaveMacroTextMac(const std::string& txt) {
+    if (macro_trim(txt).empty()) {
+        [[NSUserDefaults standardUserDefaults] setObject:@"" forKey:kMacroDefaultsKey];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        return true;
+    }
+
+    std::string pretty, err;
+    if (!macro_validate_to_pretty_json(txt, pretty, err, "Macro")) {
+        ShowMacroErrorMac("Invalid macro: " + err);
+        return false;
+    }
+    NSString* ns = [NSString stringWithUTF8String:pretty.c_str()];
+    [[NSUserDefaults standardUserDefaults] setObject:ns forKey:kMacroDefaultsKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    return true;
+}
+
+static bool StartMacroTextMac(const std::string& txt) {
+    std::vector<MacroStep> parsed;
+    if (!macro_validate_text(txt, parsed, nullptr)) {
+        ShowMacroErrorMac("Invalid macro: " + macro_last_error());
+        return false;
+    }
+
+    // Modern servers execute macros server-side and merge them with live input.
+    // Queue the exact validated JSON/command text for the sender thread to upload.
+    std::lock_guard<std::mutex> lk(g_macroUploadMutex);
+    g_macroUploadPending = txt;
+    return true;
+}
+
+static std::string MacroButtonsToTextMac(uint16_t buttons) {
+    struct BtnName { uint16_t bit; const char* name; } names[] = {
+        {ns::BTN_A, "A"}, {ns::BTN_B, "B"}, {ns::BTN_X, "X"}, {ns::BTN_Y, "Y"},
+        {ns::BTN_L, "L"}, {ns::BTN_R, "R"}, {ns::BTN_ZL, "ZL"}, {ns::BTN_ZR, "ZR"},
+        {ns::BTN_MINUS, "MINUS"}, {ns::BTN_PLUS, "PLUS"},
+        {ns::BTN_LSTICK, "LSTICK"}, {ns::BTN_RSTICK, "RSTICK"},
+        {ns::BTN_HOME, "HOME"}, {ns::BTN_CAPTURE, "CAPTURE"},
+    };
+    std::string out;
+    for (const auto& n : names) {
+        if (buttons & n.bit) {
+            if (!out.empty()) out += "+";
+            out += n.name;
+        }
+    }
+    return out;
+}
+
+static void MacroRecordAppendMacLocked(uint16_t buttons, uint64_t duration_ms) {
+    if (duration_ms < 10) return;
+    if (!g_macroRecordCommands.empty()) g_macroRecordCommands += "; ";
+    if (buttons == 0) {
+        g_macroRecordCommands += "WAIT " + std::to_string(duration_ms);
+    } else {
+        std::string combo = MacroButtonsToTextMac(buttons);
+        if (combo.empty()) combo = "WAIT";
+        g_macroRecordCommands += combo + " " + std::to_string(duration_ms);
+    }
+}
+
+static void StartMacroRecordingMac() {
+    std::lock_guard<std::mutex> lk(g_macroRecordMutex);
+    g_macroRecording = true;
+    g_macroRecordLastButtons = 0xFFFF;
+    g_macroRecordLastChangeUs = ns::now_us();
+    g_macroRecordCommands.clear();
+}
+
+static std::string StopMacroRecordingMac() {
+    std::lock_guard<std::mutex> lk(g_macroRecordMutex);
+    if (g_macroRecording && g_macroRecordLastButtons != 0xFFFF) {
+        uint64_t now = ns::now_us();
+        MacroRecordAppendMacLocked(g_macroRecordLastButtons, (now - g_macroRecordLastChangeUs) / 1000ULL);
+    }
+    g_macroRecording = false;
+    g_macroRecordLastButtons = 0xFFFF;
+    std::string commands = g_macroRecordCommands.empty() ? "WAIT 200" : g_macroRecordCommands;
+    return macro_pretty_json(commands, "Recorded Macro");
+}
+
+static void SampleMacroRecordingMac(const ns::HIDReport& report) {
+    std::lock_guard<std::mutex> lk(g_macroRecordMutex);
+    if (!g_macroRecording) return;
+    uint64_t now = ns::now_us();
+    uint16_t buttons = report.buttons;
+    if (g_macroRecordLastButtons == 0xFFFF) {
+        g_macroRecordLastButtons = buttons;
+        g_macroRecordLastChangeUs = now;
+        return;
+    }
+    if (buttons != g_macroRecordLastButtons) {
+        MacroRecordAppendMacLocked(g_macroRecordLastButtons, (now - g_macroRecordLastChangeUs) / 1000ULL);
+        g_macroRecordLastButtons = buttons;
+        g_macroRecordLastChangeUs = now;
+    }
+}
+
+static bool ApplyMacroOverrideMac(ns::HIDReport[4], bool[4], bool[4], int[4]) {
+    // Server-side macros merge with live input in the backend. The mac GUI keeps
+    // this hook as a no-op so old generated call sites compile without causing
+    // duplicate local playback on modern servers.
+    return false;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  App Delegate (GUI and Core Logic)
 // ─────────────────────────────────────────────────────────────────────────────
 
