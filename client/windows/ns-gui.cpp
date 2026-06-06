@@ -28,6 +28,9 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <sstream>
+#include <cctype>
+#include <fstream>
 #include <unordered_map>
 #include <array>
 #include <mutex>
@@ -115,6 +118,144 @@ inline uint64_t now_us() noexcept {
 #include "../../server/rpi/include/sha256.h"
 
 static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
+
+// ── Macro support ───────────────────────────────────────────────────────────
+struct MacroStep {
+    uint16_t buttons = 0;
+    uint32_t duration_ms = 0;
+};
+
+static std::string macro_trim(std::string s) {
+    auto not_space = [](unsigned char c){ return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    return s;
+}
+
+static std::string macro_upper(std::string s) {
+    for (char& c : s) c = (char)std::toupper((unsigned char)c);
+    return s;
+}
+
+static std::string macro_read_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return "";
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static std::string macro_unescape_json_string(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char n = s[++i];
+            if (n == 'n') out += '\n';
+            else if (n == 't') out += '\t';
+            else out += n;
+        } else out += s[i];
+    }
+    return out;
+}
+
+static std::string macro_extract_commands_text(const std::string& raw) {
+    size_t key = raw.find("\"commands\"");
+    if (key == std::string::npos) key = raw.find("commands");
+    if (key != std::string::npos) {
+        size_t colon = raw.find(':', key);
+        if (colon != std::string::npos) {
+            size_t q1 = raw.find('"', colon + 1);
+            if (q1 != std::string::npos) {
+                std::string val;
+                bool esc = false;
+                for (size_t i = q1 + 1; i < raw.size(); ++i) {
+                    char c = raw[i];
+                    if (esc) { val += '\\'; val += c; esc = false; continue; }
+                    if (c == '\\') { esc = true; continue; }
+                    if (c == '"') return macro_unescape_json_string(val);
+                    val += c;
+                }
+            }
+        }
+    }
+    return raw;
+}
+
+static uint16_t macro_button_bit(std::string name) {
+    name = macro_upper(macro_trim(name));
+    if (name == "A" || name == "BTN_A") return ns::BTN_A;
+    if (name == "B" || name == "BTN_B") return ns::BTN_B;
+    if (name == "X" || name == "BTN_X") return ns::BTN_X;
+    if (name == "Y" || name == "BTN_Y") return ns::BTN_Y;
+    if (name == "L" || name == "BTN_L") return ns::BTN_L;
+    if (name == "R" || name == "BTN_R") return ns::BTN_R;
+    if (name == "ZL" || name == "BTN_ZL") return ns::BTN_ZL;
+    if (name == "ZR" || name == "BTN_ZR") return ns::BTN_ZR;
+    if (name == "MINUS" || name == "-" || name == "BTN_MINUS") return ns::BTN_MINUS;
+    if (name == "PLUS" || name == "+" || name == "BTN_PLUS") return ns::BTN_PLUS;
+    if (name == "LSTICK" || name == "LS" || name == "BTN_LSTICK") return ns::BTN_LSTICK;
+    if (name == "RSTICK" || name == "RS" || name == "BTN_RSTICK") return ns::BTN_RSTICK;
+    if (name == "HOME" || name == "BTN_HOME") return ns::BTN_HOME;
+    if (name == "CAPTURE" || name == "BTN_CAPTURE") return ns::BTN_CAPTURE;
+    return 0;
+}
+
+static uint16_t macro_parse_buttons(std::string combo) {
+    for (char& c : combo) if (c == '+' || c == ',' || c == '|') c = ' ';
+    std::istringstream iss(combo);
+    std::string tok;
+    uint16_t buttons = 0;
+    while (iss >> tok) buttons |= macro_button_bit(tok);
+    return buttons;
+}
+
+static std::vector<MacroStep> macro_parse_text(const std::string& raw_text) {
+    std::string text = macro_extract_commands_text(raw_text);
+    for (char& c : text) if (c == '\n' || c == '\r') c = ';';
+    std::vector<MacroStep> steps;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t semi = text.find(';', pos);
+        std::string part = macro_trim(text.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos));
+        pos = (semi == std::string::npos) ? text.size() : semi + 1;
+        if (part.empty()) continue;
+        std::istringstream iss(part);
+        std::string cmd;
+        uint32_t ms = 0;
+        iss >> cmd >> ms;
+        if (cmd.empty() || ms == 0) continue;
+        MacroStep st;
+        if (macro_upper(cmd) == "WAIT") st.buttons = 0;
+        else st.buttons = macro_parse_buttons(cmd);
+        st.duration_ms = ms;
+        steps.push_back(st);
+    }
+    return steps;
+}
+
+static std::vector<MacroStep> macro_load_file(const std::string& path) {
+    return macro_parse_text(macro_read_file(path));
+}
+
+static uint64_t macro_total_ms(const std::vector<MacroStep>& steps) {
+    uint64_t total = 0;
+    for (const auto& s : steps) total += s.duration_ms;
+    return total;
+}
+
+static bool macro_report_at(const std::vector<MacroStep>& steps, uint64_t elapsed_ms, ns::HIDReport& out) {
+    out.reset();
+    uint64_t t = 0;
+    for (const auto& s : steps) {
+        if (elapsed_ms < t + s.duration_ms) {
+            out.buttons = s.buttons;
+            return true;
+        }
+        t += s.duration_ms;
+    }
+    return false;
+}
+
 
 #pragma pack(push, 1)
 struct ExtendedUdpPacket {
@@ -702,6 +843,7 @@ static HINSTANCE g_hInst = nullptr;
 static HWND g_hWnd = nullptr;
 static HWND g_hIpEdit = nullptr;
 static HWND g_hConnectBtn = nullptr;
+static HWND g_hMacrosBtn = nullptr;
 static HWND g_hStatusText = nullptr;
 static HWND g_hP1Text = nullptr;
 static HWND g_hP2Text = nullptr;
@@ -833,8 +975,172 @@ static void SaveKeyboardMode(int mode) {
     }
 }
 
+
+enum { IDC_IP = 101, IDC_CONNECT, IDC_KEYBOARD_COMBO = 110, IDC_BINDINGS_BTN = 111, IDC_MACROS_BTN = 112, IDC_EDITOR_CHANGE = 200, IDC_EDITOR_SETUP = 400, IDC_EDITOR_RESET = 500, IDC_EDITOR_KEY_START = 300, IDC_MACRO_EDIT = 600, IDC_MACRO_RUN = 601, IDC_MACRO_SAVE = 602, IDC_MACRO_DELETE = 603, IDC_MACRO_CLOSE = 604, IDC_MACRO_RECORD_START = 605, IDC_MACRO_RECORD_STOP = 606 };
+static HWND CreateButton(HWND parent, const wchar_t* text, int x, int y, int w, int h, int id);
+
+// ── Macro runtime/editor ────────────────────────────────────────────────────
+static std::mutex g_macro_mtx;
+static std::vector<MacroStep> g_macro_steps;
+static bool g_macro_running = false;
+static uint64_t g_macro_start_us = 0;
+static std::string g_macro_text;
+static HWND g_hMacroEdit = nullptr;
+static const wchar_t* REG_VAL_MACROS = L"MacrosJson";
+
+static std::string LoadSavedMacrosText() {
+    HKEY hKey = nullptr;
+    std::string out;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[8192]{}; DWORD len = sizeof(buf); DWORD type = 0;
+        if (RegQueryValueExW(hKey, REG_VAL_MACROS, nullptr, &type, (LPBYTE)buf, &len) == ERROR_SUCCESS && type == REG_SZ)
+            out = narrow(buf);
+        RegCloseKey(hKey);
+    }
+    return out;
+}
+static void SaveMacrosText(const std::string& txt) {
+    HKEY hKey = nullptr;
+    if (RegCreateKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        std::wstring w = widen(txt);
+        RegSetValueExW(hKey, REG_VAL_MACROS, 0, REG_SZ, (const BYTE*)w.c_str(), (DWORD)((w.size()+1)*sizeof(wchar_t)));
+        RegCloseKey(hKey);
+    }
+    g_macro_text = txt;
+}
+static void StartMacroText(const std::string& txt) {
+    std::lock_guard<std::mutex> lk(g_macro_mtx);
+    g_macro_steps = macro_parse_text(txt);
+    g_macro_running = !g_macro_steps.empty();
+    g_macro_start_us = ns::now_us();
+}
+
+static bool g_macro_recording = false;
+static uint16_t g_macro_record_last_buttons = 0xFFFF;
+static uint64_t g_macro_record_last_change_us = 0;
+static std::string g_macro_record_commands;
+
+static std::string macro_buttons_to_text(uint16_t buttons) {
+    struct BtnName { uint16_t bit; const char* name; } names[] = {
+        {ns::BTN_A, "A"}, {ns::BTN_B, "B"}, {ns::BTN_X, "X"}, {ns::BTN_Y, "Y"},
+        {ns::BTN_L, "L"}, {ns::BTN_R, "R"}, {ns::BTN_ZL, "ZL"}, {ns::BTN_ZR, "ZR"},
+        {ns::BTN_MINUS, "MINUS"}, {ns::BTN_PLUS, "PLUS"},
+        {ns::BTN_LSTICK, "LSTICK"}, {ns::BTN_RSTICK, "RSTICK"},
+        {ns::BTN_HOME, "HOME"}, {ns::BTN_CAPTURE, "CAPTURE"},
+    };
+    std::string out;
+    for (const auto& n : names) {
+        if (buttons & n.bit) {
+            if (!out.empty()) out += "+";
+            out += n.name;
+        }
+    }
+    return out;
+}
+
+static void MacroRecordAppendLocked(uint16_t buttons, uint64_t duration_ms) {
+    if (duration_ms < 10) return;
+    if (!g_macro_record_commands.empty()) g_macro_record_commands += "; ";
+    if (buttons == 0) {
+        g_macro_record_commands += "WAIT " + std::to_string(duration_ms);
+    } else {
+        std::string combo = macro_buttons_to_text(buttons);
+        if (combo.empty()) combo = "WAIT";
+        g_macro_record_commands += combo + " " + std::to_string(duration_ms);
+    }
+}
+
+static void MacroRecordStart() {
+    std::lock_guard<std::mutex> lk(g_macro_mtx);
+    g_macro_recording = true;
+    g_macro_record_last_buttons = 0xFFFF;
+    g_macro_record_last_change_us = ns::now_us();
+    g_macro_record_commands.clear();
+}
+
+static std::string MacroRecordStop() {
+    std::lock_guard<std::mutex> lk(g_macro_mtx);
+    if (g_macro_recording && g_macro_record_last_buttons != 0xFFFF) {
+        uint64_t now = ns::now_us();
+        MacroRecordAppendLocked(g_macro_record_last_buttons, (now - g_macro_record_last_change_us) / 1000ULL);
+    }
+    g_macro_recording = false;
+    g_macro_record_last_buttons = 0xFFFF;
+    std::string commands = g_macro_record_commands.empty() ? "WAIT 200" : g_macro_record_commands;
+    return std::string("{\"name\":\"Recorded Macro\",\"commands\":\"") + commands + "\"}";
+}
+
+static void MacroRecordSample(const ns::HIDReport& report) {
+    std::lock_guard<std::mutex> lk(g_macro_mtx);
+    if (!g_macro_recording || g_macro_running) return;
+    uint64_t now = ns::now_us();
+    uint16_t buttons = report.buttons;
+    if (g_macro_record_last_buttons == 0xFFFF) {
+        g_macro_record_last_buttons = buttons;
+        g_macro_record_last_change_us = now;
+        return;
+    }
+    if (buttons != g_macro_record_last_buttons) {
+        MacroRecordAppendLocked(g_macro_record_last_buttons, (now - g_macro_record_last_change_us) / 1000ULL);
+        g_macro_record_last_buttons = buttons;
+        g_macro_record_last_change_us = now;
+    }
+}
+static bool ApplyMacroOverride(ns::HIDReport logicalReports[4], bool present[4], bool hasMotion[4], int xinputForSlot[4], int rawForSlot[4]) {
+    std::lock_guard<std::mutex> lk(g_macro_mtx);
+    if (!g_macro_running) return false;
+    uint64_t elapsed_ms = (ns::now_us() - g_macro_start_us) / 1000ULL;
+    ns::HIDReport mr; bool active = macro_report_at(g_macro_steps, elapsed_ms, mr);
+    for (int i = 0; i < 4; ++i) { logicalReports[i].reset(); present[i] = false; hasMotion[i] = false; xinputForSlot[i] = rawForSlot[i] = -1; }
+    logicalReports[0] = mr; present[0] = true;
+    if (!active && elapsed_ms > macro_total_ms(g_macro_steps) + 120) g_macro_running = false;
+    return true;
+}
+static std::string GetMacroEditText() {
+    int len = GetWindowTextLengthW(g_hMacroEdit);
+    std::wstring w((size_t)len, L'\0');
+    GetWindowTextW(g_hMacroEdit, &w[0], len + 1);
+    return narrow(w.c_str());
+}
+static LRESULT CALLBACK MacroEditorProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        HFONT font = CreateFont(14,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Consolas");
+        CreateWindowW(L"STATIC", L"JSON/commands, or record live P1 buttons while connected.", WS_VISIBLE|WS_CHILD, 12, 10, 560, 20, hWnd, nullptr, g_hInst, nullptr);
+        g_hMacroEdit = CreateWindowW(L"EDIT", L"", WS_VISIBLE|WS_CHILD|WS_BORDER|ES_LEFT|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL, 12, 36, 560, 170, hWnd, (HMENU)IDC_MACRO_EDIT, g_hInst, nullptr);
+        SendMessage(g_hMacroEdit, WM_SETFONT, (WPARAM)font, TRUE);
+        g_macro_text = LoadSavedMacrosText();
+        std::wstring initial = widen(g_macro_text.empty() ? "{\"name\":\"Macro\",\"commands\":\"WAIT 200; A 100; B 100\"}" : g_macro_text);
+        SetWindowTextW(g_hMacroEdit, initial.c_str());
+        CreateButton(hWnd, L"Run", 12, 218, 82, 28, IDC_MACRO_RUN);
+        CreateButton(hWnd, L"Save/Add", 104, 218, 92, 28, IDC_MACRO_SAVE);
+        CreateButton(hWnd, L"Delete", 206, 218, 82, 28, IDC_MACRO_DELETE);
+        CreateButton(hWnd, L"Record", 298, 218, 82, 28, IDC_MACRO_RECORD_START);
+        CreateButton(hWnd, L"Stop Rec", 390, 218, 90, 28, IDC_MACRO_RECORD_STOP);
+        CreateButton(hWnd, L"Close", 490, 218, 82, 28, IDC_MACRO_CLOSE);
+        break;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        if (id == IDC_MACRO_RUN) StartMacroText(GetMacroEditText());
+        else if (id == IDC_MACRO_SAVE) SaveMacrosText(GetMacroEditText());
+        else if (id == IDC_MACRO_DELETE) { SaveMacrosText(""); SetWindowTextW(g_hMacroEdit, L""); }
+        else if (id == IDC_MACRO_RECORD_START) { MacroRecordStart(); SetWindowTextW(g_hMacroEdit, L"Recording... play on P1, then press Stop Rec."); }
+        else if (id == IDC_MACRO_RECORD_STOP) { std::string rec = MacroRecordStop(); SaveMacrosText(rec); SetWindowTextW(g_hMacroEdit, widen(rec).c_str()); }
+        else if (id == IDC_MACRO_CLOSE) DestroyWindow(hWnd);
+        break;
+    }
+    case WM_CLOSE: DestroyWindow(hWnd); break;
+    default: return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+static void ShowMacroEditor(HWND parent) {
+    HWND h = CreateWindowW(L"NSMacroEditor", L"Macros", WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 600, 300, parent, nullptr, g_hInst, nullptr);
+    if (h) ShowWindow(h, SW_SHOW);
+}
+
 // ── Control IDs ──
-enum { IDC_IP = 101, IDC_CONNECT, IDC_KEYBOARD_COMBO = 110, IDC_BINDINGS_BTN = 111, IDC_EDITOR_CHANGE = 200, IDC_EDITOR_SETUP = 400, IDC_EDITOR_RESET = 500, IDC_EDITOR_KEY_START = 300 };
 
 // ── Create a modern button with theme support ──
 static HWND CreateButton(HWND parent, const wchar_t* text, int x, int y, int w, int h, int id) {
@@ -1052,6 +1358,9 @@ static void SenderThread() {
             activeCount = std::max(activeCount, 1);
         }
 
+        MacroRecordSample(logicalReports[0]);
+        if (ApplyMacroOverride(logicalReports, present, hasMotion, xinputForSlot, rawForSlot)) activeCount = 1;
+
         ExtendedUdpPacket pkt{};
         memset(&pkt, 0, sizeof(pkt));
         pkt.magic = ns::PROTO_MAGIC;
@@ -1163,6 +1472,7 @@ static void DoConnect(HWND hWnd) {
     EnableWindow(g_hIpEdit, FALSE);
     EnableWindow(g_hKeyboardCombo, FALSE);
     EnableWindow(g_hBindingsBtn, FALSE);
+    EnableWindow(g_hMacrosBtn, TRUE);
 
     std::wstring status = L"Connected to " + std::wstring(ipBuf) + L":" + std::to_wstring(port);
     SetWindowText(g_hStatusText, status.c_str());
@@ -1179,6 +1489,7 @@ static void DoDisconnect() {
     EnableWindow(g_hIpEdit, TRUE);
     EnableWindow(g_hKeyboardCombo, TRUE);
     if (g_keyboardMode.load() != KB_OFF) EnableWindow(g_hBindingsBtn, TRUE);
+    EnableWindow(g_hMacrosBtn, TRUE);
     SetWindowText(g_hStatusText, L"Disconnected");
     SetWindowText(g_hP1Text, L"");
     SetWindowText(g_hP2Text, L"");
@@ -1277,6 +1588,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_hBindingsBtn = CreateButton(hWnd, L"Bindings...", x + 285, y, 80, 24, IDC_BINDINGS_BTN);
             EnableWindow(g_hBindingsBtn, savedMode != KB_OFF);
             y += 32;
+            g_hMacrosBtn = CreateButton(hWnd, L"Macros...", x + 115, y, 120, 24, IDC_MACROS_BTN);
+            y += 32;
 
             // ── Connect / Quit buttons ──
             g_hConnectBtn = CreateButton(hWnd, L"Connect", x + 115, y, 100, 30, IDC_CONNECT);
@@ -1325,6 +1638,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_keyboardMode = sel;
                 EnableWindow(g_hBindingsBtn, sel != KB_OFF);
                 SaveKeyboardMode(sel);
+            } else if (id == IDC_MACROS_BTN) {
+                ShowMacroEditor(hWnd);
             } else if (id == IDC_BINDINGS_BTN) {
                 g_editBindings = g_keyBindings;
                 g_listeningIdx = -1;
@@ -1658,7 +1973,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     ec.lpszClassName = L"NSBindingEditor";
     RegisterClass(&ec);
 
-    RECT rc{0, 0, 410, 315};
+    WNDCLASS mc{};
+    mc.lpfnWndProc = MacroEditorProc;
+    mc.hInstance = hInst;
+    mc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    mc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    mc.lpszClassName = L"NSMacroEditor";
+    RegisterClass(&mc);
+
+    RECT rc{0, 0, 410, 345};
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX), FALSE);
 
     HWND hWnd = CreateWindowEx(0, CLASS_NAME, L"NS PC Control",

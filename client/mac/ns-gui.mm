@@ -35,7 +35,11 @@
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
+#include <mutex>
 #include <cerrno>
+#include <sstream>
+#include <cctype>
+#include <fstream>
 #include <fcntl.h>
 #include <dispatch/dispatch.h>
 #include <sys/socket.h>
@@ -59,6 +63,144 @@ enum KeyboardMode {
 
 static constexpr int MAX_SLOTS = 4;
 static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
+
+// ── Macro support ───────────────────────────────────────────────────────────
+struct MacroStep {
+    uint16_t buttons = 0;
+    uint32_t duration_ms = 0;
+};
+
+static std::string macro_trim(std::string s) {
+    auto not_space = [](unsigned char c){ return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    return s;
+}
+
+static std::string macro_upper(std::string s) {
+    for (char& c : s) c = (char)std::toupper((unsigned char)c);
+    return s;
+}
+
+static std::string macro_read_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return "";
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static std::string macro_unescape_json_string(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char n = s[++i];
+            if (n == 'n') out += '\n';
+            else if (n == 't') out += '\t';
+            else out += n;
+        } else out += s[i];
+    }
+    return out;
+}
+
+static std::string macro_extract_commands_text(const std::string& raw) {
+    size_t key = raw.find("\"commands\"");
+    if (key == std::string::npos) key = raw.find("commands");
+    if (key != std::string::npos) {
+        size_t colon = raw.find(':', key);
+        if (colon != std::string::npos) {
+            size_t q1 = raw.find('"', colon + 1);
+            if (q1 != std::string::npos) {
+                std::string val;
+                bool esc = false;
+                for (size_t i = q1 + 1; i < raw.size(); ++i) {
+                    char c = raw[i];
+                    if (esc) { val += '\\'; val += c; esc = false; continue; }
+                    if (c == '\\') { esc = true; continue; }
+                    if (c == '"') return macro_unescape_json_string(val);
+                    val += c;
+                }
+            }
+        }
+    }
+    return raw;
+}
+
+static uint16_t macro_button_bit(std::string name) {
+    name = macro_upper(macro_trim(name));
+    if (name == "A" || name == "BTN_A") return ns::BTN_A;
+    if (name == "B" || name == "BTN_B") return ns::BTN_B;
+    if (name == "X" || name == "BTN_X") return ns::BTN_X;
+    if (name == "Y" || name == "BTN_Y") return ns::BTN_Y;
+    if (name == "L" || name == "BTN_L") return ns::BTN_L;
+    if (name == "R" || name == "BTN_R") return ns::BTN_R;
+    if (name == "ZL" || name == "BTN_ZL") return ns::BTN_ZL;
+    if (name == "ZR" || name == "BTN_ZR") return ns::BTN_ZR;
+    if (name == "MINUS" || name == "-" || name == "BTN_MINUS") return ns::BTN_MINUS;
+    if (name == "PLUS" || name == "+" || name == "BTN_PLUS") return ns::BTN_PLUS;
+    if (name == "LSTICK" || name == "LS" || name == "BTN_LSTICK") return ns::BTN_LSTICK;
+    if (name == "RSTICK" || name == "RS" || name == "BTN_RSTICK") return ns::BTN_RSTICK;
+    if (name == "HOME" || name == "BTN_HOME") return ns::BTN_HOME;
+    if (name == "CAPTURE" || name == "BTN_CAPTURE") return ns::BTN_CAPTURE;
+    return 0;
+}
+
+static uint16_t macro_parse_buttons(std::string combo) {
+    for (char& c : combo) if (c == '+' || c == ',' || c == '|') c = ' ';
+    std::istringstream iss(combo);
+    std::string tok;
+    uint16_t buttons = 0;
+    while (iss >> tok) buttons |= macro_button_bit(tok);
+    return buttons;
+}
+
+static std::vector<MacroStep> macro_parse_text(const std::string& raw_text) {
+    std::string text = macro_extract_commands_text(raw_text);
+    for (char& c : text) if (c == '\n' || c == '\r') c = ';';
+    std::vector<MacroStep> steps;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t semi = text.find(';', pos);
+        std::string part = macro_trim(text.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos));
+        pos = (semi == std::string::npos) ? text.size() : semi + 1;
+        if (part.empty()) continue;
+        std::istringstream iss(part);
+        std::string cmd;
+        uint32_t ms = 0;
+        iss >> cmd >> ms;
+        if (cmd.empty() || ms == 0) continue;
+        MacroStep st;
+        if (macro_upper(cmd) == "WAIT") st.buttons = 0;
+        else st.buttons = macro_parse_buttons(cmd);
+        st.duration_ms = ms;
+        steps.push_back(st);
+    }
+    return steps;
+}
+
+static std::vector<MacroStep> macro_load_file(const std::string& path) {
+    return macro_parse_text(macro_read_file(path));
+}
+
+static uint64_t macro_total_ms(const std::vector<MacroStep>& steps) {
+    uint64_t total = 0;
+    for (const auto& s : steps) total += s.duration_ms;
+    return total;
+}
+
+static bool macro_report_at(const std::vector<MacroStep>& steps, uint64_t elapsed_ms, ns::HIDReport& out) {
+    out.reset();
+    uint64_t t = 0;
+    for (const auto& s : steps) {
+        if (elapsed_ms < t + s.duration_ms) {
+            out.buttons = s.buttons;
+            return true;
+        }
+        t += s.duration_ms;
+    }
+    return false;
+}
+
 static bool g_legacyUdp = false; // hidden fallback: NSPC_LEGACY_UDP=1
 
 #pragma pack(push, 1)
@@ -82,6 +224,95 @@ static GCController* g_rumbleControllers[MAX_SLOTS] = {};
 static __strong CHHapticEngine* g_hapticEngines[MAX_SLOTS] = {};
 static __strong id<CHHapticPatternPlayer> g_hapticPlayers[MAX_SLOTS] = {};
 
+
+
+// ── Macro runtime ───────────────────────────────────────────────────────────
+static std::mutex g_macroMutex;
+static std::vector<MacroStep> g_macroSteps;
+static bool g_macroRunning = false;
+static uint64_t g_macroStartUs = 0;
+static std::string LoadMacroTextMac() {
+    NSString* s = [[NSUserDefaults standardUserDefaults] stringForKey:@"macrosJson"];
+    return s ? std::string([s UTF8String]) : std::string();
+}
+static void SaveMacroTextMac(const std::string& txt) {
+    [[NSUserDefaults standardUserDefaults] setObject:[NSString stringWithUTF8String:txt.c_str()] forKey:@"macrosJson"];
+}
+static void StartMacroTextMac(const std::string& txt) {
+    std::lock_guard<std::mutex> lk(g_macroMutex);
+    g_macroSteps = macro_parse_text(txt);
+    g_macroRunning = !g_macroSteps.empty();
+    g_macroStartUs = ns::now_us();
+}
+
+static bool g_macroRecording = false;
+static uint16_t g_macroRecordLastButtons = 0xFFFF;
+static uint64_t g_macroRecordLastChangeUs = 0;
+static std::string g_macroRecordCommands;
+
+static std::string MacroButtonsToTextMac(uint16_t buttons) {
+    struct BtnName { uint16_t bit; const char* name; } names[] = {
+        {ns::BTN_A,"A"},{ns::BTN_B,"B"},{ns::BTN_X,"X"},{ns::BTN_Y,"Y"},
+        {ns::BTN_L,"L"},{ns::BTN_R,"R"},{ns::BTN_ZL,"ZL"},{ns::BTN_ZR,"ZR"},
+        {ns::BTN_MINUS,"MINUS"},{ns::BTN_PLUS,"PLUS"},{ns::BTN_LSTICK,"LSTICK"},{ns::BTN_RSTICK,"RSTICK"},
+        {ns::BTN_HOME,"HOME"},{ns::BTN_CAPTURE,"CAPTURE"},
+    };
+    std::string out;
+    for (const auto& n : names) if (buttons & n.bit) { if (!out.empty()) out += "+"; out += n.name; }
+    return out;
+}
+
+static void MacroRecordAppendMacLocked(uint16_t buttons, uint64_t duration_ms) {
+    if (duration_ms < 10) return;
+    if (!g_macroRecordCommands.empty()) g_macroRecordCommands += "; ";
+    if (buttons == 0) g_macroRecordCommands += "WAIT " + std::to_string(duration_ms);
+    else g_macroRecordCommands += MacroButtonsToTextMac(buttons) + " " + std::to_string(duration_ms);
+}
+
+static void StartMacroRecordingMac() {
+    std::lock_guard<std::mutex> lk(g_macroMutex);
+    g_macroRecording = true;
+    g_macroRecordLastButtons = 0xFFFF;
+    g_macroRecordLastChangeUs = ns::now_us();
+    g_macroRecordCommands.clear();
+}
+
+static std::string StopMacroRecordingMac() {
+    std::lock_guard<std::mutex> lk(g_macroMutex);
+    if (g_macroRecording && g_macroRecordLastButtons != 0xFFFF)
+        MacroRecordAppendMacLocked(g_macroRecordLastButtons, (ns::now_us() - g_macroRecordLastChangeUs) / 1000ULL);
+    g_macroRecording = false;
+    g_macroRecordLastButtons = 0xFFFF;
+    std::string commands = g_macroRecordCommands.empty() ? "WAIT 200" : g_macroRecordCommands;
+    return std::string("{\"name\":\"Recorded Macro\",\"commands\":\"") + commands + "\"}";
+}
+
+static void SampleMacroRecordingMac(const ns::HIDReport& report) {
+    std::lock_guard<std::mutex> lk(g_macroMutex);
+    if (!g_macroRecording || g_macroRunning) return;
+    uint64_t now = ns::now_us();
+    uint16_t buttons = report.buttons;
+    if (g_macroRecordLastButtons == 0xFFFF) {
+        g_macroRecordLastButtons = buttons;
+        g_macroRecordLastChangeUs = now;
+        return;
+    }
+    if (buttons != g_macroRecordLastButtons) {
+        MacroRecordAppendMacLocked(g_macroRecordLastButtons, (now - g_macroRecordLastChangeUs) / 1000ULL);
+        g_macroRecordLastButtons = buttons;
+        g_macroRecordLastChangeUs = now;
+    }
+}
+static bool ApplyMacroOverrideMac(ns::HIDReport reports[4], bool present[4], bool has_motion[4], int controller_for_slot[4]) {
+    std::lock_guard<std::mutex> lk(g_macroMutex);
+    if (!g_macroRunning) return false;
+    uint64_t elapsed_ms = (ns::now_us() - g_macroStartUs) / 1000ULL;
+    ns::HIDReport mr; bool active = macro_report_at(g_macroSteps, elapsed_ms, mr);
+    for (int i = 0; i < 4; ++i) { reports[i].reset(); present[i] = false; has_motion[i] = false; controller_for_slot[i] = -1; }
+    reports[0] = mr; present[0] = true;
+    if (!active && elapsed_ms > macro_total_ms(g_macroSteps) + 120) g_macroRunning = false;
+    return true;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Shared gamepad state
@@ -494,6 +725,7 @@ static void pump_udp_rumble(int sock, RumbleManager& rumble, const int controlle
     @public
     NSTextField* ipField;
     NSButton* connectBtn;
+    NSButton* macrosBtn;
     NSPopUpButton* kbCombo;
     NSButton* bindingsBtn;
     NSTextField* statusField;
@@ -522,6 +754,7 @@ static void pump_udp_rumble(int sock, RumbleManager& rumble, const int controlle
 - (void)saveBindings;
 - (void)kbComboChanged;
 - (void)openBindingsEditor;
+- (void)openMacros;
 @end
 
 static std::unordered_map<std::string, std::string> default_key_bindings() {
@@ -1051,6 +1284,13 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
     [connectBtn setAction:@selector(connectClicked)];
     [view addSubview:connectBtn];
 
+    macrosBtn = [[NSButton alloc] initWithFrame:NSMakeRect(255, 215, 120, 32)];
+    [macrosBtn setTitle:@"Macros..."];
+    [macrosBtn setBezelStyle:NSBezelStyleRounded];
+    [macrosBtn setTarget:self];
+    [macrosBtn setAction:@selector(openMacros)];
+    [view addSubview:macrosBtn];
+
     NSBox* sep = [[NSBox alloc] initWithFrame:NSMakeRect(15, 195, 390, 1)];
     [sep setBoxType:NSBoxSeparator];
     [view addSubview:sep];
@@ -1078,6 +1318,36 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
     [NSApp activateIgnoringOtherApps:YES];
 
     [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(updateUI) userInfo:nil repeats:YES];
+}
+
+
+- (void)openMacros {
+    NSAlert* alert = [[NSAlert alloc] init];
+    [alert setMessageText:@"Macros"];
+    [alert setInformativeText:@"JSON/commands, or record live P1 buttons while connected."];
+    [alert addButtonWithTitle:@"Run"];
+    [alert addButtonWithTitle:@"Save/Add"];
+    [alert addButtonWithTitle:@"Delete"];
+    [alert addButtonWithTitle:@"Record"];
+    [alert addButtonWithTitle:@"Stop Recording"];
+    [alert addButtonWithTitle:@"Close"];
+    NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0,0,520,180)];
+    NSTextView* tv = [[NSTextView alloc] initWithFrame:NSMakeRect(0,0,520,180)];
+    [scroll setDocumentView:tv]; [scroll setHasVerticalScroller:YES];
+    std::string txt = LoadMacroTextMac();
+    if (txt.empty()) txt = "{\"name\":\"Macro\",\"commands\":\"WAIT 200; A 100; B 100\"}";
+    [tv setString:[NSString stringWithUTF8String:txt.c_str()]];
+    [alert setAccessoryView:scroll];
+    NSModalResponse r = [alert runModal];
+    std::string out([[tv string] UTF8String]);
+    if (r == NSAlertFirstButtonReturn) StartMacroTextMac(out);
+    else if (r == NSAlertSecondButtonReturn) SaveMacroTextMac(out);
+    else if (r == NSAlertThirdButtonReturn) SaveMacroTextMac("");
+    else if (r == NSAlertThirdButtonReturn + 1) StartMacroRecordingMac();
+    else if (r == NSAlertThirdButtonReturn + 2) {
+        std::string rec = StopMacroRecordingMac();
+        SaveMacroTextMac(rec);
+    }
 }
 
 - (void)connectClicked {
@@ -1198,6 +1468,9 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
                 present[0] = true;
                 active_count = std::max(active_count, 1);
             }
+
+            SampleMacroRecordingMac(logical_reports[0]);
+            if (ApplyMacroOverrideMac(logical_reports, present, has_motion, controller_for_slot)) active_count = 1;
 
             if (g_legacyUdp) {
                 ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet));

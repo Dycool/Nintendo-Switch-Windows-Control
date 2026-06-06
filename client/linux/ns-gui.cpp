@@ -26,6 +26,8 @@
 #include <cctype>
 #include <cmath>
 #include <mutex>
+#include <sstream>
+#include <fstream>
 #include <cerrno>
 
 
@@ -45,6 +47,144 @@
 #include "../../server/rpi/include/protocol.hpp"
 
 static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
+
+// ── Macro support ───────────────────────────────────────────────────────────
+struct MacroStep {
+    uint16_t buttons = 0;
+    uint32_t duration_ms = 0;
+};
+
+static std::string macro_trim(std::string s) {
+    auto not_space = [](unsigned char c){ return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    return s;
+}
+
+static std::string macro_upper(std::string s) {
+    for (char& c : s) c = (char)std::toupper((unsigned char)c);
+    return s;
+}
+
+static std::string macro_read_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return "";
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static std::string macro_unescape_json_string(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char n = s[++i];
+            if (n == 'n') out += '\n';
+            else if (n == 't') out += '\t';
+            else out += n;
+        } else out += s[i];
+    }
+    return out;
+}
+
+static std::string macro_extract_commands_text(const std::string& raw) {
+    size_t key = raw.find("\"commands\"");
+    if (key == std::string::npos) key = raw.find("commands");
+    if (key != std::string::npos) {
+        size_t colon = raw.find(':', key);
+        if (colon != std::string::npos) {
+            size_t q1 = raw.find('"', colon + 1);
+            if (q1 != std::string::npos) {
+                std::string val;
+                bool esc = false;
+                for (size_t i = q1 + 1; i < raw.size(); ++i) {
+                    char c = raw[i];
+                    if (esc) { val += '\\'; val += c; esc = false; continue; }
+                    if (c == '\\') { esc = true; continue; }
+                    if (c == '"') return macro_unescape_json_string(val);
+                    val += c;
+                }
+            }
+        }
+    }
+    return raw;
+}
+
+static uint16_t macro_button_bit(std::string name) {
+    name = macro_upper(macro_trim(name));
+    if (name == "A" || name == "BTN_A") return ns::BTN_A;
+    if (name == "B" || name == "BTN_B") return ns::BTN_B;
+    if (name == "X" || name == "BTN_X") return ns::BTN_X;
+    if (name == "Y" || name == "BTN_Y") return ns::BTN_Y;
+    if (name == "L" || name == "BTN_L") return ns::BTN_L;
+    if (name == "R" || name == "BTN_R") return ns::BTN_R;
+    if (name == "ZL" || name == "BTN_ZL") return ns::BTN_ZL;
+    if (name == "ZR" || name == "BTN_ZR") return ns::BTN_ZR;
+    if (name == "MINUS" || name == "-" || name == "BTN_MINUS") return ns::BTN_MINUS;
+    if (name == "PLUS" || name == "+" || name == "BTN_PLUS") return ns::BTN_PLUS;
+    if (name == "LSTICK" || name == "LS" || name == "BTN_LSTICK") return ns::BTN_LSTICK;
+    if (name == "RSTICK" || name == "RS" || name == "BTN_RSTICK") return ns::BTN_RSTICK;
+    if (name == "HOME" || name == "BTN_HOME") return ns::BTN_HOME;
+    if (name == "CAPTURE" || name == "BTN_CAPTURE") return ns::BTN_CAPTURE;
+    return 0;
+}
+
+static uint16_t macro_parse_buttons(std::string combo) {
+    for (char& c : combo) if (c == '+' || c == ',' || c == '|') c = ' ';
+    std::istringstream iss(combo);
+    std::string tok;
+    uint16_t buttons = 0;
+    while (iss >> tok) buttons |= macro_button_bit(tok);
+    return buttons;
+}
+
+static std::vector<MacroStep> macro_parse_text(const std::string& raw_text) {
+    std::string text = macro_extract_commands_text(raw_text);
+    for (char& c : text) if (c == '\n' || c == '\r') c = ';';
+    std::vector<MacroStep> steps;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t semi = text.find(';', pos);
+        std::string part = macro_trim(text.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos));
+        pos = (semi == std::string::npos) ? text.size() : semi + 1;
+        if (part.empty()) continue;
+        std::istringstream iss(part);
+        std::string cmd;
+        uint32_t ms = 0;
+        iss >> cmd >> ms;
+        if (cmd.empty() || ms == 0) continue;
+        MacroStep st;
+        if (macro_upper(cmd) == "WAIT") st.buttons = 0;
+        else st.buttons = macro_parse_buttons(cmd);
+        st.duration_ms = ms;
+        steps.push_back(st);
+    }
+    return steps;
+}
+
+static std::vector<MacroStep> macro_load_file(const std::string& path) {
+    return macro_parse_text(macro_read_file(path));
+}
+
+static uint64_t macro_total_ms(const std::vector<MacroStep>& steps) {
+    uint64_t total = 0;
+    for (const auto& s : steps) total += s.duration_ms;
+    return total;
+}
+
+static bool macro_report_at(const std::vector<MacroStep>& steps, uint64_t elapsed_ms, ns::HIDReport& out) {
+    out.reset();
+    uint64_t t = 0;
+    for (const auto& s : steps) {
+        if (elapsed_ms < t + s.duration_ms) {
+            out.buttons = s.buttons;
+            return true;
+        }
+        t += s.duration_ms;
+    }
+    return false;
+}
+
 
 #pragma pack(push, 1)
 struct ExtendedUdpPacket {
@@ -94,6 +234,7 @@ static void save_config(const char* full) {
 // ── Global state ──
 static GtkWidget* ipEntry = nullptr;
 static GtkWidget* connectBtn = nullptr;
+static GtkWidget* macroBtn = nullptr;
 static GtkWidget* statusLabel = nullptr;
 static GtkWidget* ctrlLabels[4]; // Labels to display P1 to P4 status
 
@@ -109,6 +250,82 @@ static std::mutex   g_hw_mtx;           // Protects hardware string arrays
 static bool         g_pad_accel_enabled[4] = {false, false, false, false};
 static bool         g_pad_gyro_enabled[4]  = {false, false, false, false};
 static bool         g_legacy_udp = false; // hidden fallback: NSPC_LEGACY_UDP=1
+
+
+static std::mutex g_macro_mtx;
+static std::vector<MacroStep> g_macro_steps;
+static bool g_macro_running = false;
+static uint64_t g_macro_start_us = 0;
+static std::string g_macro_text;
+static std::string macros_file_path() { return get_config_dir() + "/macros.json"; }
+static void load_macro_text() { g_macro_text = macro_read_file(macros_file_path()); }
+static void save_macro_text(const std::string& txt) { std::string dir = get_config_dir(); g_mkdir_with_parents(dir.c_str(), 0755); FILE* f = fopen(macros_file_path().c_str(), "w"); if (f) { fwrite(txt.data(), 1, txt.size(), f); fclose(f); } g_macro_text = txt; }
+static void start_macro_text(const std::string& txt) { std::lock_guard<std::mutex> lk(g_macro_mtx); g_macro_steps = macro_parse_text(txt); g_macro_running = !g_macro_steps.empty(); g_macro_start_us = ns::now_us(); }
+static bool g_macro_recording = false;
+static uint16_t g_macro_record_last_buttons = 0xFFFF;
+static uint64_t g_macro_record_last_change_us = 0;
+static std::string g_macro_record_commands;
+static std::string macro_buttons_to_text(uint16_t buttons) {
+    struct BtnName { uint16_t bit; const char* name; } names[] = {
+        {ns::BTN_A,"A"},{ns::BTN_B,"B"},{ns::BTN_X,"X"},{ns::BTN_Y,"Y"},
+        {ns::BTN_L,"L"},{ns::BTN_R,"R"},{ns::BTN_ZL,"ZL"},{ns::BTN_ZR,"ZR"},
+        {ns::BTN_MINUS,"MINUS"},{ns::BTN_PLUS,"PLUS"},{ns::BTN_LSTICK,"LSTICK"},{ns::BTN_RSTICK,"RSTICK"},
+        {ns::BTN_HOME,"HOME"},{ns::BTN_CAPTURE,"CAPTURE"},
+    };
+    std::string out;
+    for (const auto& n : names) if (buttons & n.bit) { if (!out.empty()) out += "+"; out += n.name; }
+    return out;
+}
+static void macro_record_append_locked(uint16_t buttons, uint64_t duration_ms) {
+    if (duration_ms < 10) return;
+    if (!g_macro_record_commands.empty()) g_macro_record_commands += "; ";
+    if (buttons == 0) g_macro_record_commands += "WAIT " + std::to_string(duration_ms);
+    else g_macro_record_commands += macro_buttons_to_text(buttons) + " " + std::to_string(duration_ms);
+}
+static void start_macro_recording() {
+    std::lock_guard<std::mutex> lk(g_macro_mtx);
+    g_macro_recording = true;
+    g_macro_record_last_buttons = 0xFFFF;
+    g_macro_record_last_change_us = ns::now_us();
+    g_macro_record_commands.clear();
+}
+static std::string stop_macro_recording() {
+    std::lock_guard<std::mutex> lk(g_macro_mtx);
+    if (g_macro_recording && g_macro_record_last_buttons != 0xFFFF)
+        macro_record_append_locked(g_macro_record_last_buttons, (ns::now_us() - g_macro_record_last_change_us) / 1000ULL);
+    g_macro_recording = false;
+    g_macro_record_last_buttons = 0xFFFF;
+    std::string commands = g_macro_record_commands.empty() ? "WAIT 200" : g_macro_record_commands;
+    return std::string("{\"name\":\"Recorded Macro\",\"commands\":\"") + commands + "\"}";
+}
+static void sample_macro_recording(const ns::HIDReport& report) {
+    std::lock_guard<std::mutex> lk(g_macro_mtx);
+    if (!g_macro_recording || g_macro_running) return;
+    uint64_t now = ns::now_us();
+    uint16_t buttons = report.buttons;
+    if (g_macro_record_last_buttons == 0xFFFF) {
+        g_macro_record_last_buttons = buttons;
+        g_macro_record_last_change_us = now;
+        return;
+    }
+    if (buttons != g_macro_record_last_buttons) {
+        macro_record_append_locked(g_macro_record_last_buttons, (now - g_macro_record_last_change_us) / 1000ULL);
+        g_macro_record_last_buttons = buttons;
+        g_macro_record_last_change_us = now;
+    }
+}
+static bool apply_macro_override(ns::HIDReport reports[4], bool present[4]) {
+    std::lock_guard<std::mutex> lk(g_macro_mtx);
+    if (!g_macro_running) return false;
+    uint64_t elapsed_ms = (ns::now_us() - g_macro_start_us) / 1000ULL;
+    ns::HIDReport mr;
+    bool active = macro_report_at(g_macro_steps, elapsed_ms, mr);
+    for (int i = 0; i < 4; ++i) { reports[i].reset(); present[i] = false; }
+    reports[0] = mr;
+    present[0] = true;
+    if (!active && elapsed_ms > macro_total_ms(g_macro_steps) + 120) g_macro_running = false;
+    return true;
+}
 
 // ── Axis conversion ──
 static uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8000) {
@@ -472,6 +689,9 @@ static void SenderThread(std::string host, uint16_t port) {
             }
         }
 
+        sample_macro_recording(reports[0]);
+        if (apply_macro_override(reports, present)) active_count = 1;
+
         if (g_legacy_udp) {
             ns::Packet pkt; memset(&pkt, 0, sizeof(ns::Packet));
             pkt.magic         = ns::PROTO_MAGIC;
@@ -531,6 +751,38 @@ static void SenderThread(std::string host, uint16_t port) {
     close(sock);
 }
 
+
+
+extern "C" void on_macros_clicked(GtkWidget*, gpointer) {
+    load_macro_text();
+    GtkWidget* dlg = gtk_dialog_new_with_buttons("Macros", nullptr, GTK_DIALOG_MODAL,
+        "Run", 1, "Save/Add JSON", 2, "Delete", 3, "Record", 4, "Stop Recording", 5, "Close", GTK_RESPONSE_CLOSE, nullptr);
+    GtkWidget* area = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    GtkWidget* label = gtk_label_new("Use JSON like {\"name\":\"Boost\",\"commands\":\"WAIT 200; A 100; B 100\"}, or record live P1 buttons while connected.");
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_container_add(GTK_CONTAINER(area), label);
+    GtkWidget* scroll = gtk_scrolled_window_new(nullptr, nullptr);
+    gtk_widget_set_size_request(scroll, 520, 180);
+    GtkWidget* text = gtk_text_view_new();
+    gtk_container_add(GTK_CONTAINER(scroll), text);
+    gtk_container_add(GTK_CONTAINER(area), scroll);
+    GtkTextBuffer* buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text));
+    gtk_text_buffer_set_text(buf, g_macro_text.empty() ? "{\"name\":\"Macro\",\"commands\":\"WAIT 200; A 100; B 100\"}" : g_macro_text.c_str(), -1);
+    gtk_widget_show_all(dlg);
+    while (true) {
+        int r = gtk_dialog_run(GTK_DIALOG(dlg));
+        GtkTextIter a,b; gtk_text_buffer_get_bounds(buf, &a, &b);
+        char* raw = gtk_text_buffer_get_text(buf, &a, &b, FALSE);
+        std::string txt = raw ? raw : ""; if (raw) g_free(raw);
+        if (r == 1) start_macro_text(txt);
+        else if (r == 2) save_macro_text(txt);
+        else if (r == 3) save_macro_text("");
+        else if (r == 4) { start_macro_recording(); gtk_text_buffer_set_text(buf, "Recording... play on P1, then press Stop Recording.", -1); }
+        else if (r == 5) { std::string rec = stop_macro_recording(); save_macro_text(rec); gtk_text_buffer_set_text(buf, rec.c_str(), -1); }
+        else break;
+    }
+    gtk_widget_destroy(dlg);
+}
 
 // ── GTK Callbacks ──
 extern "C" void on_connect_clicked(GtkWidget*, gpointer) {
@@ -685,7 +937,10 @@ int main(int argc, char* argv[]) {
     // Row 1: Connect Button
     connectBtn = gtk_button_new_with_label("Connect");
     g_signal_connect(connectBtn, "clicked", G_CALLBACK(on_connect_clicked), nullptr);
-    gtk_grid_attach(GTK_GRID(grid), connectBtn, 1, 1, 3, 1);
+    gtk_grid_attach(GTK_GRID(grid), connectBtn, 1, 1, 2, 1);
+    macroBtn = gtk_button_new_with_label("Macros...");
+    g_signal_connect(macroBtn, "clicked", G_CALLBACK(on_macros_clicked), nullptr);
+    gtk_grid_attach(GTK_GRID(grid), macroBtn, 3, 1, 1, 1);
 
     // Row 2: Separator
     GtkWidget* sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);

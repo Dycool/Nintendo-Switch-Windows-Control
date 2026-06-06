@@ -10,6 +10,7 @@
 /// Usage:
 ///   ./ns-gamepad <RASPBERRY_PI_IP[:PORT]>
 ///   ./ns-gamepad <RASPBERRY_PI_IP[:PORT]> --legacy
+///   ./ns-gamepad <RASPBERRY_PI_IP[:PORT]> --macro macro.json
 
 #include <iostream>
 #include <chrono>
@@ -24,6 +25,9 @@
 #include <string>
 #include <cerrno>
 
+#include <fstream>
+#include <sstream>
+#include <cctype>
 #include <SDL2/SDL.h>
 
 #include <sys/socket.h>
@@ -39,6 +43,144 @@
 #include "../../server/rpi/include/protocol.hpp"
 
 static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
+
+// ── Macro support ───────────────────────────────────────────────────────────
+struct MacroStep {
+    uint16_t buttons = 0;
+    uint32_t duration_ms = 0;
+};
+
+static std::string macro_trim(std::string s) {
+    auto not_space = [](unsigned char c){ return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
+    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
+    return s;
+}
+
+static std::string macro_upper(std::string s) {
+    for (char& c : s) c = (char)std::toupper((unsigned char)c);
+    return s;
+}
+
+static std::string macro_read_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return "";
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static std::string macro_unescape_json_string(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char n = s[++i];
+            if (n == 'n') out += '\n';
+            else if (n == 't') out += '\t';
+            else out += n;
+        } else out += s[i];
+    }
+    return out;
+}
+
+static std::string macro_extract_commands_text(const std::string& raw) {
+    size_t key = raw.find("\"commands\"");
+    if (key == std::string::npos) key = raw.find("commands");
+    if (key != std::string::npos) {
+        size_t colon = raw.find(':', key);
+        if (colon != std::string::npos) {
+            size_t q1 = raw.find('"', colon + 1);
+            if (q1 != std::string::npos) {
+                std::string val;
+                bool esc = false;
+                for (size_t i = q1 + 1; i < raw.size(); ++i) {
+                    char c = raw[i];
+                    if (esc) { val += '\\'; val += c; esc = false; continue; }
+                    if (c == '\\') { esc = true; continue; }
+                    if (c == '"') return macro_unescape_json_string(val);
+                    val += c;
+                }
+            }
+        }
+    }
+    return raw;
+}
+
+static uint16_t macro_button_bit(std::string name) {
+    name = macro_upper(macro_trim(name));
+    if (name == "A" || name == "BTN_A") return ns::BTN_A;
+    if (name == "B" || name == "BTN_B") return ns::BTN_B;
+    if (name == "X" || name == "BTN_X") return ns::BTN_X;
+    if (name == "Y" || name == "BTN_Y") return ns::BTN_Y;
+    if (name == "L" || name == "BTN_L") return ns::BTN_L;
+    if (name == "R" || name == "BTN_R") return ns::BTN_R;
+    if (name == "ZL" || name == "BTN_ZL") return ns::BTN_ZL;
+    if (name == "ZR" || name == "BTN_ZR") return ns::BTN_ZR;
+    if (name == "MINUS" || name == "-" || name == "BTN_MINUS") return ns::BTN_MINUS;
+    if (name == "PLUS" || name == "+" || name == "BTN_PLUS") return ns::BTN_PLUS;
+    if (name == "LSTICK" || name == "LS" || name == "BTN_LSTICK") return ns::BTN_LSTICK;
+    if (name == "RSTICK" || name == "RS" || name == "BTN_RSTICK") return ns::BTN_RSTICK;
+    if (name == "HOME" || name == "BTN_HOME") return ns::BTN_HOME;
+    if (name == "CAPTURE" || name == "BTN_CAPTURE") return ns::BTN_CAPTURE;
+    return 0;
+}
+
+static uint16_t macro_parse_buttons(std::string combo) {
+    for (char& c : combo) if (c == '+' || c == ',' || c == '|') c = ' ';
+    std::istringstream iss(combo);
+    std::string tok;
+    uint16_t buttons = 0;
+    while (iss >> tok) buttons |= macro_button_bit(tok);
+    return buttons;
+}
+
+static std::vector<MacroStep> macro_parse_text(const std::string& raw_text) {
+    std::string text = macro_extract_commands_text(raw_text);
+    for (char& c : text) if (c == '\n' || c == '\r') c = ';';
+    std::vector<MacroStep> steps;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t semi = text.find(';', pos);
+        std::string part = macro_trim(text.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos));
+        pos = (semi == std::string::npos) ? text.size() : semi + 1;
+        if (part.empty()) continue;
+        std::istringstream iss(part);
+        std::string cmd;
+        uint32_t ms = 0;
+        iss >> cmd >> ms;
+        if (cmd.empty() || ms == 0) continue;
+        MacroStep st;
+        if (macro_upper(cmd) == "WAIT") st.buttons = 0;
+        else st.buttons = macro_parse_buttons(cmd);
+        st.duration_ms = ms;
+        steps.push_back(st);
+    }
+    return steps;
+}
+
+static std::vector<MacroStep> macro_load_file(const std::string& path) {
+    return macro_parse_text(macro_read_file(path));
+}
+
+static uint64_t macro_total_ms(const std::vector<MacroStep>& steps) {
+    uint64_t total = 0;
+    for (const auto& s : steps) total += s.duration_ms;
+    return total;
+}
+
+static bool macro_report_at(const std::vector<MacroStep>& steps, uint64_t elapsed_ms, ns::HIDReport& out) {
+    out.reset();
+    uint64_t t = 0;
+    for (const auto& s : steps) {
+        if (elapsed_ms < t + s.duration_ms) {
+            out.buttons = s.buttons;
+            return true;
+        }
+        t += s.duration_ms;
+    }
+    return false;
+}
+
 
 #pragma pack(push, 1)
 struct ExtendedUdpPacket {
@@ -423,7 +565,7 @@ int main(int argc, char** argv) {
     }
 
     if (host.empty()) {
-        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP[:PORT]> [--legacy]\n";
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP[:PORT]> [--legacy] [--macro file.json]\n";
         std::cerr << "  --legacy  Send old input-only UDP packets; disables UDP rumble/gyro\n";
         return 1;
     }
@@ -496,6 +638,15 @@ int main(int argc, char** argv) {
     uint32_t seq = 0;
     auto next_tick = std::chrono::steady_clock::now();
     RumbleManager rumble;
+    std::vector<MacroStep> macro_steps;
+    uint64_t macro_start_us = 0;
+    bool macro_stop_after_send = false;
+    if (macro_mode) {
+        macro_steps = macro_load_file(macro_path);
+        if (macro_steps.empty()) { std::cerr << "Macro file has no usable commands: " << macro_path << "\n"; close(sock); SDL_Quit(); return 1; }
+        macro_start_us = ns::now_us();
+        std::cout << "Macro mode: executing " << macro_steps.size() << " steps on P1, then exiting.\n";
+    }
 
     // ── Main Loop (Input Polling & UDP Networking) ────────────────────────────
     while (g_running.load(std::memory_order_relaxed)) {
