@@ -214,6 +214,9 @@ static void writer_thread(int hz) {
 }
 
 
+// ── Per-IP rate limiter ──────────────────────────────────────────────────────
+static std::mutex g_rate_mtx;
+
 // ── Stats thread ──────────────────────────────────────────────────────────────
 static void stats_thread() {
     uint64_t last_cleanup = 0;
@@ -224,6 +227,7 @@ static void stats_thread() {
         uint64_t now = now_us();
         if (now - last_cleanup > 60000000) {
             last_cleanup = now;
+            std::lock_guard<std::mutex> lk(g_rate_mtx);
             for (int i = 0; i < RATE_TABLE; ++i) {
                 if (g_rate_table[i].ip != 0 &&
                     now - g_rate_table[i].window_start > RATE_WINDOW_US * 2)
@@ -240,6 +244,7 @@ static void stats_thread() {
 
 // ── Per-IP rate limiter ──────────────────────────────────────────────────────
 static bool rate_allow(uint32_t ip) {
+    std::lock_guard<std::mutex> lk(g_rate_mtx);
     uint64_t now = now_us();
     uint32_t idx = ip % RATE_TABLE;
     RateSlot &s = g_rate_table[idx];
@@ -1134,9 +1139,11 @@ struct WebClient {
         CLOSED
     } state = CLOSED;
 
-    // HTTP headers (null-terminated)
+                // HTTP headers (null-terminated)
     char http_buf[8192];
     size_t http_len = 0;
+    uint64_t connect_time = 0;
+    uint32_t ip = 0;
 
     // WS session
     int      ws_slot = -1;
@@ -1352,13 +1359,28 @@ static char* html_format(const char *fmt, const char *arg, size_t *out_len) {
 }
 
 
-// ── Case-insensitive substring check ─────────────────────────────────────────
+// ── Case-insensitive header check ───────────────────────────────────────────
 static bool has_header(const char *buf, const char *header) {
     size_t hlen = strlen(header);
     const char *p = buf;
     while (*p) {
         if ((p == buf || p[-1] == '\n') &&
             strncasecmp(p, header, hlen) == 0)
+            return true;
+        p = strchr(p, '\n');
+        if (!p) break;
+        p++;
+    }
+    return false;
+}
+
+// ── Request-line prefix match (line-start only) ──────────────────────────────
+static bool req_match(const char *buf, const char *path) {
+    size_t plen = strlen(path);
+    const char *p = buf;
+    while (*p) {
+        if ((p == buf || p[-1] == '\n') &&
+            strncmp(p, path, plen) == 0)
             return true;
         p = strchr(p, '\n');
         if (!p) break;
@@ -1395,11 +1417,15 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
     for (int i = 0; i < MAX_WS_CLIENTS; i++) { pfds[i+1].fd = -1; }
 
     while (g_running.load(std::memory_order_relaxed)) {
-        // Idle WS client timeout (30s without data)
+        // Idle WS timeout (30s) and HTTP handshake timeout (5s)
         uint64_t now_ws = now_us();
         for (int i = 0; i < n_clients; i++) {
             if (clients[i].state == WebClient::WS_ACTIVE &&
                 now_ws - clients[i].ws_last_rx > 30000000)
+                clients[i].state = WebClient::CLOSED;
+            if (clients[i].state == WebClient::READ_HTTP &&
+                clients[i].connect_time > 0 &&
+                now_ws - clients[i].connect_time > 5000000)
                 clients[i].state = WebClient::CLOSED;
         }
 
@@ -1416,8 +1442,21 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
 
         // ── Accept new connections ─────────────────────────────────────────
         if (pfds[0].revents & POLLIN) {
-            int fd = accept(srv, nullptr, nullptr);
+            sockaddr_in peer{};
+            socklen_t   plen = sizeof(peer);
+            int fd = accept(srv, (sockaddr*)&peer, &plen);
             if (fd >= 0) {
+                uint32_t peer_ip = peer.sin_addr.s_addr;
+                int cnt = 0;
+                for (int i = 0; i < n_clients; i++)
+                    if (clients[i].state != WebClient::CLOSED && clients[i].ip == peer_ip)
+                        cnt++;
+                if (cnt >= 8) {
+                    close(fd);
+                    if (g_verbose) std::printf("[web] client rejected: %d connections from this IP\n", cnt);
+                    continue;
+                }
+
                 fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
                 struct timeval tv = {10, 0};
                 setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -1430,7 +1469,11 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
                     clients[slot] = WebClient{};
                     clients[slot].fd = fd;
                     clients[slot].state = WebClient::READ_HTTP;
+                    clients[slot].connect_time = now_us();
+                    clients[slot].ip = peer_ip;
                     pfds[slot+1].fd = fd;
+                    pfds[slot+1].events = POLLIN;
+                    pfds[slot+1].revents = 0;
                     if (slot >= n_clients) n_clients = slot + 1;
                     if (g_verbose) std::printf("[web] client %d accepted (slot %d)\n", fd, slot);
                 } else {
@@ -1475,7 +1518,7 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
 
             // ── READ_HTTP: accumulate headers, then dispatch ────────────────
             if (c->state == WebClient::READ_HTTP) {
-                size_t copy = std::min(sizeof(c->http_buf) - c->http_len, c->fill);
+                size_t copy = std::min(sizeof(c->http_buf) - 1 - c->http_len, c->fill);
                 if (copy == 0) { c->state = WebClient::CLOSED; continue; }
                 memcpy(c->http_buf + c->http_len, c->buf, copy);
                 c->http_len += copy;
@@ -1523,14 +1566,14 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
                         int status = 200;
                         const char *status_str = "OK";
 
-                        if (strstr(c->http_buf, "GET / ") != nullptr ||
-                            strstr(c->http_buf, "GET /index.html ") != nullptr) {
+                        if (req_match(c->http_buf, "GET / ") ||
+                            req_match(c->http_buf, "GET /index.html ")) {
                             body = INDEX_HTML;
                             body_len = strlen(INDEX_HTML);
-                        } else if (strstr(c->http_buf, "GET /mobile ") != nullptr) {
+                        } else if (req_match(c->http_buf, "GET /mobile ")) {
                             free_body = html_format(MOBILE_HTML, MOBILE_STYLE_AND_DOM, &body_len);
                             body = free_body;
-                        } else if (strstr(c->http_buf, "GET /editor ") != nullptr) {
+                        } else if (req_match(c->http_buf, "GET /editor ")) {
                             free_body = html_format(EDITOR_HTML, MOBILE_STYLE_AND_DOM, &body_len);
                             body = free_body;
                         } else {
