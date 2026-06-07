@@ -62,12 +62,18 @@ static constexpr int     RUMBLE_GAIN_PERCENT = 100;
 // into generic SDL/Web weak/strong rumble here.
 static std::string g_usb_serial = "NSBRIDGE000001";
 
+// Optional local/private controller SPI profile.
+// Public repository ships only the loader. Users provide their own dump/profile
+// locally; the file must stay out of git. The loader applies only compatibility
+// calibration/model ranges and keeps generated per-controller MAC/serial IDs.
+static std::string g_spi_profile_path;
+
 // Built-in USB gadget lifecycle.  ns-backend can now create/bind the
 // USB gamepad gadget itself on startup and unbind/remove it
 // on shutdown, so setup_gadget.sh is no longer needed at runtime.
 static std::atomic<bool> g_gadget_setup_attempted{false};
 
-static constexpr int HID_PORT_COUNT = 1;
+static constexpr int HID_PORT_COUNT = 4;
 
 // HMAC authentication (key derived from DEFAULT_SECRET at startup)
 static uint8_t  g_hmac_key[32];
@@ -1115,10 +1121,111 @@ struct ControllerRuntime {
     b1 = (b1 & 0xF0) | ((val >> 8) & 0x0F);
 }
 
-static void apply_private_controller_spi_profile(uint8_t* flash) {
-    (void)flash;
-    // Public build intentionally does not embed private controller SPI/profile data.
-    // Users may load their own device profile/dump locally where legally permitted.
+struct SpiProfileRange {
+    uint32_t addr;
+    size_t len;
+    const char* name;
+};
+
+static bool read_file_bytes(const std::string& path, std::vector<uint8_t>& out) {
+    out.clear();
+
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        std::fprintf(stderr, "[spi-profile] failed to open: %s\n", path.c_str());
+        return false;
+    }
+
+    std::streamoff len = f.tellg();
+    if (len <= 0) {
+        std::fprintf(stderr, "[spi-profile] empty/invalid file: %s\n", path.c_str());
+        return false;
+    }
+
+    // Supported:
+    //   0x10000 = reduced profile used by this backend
+    //   0x80000 = common full SPI backup size
+    // Larger files are rejected so a wrong file cannot silently produce garbage.
+    if (len != (std::streamoff)0x10000 && len != (std::streamoff)0x80000) {
+        std::fprintf(stderr,
+                     "[spi-profile] unsupported size %lld for %s; expected 65536 or 524288 bytes\n",
+                     (long long)len, path.c_str());
+        return false;
+    }
+
+    f.seekg(0, std::ios::beg);
+    try {
+        out.resize((size_t)len);
+    } catch (...) {
+        std::fprintf(stderr, "[spi-profile] out of memory reading: %s\n", path.c_str());
+        return false;
+    }
+
+    f.read(reinterpret_cast<char*>(out.data()), len);
+    if (!f) {
+        std::fprintf(stderr, "[spi-profile] short read: %s\n", path.c_str());
+        out.clear();
+        return false;
+    }
+
+    return true;
+}
+
+static bool apply_spi_profile_overlay(uint8_t* flash, const std::vector<uint8_t>& src, int ctrl) {
+    if (!flash || src.empty()) return false;
+
+    // Keep this range list intentionally small and boring. These are calibration,
+    // colour/model, and stick/IMU parameter blocks that improve compatibility.
+    // Do not blindly copy identity/pairing areas. Runtime identity is generated
+    // by CTRL_MAC_BE/g_usb_serial and reported via USB 0x81/subcmd 0x02.
+    static const SpiProfileRange ranges[] = {
+        {0x6000, 0x20, "device-flags"},
+        {0x6020, 0x18, "factory-imu-cal"},
+        {0x603D, 0x12, "factory-stick-cal"},
+        {0x6050, 0x0D, "colors"},
+        {0x6080, 0x2A, "imu-stick-model"},
+        {0x8010, 0x30, "user-stick-cal-area"},
+        {0x8026, 0x1A, "user-imu-cal-area"},
+    };
+
+    for (const auto& r : ranges) {
+        if (r.addr + r.len > SPI_FLASH_SIZE) {
+            std::fprintf(stderr, "[spi-profile] internal range outside virtual SPI: %s\n", r.name);
+            return false;
+        }
+        if (r.addr + r.len > src.size()) {
+            std::fprintf(stderr,
+                         "[spi-profile] file too small for range %s at 0x%04X len=%zu\n",
+                         r.name, r.addr, r.len);
+            return false;
+        }
+        std::memcpy(flash + r.addr, src.data() + r.addr, r.len);
+    }
+
+    // Per-controller visible identity remains generated. If a dumped profile has
+    // user/pairing data, it is not used for USB MAC replies or subcmd 0x02.
+    // Keep colours unique per virtual controller only when no profile was used;
+    // profile colours are preserved here because they are cosmetic.
+    if (g_verbose) {
+        std::printf("[spi-profile] applied local profile overlay to pad%d (%zu-byte source)\n",
+                    ctrl + 1, src.size());
+    }
+    return true;
+}
+
+static void apply_private_controller_spi_profile(uint8_t* flash, int ctrl) {
+    if (!flash || g_spi_profile_path.empty()) return;
+
+    std::vector<uint8_t> profile;
+    if (!read_file_bytes(g_spi_profile_path, profile)) {
+        std::fprintf(stderr, "[spi-profile] keeping synthetic SPI fallback for pad%d\n", ctrl + 1);
+        return;
+    }
+
+    if (!apply_spi_profile_overlay(flash, profile, ctrl)) {
+        std::fprintf(stderr, "[spi-profile] overlay failed; keeping synthetic SPI fallback for pad%d\n", ctrl + 1);
+        return;
+    }
 }
 
 static void init_spi_flash(int ctrl) {
@@ -1225,7 +1332,7 @@ static void init_spi_flash(int ctrl) {
     flash[0x6059] = 0xFF;    flash[0x605A] = 0xFF;    flash[0x605B] = 0xFF;
     flash[0x605C] = 0x00;
 
-    apply_private_controller_spi_profile(flash);
+    apply_private_controller_spi_profile(flash, ctrl);
     g_spi_initialized[ctrl] = true;
 }
 
@@ -4802,6 +4909,7 @@ int main(int argc, char** argv) {
         else if (a == "-b" && i+1 < argc) bind_addr = argv[++i];
         else if (a == "-v")               g_verbose  = true;
         else if (a == "--upnp")           do_upnp    = true;
+        else if (a == "--spi-profile" && i+1 < argc) g_spi_profile_path = argv[++i];
         else if (a == "-w") {
             if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9')
                 web_port = std::atoi(argv[++i]);
@@ -4810,11 +4918,20 @@ int main(int argc, char** argv) {
         }
         else if (a == "-h") {
             puts("ns-backend  [-p PORT] [-b ADDR] [--upnp] [-w [WEB_PORT]] [-v]");
+            puts("            [--spi-profile FILE]");
+            puts("");
+            puts("  --spi-profile FILE   Load a local user-provided controller SPI profile.");
+            puts("                       Supports 65536-byte reduced profiles or 524288-byte full dumps.");
+            puts("                       Only calibration/model ranges are overlaid; MAC/serial stay generated.");
             return 0;
         }
     }
 
     randomize_controller_identity();
+
+    if (!g_spi_profile_path.empty()) {
+        std::printf("[spi-profile] using local profile: %s\n", g_spi_profile_path.c_str());
+    }
 
     // Always recreate the built-in gadget at process startup.  This makes every
     // launch self-healing: stale configfs state, leftover /dev/hidg* nodes, or a
