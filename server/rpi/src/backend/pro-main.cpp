@@ -4151,14 +4151,19 @@ static void flush_rumble_to_udp(int sock, int client_idx) {
         if (g_verbose && precision_sent != (ssize_t)sizeof(PrecisionRumblePacket))
             std::fprintf(stderr, "[udp] failed to send precision rumble packet: %s\n", std::strerror(errno));
 
-        // Classic fallback after precision. Older clients that do not know
-        // PrecisionRumblePacket can still use this RumblePacket. New clients
-        // should ignore this fallback when they already consumed the precision
-        // packet for the same rumble sequence/frame.
-        ssize_t sent = sendto(sock, &pending[s], sizeof(RumblePacket), 0,
+        // Classic fallback after precision, but deliberately attenuated.
+        //
+        // HD-capable clients should consume PrecisionRumblePacket and ignore this
+        // fallback for the same frame. Older clients still receive something,
+        // but not a second full-strength vibration on top of the HD path.
+        RumblePacket fallback = pending[s];
+        fallback.strong = (uint8_t)((int)fallback.strong * 45 / 100);
+        fallback.weak   = (uint8_t)((int)fallback.weak   * 45 / 100);
+
+        ssize_t sent = sendto(sock, &fallback, sizeof(RumblePacket), 0,
                               reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
         if (g_verbose && sent != (ssize_t)sizeof(RumblePacket))
-            std::fprintf(stderr, "[udp] failed to send rumble packet: %s\n", std::strerror(errno));
+            std::fprintf(stderr, "[udp] failed to send fallback rumble packet: %s\n", std::strerror(errno));
     }
 }
 
