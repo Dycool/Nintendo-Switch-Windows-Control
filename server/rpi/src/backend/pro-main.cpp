@@ -138,6 +138,12 @@ static bool        g_force_gadget_setup    = false;
 static bool        g_teardown_gadget_exit  = true;
 static std::atomic<bool> g_gadget_setup_attempted{false};
 
+// For gyro debugging, default to a descriptor that matches a real single
+// Nintendo Pro Controller: one HID interface.  The old 4-interface composite
+// gadget is still available with --gadget-pads 4, but it does not match the
+// descriptor captured from real hardware and may be treated differently by HOS.
+static int g_hid_port_count = 1;
+
 // HMAC authentication (key derived from DEFAULT_SECRET at startup)
 static uint8_t  g_hmac_key[32];
 
@@ -1731,7 +1737,7 @@ static const uint8_t PRO_CONTROLLER_REPORT_DESC[] = {
 };
 
 static bool hidg_nodes_ready() {
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < g_hid_port_count; ++i) {
         char path[32];
         std::snprintf(path, sizeof(path), "/dev/hidg%d", i);
         if (access(path, R_OK | W_OK) != 0)
@@ -1911,7 +1917,7 @@ static bool setup_gadget_builtin(bool force, const char* reason) {
 
     if (geteuid() != 0) {
         std::fprintf(stderr,
-            "[gadget] /dev/hidg0..3 are not ready and built-in setup needs root.\n"
+            "[gadget] requested /dev/hidg* nodes are not ready and built-in setup needs root.\n"
             "[gadget] Run: sudo ./ns-backend ...\n");
         return false;
     }
@@ -1954,11 +1960,11 @@ static bool setup_gadget_builtin(bool force, const char* reason) {
     if (!mkdir_if_needed(strings_dir.c_str())) return false;
     if (!mkdir_if_needed(join_path(GADGET_DIR, "configs").c_str())) return false;
     if (!mkdir_if_needed(configs_dir.c_str())) return false;
-    if (!mkdir_if_needed(join_path(configs_dir, "strings").c_str())) return false;
-    if (!mkdir_if_needed(config_strings_dir.c_str())) return false;
+    // Real Pro Controller descriptor has iConfiguration = 0, so do not create
+    // a configuration string in configs/c.1/strings.
     if (!mkdir_if_needed(functions_dir.c_str())) return false;
 
-    if (!write_text_file(join_path(GADGET_DIR, "bcdDevice").c_str(), "0x0200")) return false;
+    if (!write_text_file(join_path(GADGET_DIR, "bcdDevice").c_str(), "0x0400")) return false;
     if (!write_text_file(join_path(GADGET_DIR, "bcdUSB").c_str(), "0x0200")) return false;
     if (!write_text_file(join_path(GADGET_DIR, "idVendor").c_str(), "0x057e")) return false;
     if (!write_text_file(join_path(GADGET_DIR, "idProduct").c_str(), "0x2009")) return false;
@@ -1967,14 +1973,14 @@ static bool setup_gadget_builtin(bool force, const char* reason) {
     if (!write_text_file(join_path(GADGET_DIR, "bDeviceProtocol").c_str(), "0x00")) return false;
 
     // USB descriptor serial belongs here, not in the controller SPI area.
-    if (!write_text_file(join_path(strings_dir, "serialnumber").c_str(), "NSGP260606A0")) return false;
+    if (!write_text_file(join_path(strings_dir, "serialnumber").c_str(), "000000000001")) return false;
     if (!write_text_file(join_path(strings_dir, "manufacturer").c_str(), "Nintendo Co., Ltd.")) return false;
     if (!write_text_file(join_path(strings_dir, "product").c_str(), "Pro Controller")) return false;
 
     if (!write_text_file(join_path(configs_dir, "MaxPower").c_str(), "500")) return false;
-    if (!write_text_file(join_path(config_strings_dir, "configuration").c_str(), "NS-PC-Control Pro Controller Hub")) return false;
+    if (!write_text_file(join_path(configs_dir, "bmAttributes").c_str(), "0xA0")) return false;
 
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < g_hid_port_count; ++i) {
         if (!create_hid_function(i)) return false;
     }
 
@@ -1991,20 +1997,20 @@ static bool setup_gadget_builtin(bool force, const char* reason) {
     // /dev/hidg* can appear shortly after binding.
     for (int tries = 0; tries < 20; ++tries) {
         bool all_seen = true;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < g_hid_port_count; ++i) {
             char path[32];
             std::snprintf(path, sizeof(path), "/dev/hidg%d", i);
             if (access(path, F_OK) != 0) all_seen = false;
             chmod(path, 0666);
         }
         if (all_seen && hidg_nodes_ready()) {
-            std::puts("[gadget] Done. Exposed /dev/hidg0 to /dev/hidg3");
+            std::printf("[gadget] Done. Exposed %d Pro Controller HID interface(s) (/dev/hidg0..%d)\n", g_hid_port_count, g_hid_port_count - 1);
             return true;
         }
         std::this_thread::sleep_for(ms(100));
     }
 
-    std::fprintf(stderr, "[gadget] setup finished, but /dev/hidg0..3 are still not ready.\n");
+    std::fprintf(stderr, "[gadget] setup finished, but requested /dev/hidg* nodes are still not ready.\n");
     return false;
 }
 
@@ -2026,7 +2032,7 @@ static void drain_hid_output_queue(int fd) {
 
 // ── Smart Multiplexer HID Writer Thread ───────────────────────────────────────
 static void writer_thread(int hz) {
-    for (int i = 0; i < 4; ++i) init_spi_flash(i);
+    for (int i = 0; i < g_hid_port_count; ++i) init_spi_flash(i);
 
     const auto tick = us(1'000'000 / hz);
     int fds[4] = {-1, -1, -1, -1};
@@ -2036,11 +2042,11 @@ static void writer_thread(int hz) {
     struct HwSlot { int client_idx = -1; int sub_idx = -1; };
     HwSlot hw_slots[4];
     ControllerRuntime rt[4];
-    for (int i = 0; i < 4; ++i) rt[i].ctrl = i;
+    for (int i = 0; i < g_hid_port_count; ++i) rt[i].ctrl = i;
 
     while (g_running.load(std::memory_order_relaxed)) {
         bool all_open = true;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < g_hid_port_count; ++i) {
             if (fds[i] < 0) {
                 fds[i] = open(devs[i].c_str(), O_RDWR);
                 if (fds[i] >= 0) {
@@ -2061,16 +2067,16 @@ static void writer_thread(int hz) {
         if (!all_open) {
             // Do not keep a partial set of opened endpoints around while the
             // gadget is being recreated/rebound.  Retry with a clean fd set.
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < g_hid_port_count; ++i) {
                 if (fds[i] >= 0) { close(fds[i]); fds[i] = -1; rt[i].fd = -1; }
             }
-            run_gadget_setup_if_needed(false, "/dev/hidg0..3 could not all be opened");
+            run_gadget_setup_if_needed(false, "requested /dev/hidg* nodes could not all be opened");
             std::this_thread::sleep_for(ms(500));
             continue;
         }
 
         if (g_verbose || !was_connected)
-            std::puts("4x Pro Controller /dev/hidg* opened");
+            std::printf("%dx Pro Controller /dev/hidg* opened\n", g_hid_port_count);
         was_connected = true;
 
         auto next = Clock::now() + tick;
@@ -2156,7 +2162,7 @@ static void writer_thread(int hz) {
                 }
             }
 
-            for (int h = 0; h < 4; ++h) {
+            for (int h = 0; h < g_hid_port_count; ++h) {
                 if (hw_slots[h].client_idx == -1) continue;
 
                 int cidx = hw_slots[h].client_idx;
@@ -2185,7 +2191,7 @@ static void writer_thread(int hz) {
                 if (!active_snap[c]) continue;
                 for (int s = 0; s < 4; ++s) {
                     bool mapped = false;
-                    for (int h = 0; h < 4; ++h) {
+                    for (int h = 0; h < g_hid_port_count; ++h) {
                         if (hw_slots[h].client_idx == c && hw_slots[h].sub_idx == s) {
                             mapped = true;
                             break;
@@ -2206,12 +2212,12 @@ static void writer_thread(int hz) {
                     // let Pad 2 steal Switch Port 1 whenever keyboard/mobile Pad 1 was
                     // neutral, which made keyboard mode and mobile mode look broken.
                     int chosen = -1;
-                    if (s >= 0 && s < 4 && hw_slots[s].client_idx == -1) {
+                    if (s >= 0 && s < g_hid_port_count && hw_slots[s].client_idx == -1) {
                         chosen = s;
                     } else {
                         // Fallback only for multi-client cases where the preferred port
                         // is already occupied.
-                        for (int h = 0; h < 4; ++h) {
+                        for (int h = 0; h < g_hid_port_count; ++h) {
                             if (hw_slots[h].client_idx == -1) {
                                 chosen = h;
                                 break;
@@ -2229,8 +2235,8 @@ static void writer_thread(int hz) {
             }
 
             ExtendedHIDReport out_reports[4];
-            for (int h = 0; h < 4; ++h) out_reports[h].reset();
-            for (int h = 0; h < 4; ++h) {
+            for (int h = 0; h < g_hid_port_count; ++h) out_reports[h].reset();
+            for (int h = 0; h < g_hid_port_count; ++h) {
                 if (hw_slots[h].client_idx != -1) {
                     out_reports[h] = report_snap[hw_slots[h].client_idx][hw_slots[h].sub_idx];
                     server_macro_apply(hw_slots[h].client_idx, hw_slots[h].sub_idx, out_reports[h].input);
@@ -2238,7 +2244,7 @@ static void writer_thread(int hz) {
             }
 
             bool ok = true;
-            for (int h = 0; h < 4; ++h) {
+            for (int h = 0; h < g_hid_port_count; ++h) {
                 const bool port_needed = (hw_slots[h].client_idx != -1);
 
                 uint8_t write_buf[PRO_REPORT_SIZE] = {};
@@ -2326,7 +2332,7 @@ static void writer_thread(int hz) {
                 }
             }
 
-            for (int h = 0; h < 4; ++h) {
+            for (int h = 0; h < g_hid_port_count; ++h) {
                 // Always serve the HID control/output side for every exposed Pro
                 // Controller interface.  HID gadgets are not lazily created: once
                 // setup_gadget.sh exposes hidg0..hidg3, the Switch may send init
@@ -4783,6 +4789,12 @@ int main(int argc, char** argv) {
         }
         else if (a == "--log-neutral-rumble") g_log_neutral_rumble = true;
         else if (a == "--test-rumble") g_test_rumble_on_connect = true;
+        else if (a == "--gadget-pads" && i+1 < argc) {
+            int n = std::atoi(argv[++i]);
+            if (n < 1) n = 1;
+            if (n > 4) n = 4;
+            g_hid_port_count = n;
+        }
         else if (a == "-w") {
             if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9')
                 web_port = std::atoi(argv[++i]);
@@ -4791,7 +4803,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "-h") {
             puts("ns-backend  [-p PORT] [-b ADDR] [--upnp] [-w [WEB_PORT]] [-v]");
-            puts("            [--force-gadget-setup] [--no-auto-gadget] [--keep-gadget-on-exit]");
+            puts("            [--force-gadget-setup] [--no-auto-gadget] [--keep-gadget-on-exit] [--gadget-pads 1..4]");
             puts("            [--client-timeout-ms MS] [--imu-map direct|invert-x|invert-y|invert-z|swap-yz|switch1|switch2|switch3]");
             puts("            [--pro-report-us US] [--test-imu off|roll|pitch|yaw|shake]");
             puts("            [--log-neutral-rumble] [--test-rumble]");
@@ -4839,10 +4851,11 @@ int main(int argc, char** argv) {
     std::printf("UDP %s:%u writer=%d Hz\n",
                 bind_addr.c_str(), port, WRITER_HZ);
     if (g_verbose) {
-        std::printf("[config] client_timeout=%.1fs stale_neutral=%.0fms imu_map=%s neutral_rumble_log=%s test_rumble=%s\n",
+        std::printf("[config] client_timeout=%.1fs stale_neutral=%.0fms imu_map=%s gadget_pads=%d neutral_rumble_log=%s test_rumble=%s\n",
                     (double)g_client_timeout_us / 1000000.0,
                     (double)CLIENT_STALE_NEUTRAL_US / 1000.0,
                     imu_map_name(g_imu_map),
+                    g_hid_port_count,
                     g_log_neutral_rumble ? "yes" : "no",
                     g_test_rumble_on_connect ? "yes" : "no");
     }
