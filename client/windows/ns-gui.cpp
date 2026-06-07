@@ -8,8 +8,12 @@
 #ifndef _CRT_SECURE_NO_WARNINGS
 #  define _CRT_SECURE_NO_WARNINGS
 #endif
-#define UNICODE
-#define _UNICODE
+#ifndef UNICODE
+#  define UNICODE
+#endif
+#ifndef _UNICODE
+#  define _UNICODE
+#endif
 
 #include <windows.h>
 #include <mmsystem.h>
@@ -42,8 +46,11 @@
 // SDL3 is the only native Windows gamepad backend. It owns controller
 // discovery, buttons/sticks, optional motion sensors, and rumble.
 // Link against SDL3 and ship SDL3.dll next to ns-gui.exe, or link SDL3 statically.
-#define SDL_MAIN_HANDLED
+#ifndef SDL_MAIN_HANDLED
+#  define SDL_MAIN_HANDLED
+#endif
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -754,7 +761,6 @@ public:
         SDL_SetHint("SDL_JOYSTICK_HIDAPI", "1");
         SDL_SetHint("SDL_JOYSTICK_HIDAPI_SWITCH", "1");
         SDL_SetHint("SDL_JOYSTICK_ENHANCED_REPORTS", "1");
-        SDL_SetMainReady();
 
         if (!SDL_Init(SDL_INIT_GAMEPAD | SDL_INIT_SENSOR | SDL_INIT_HAPTIC | SDL_INIT_EVENTS)) {
             last_error = SDL_GetError() ? SDL_GetError() : "SDL_Init failed";
@@ -2562,14 +2568,11 @@ static void apply_keyboard_to_report(ns::HIDReport& rep, bool override_mode) {
 static void SenderThread() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
-    // SDL3 is now the only native Windows controller receiver. If SDL init
-    // fails we still keep the UDP/keyboard path alive, but controller input
-    // will remain empty and the status text will show the SDL error.
-    g_sdlInput.start();
+    // SDL3 is initialized once on the main thread at app startup.
+    // The sender thread only polls the already-initialized backend.
 
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock == INVALID_SOCKET) {
-        g_sdlInput.stop();
         return;
     }
 
@@ -2583,7 +2586,6 @@ static void SenderThread() {
     snprintf(portBuf, sizeof(portBuf), "%u", g_targetPort);
     if (getaddrinfo(g_targetHost.c_str(), portBuf, &hints, &res) != 0 || !res) {
         closesocket(sock);
-        g_sdlInput.stop();
         return;
     }
     sockaddr_in dest{};
@@ -2693,7 +2695,6 @@ static void SenderThread() {
     }
 
     rumble.stop_all();
-    g_sdlInput.stop();
     closesocket(sock);
     g_sock = INVALID_SOCKET;
 }
@@ -2762,11 +2763,6 @@ static void DoConnect(HWND hWnd) {
     g_targetPort = (uint16_t)port;
     g_packetCount = 0;
     LoadMacroEntries();
-
-    for (int i = 0; i < 4; i++) {
-        g_is_connected[i] = false;
-        g_last_check_us[i] = 0;
-    }
 
     g_connected = true;
 
@@ -3012,6 +3008,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_DESTROY:
             DoDisconnect();
+            g_sdlInput.stop();
             PostQuitMessage(0);
             break;
 
@@ -3261,6 +3258,8 @@ static LRESULT CALLBACK BindingsEditorProc(HWND hDlg, UINT msg, WPARAM wParam, L
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     timeBeginPeriod(1);
     SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    SDL_SetMainReady();
+    g_sdlInput.start();
     g_hInst = hInst;
 
     WSADATA wsa{};

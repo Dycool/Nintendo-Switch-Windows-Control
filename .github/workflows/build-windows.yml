@@ -13,6 +13,7 @@ on:
 
 env:
   SDL_REF: release-3.4.10
+  SDL_CACHE_VERSION: v1
 
 jobs:
   build-windows:
@@ -32,12 +33,34 @@ jobs:
         with:
           arch: x64
 
-      - name: Fetch SDL3
+      - name: Restore SDL3 static cache
+        id: cache-sdl3
+        uses: actions/cache@v5
+        with:
+          path: _cache/sdl3-static
+          key: sdl3-${{ runner.os }}-x64-${{ env.SDL_REF }}-mt-${{ env.SDL_CACHE_VERSION }}
+          restore-keys: |
+            sdl3-${{ runner.os }}-x64-${{ env.SDL_REF }}-mt-
+
+      - name: Build and install SDL3 static
+        if: steps.cache-sdl3.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           git clone --depth 1 --branch $env:SDL_REF https://github.com/libsdl-org/SDL.git _deps/SDL
 
-      - name: Build GUI Client (MSVC + static SDL3)
+          cmake -S _deps/SDL -B _deps/SDL/build-static -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="$PWD/_cache/sdl3-static" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DSDL_SHARED=OFF `
+            -DSDL_STATIC=ON `
+            -DSDL_TESTS=OFF `
+            -DSDL_TEST_LIBRARY=OFF `
+            -DSDL_EXAMPLES=OFF
+
+          cmake --build _deps/SDL/build-static --config Release --target install --parallel
+
+      - name: Build GUI Client (MSVC + cached static SDL3)
         shell: pwsh
         run: |
           cd client/windows
@@ -54,14 +77,10 @@ jobs:
             set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
           endif()
 
-          set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-          set(SDL_STATIC ON CACHE BOOL "" FORCE)
-          set(SDL_TESTS OFF CACHE BOOL "" FORCE)
-          set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
-          set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
-          set(SDL_DISABLE_INSTALL ON CACHE BOOL "" FORCE)
-
-          add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../_deps/SDL" SDL-build EXCLUDE_FROM_ALL)
+          find_package(SDL3 REQUIRED CONFIG
+            PATHS "${CMAKE_CURRENT_LIST_DIR}/../../_cache/sdl3-static"
+            NO_DEFAULT_PATH
+          )
 
           add_executable(ns-gui WIN32
             ns-gui.cpp
@@ -83,14 +102,9 @@ jobs:
             target_compile_options(ns-gui PRIVATE /W3 /O2 /EHsc)
           endif()
 
-          if(TARGET SDL3::SDL3-static)
-            set(NS_SDL3_TARGET SDL3::SDL3-static)
-          else()
-            set(NS_SDL3_TARGET SDL3::SDL3)
-          endif()
-
+          # SDL guarantees SDL3::SDL3 exists; with this install it aliases the static target.
           target_link_libraries(ns-gui PRIVATE
-            ${NS_SDL3_TARGET}
+            SDL3::SDL3
             ws2_32
             comctl32
             comdlg32
