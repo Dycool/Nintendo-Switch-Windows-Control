@@ -1156,7 +1156,7 @@ static uint64_t g_pro_report_interval_us = 15'000ULL;
 static uint8_t  g_pro_bat_con = 0x81;
 // Byte 12 of report 0x30/0x21 is the controller's vibrator input/status byte.
 // Usually 0 is fine, but keep it configurable for exact-protocol experiments.
-static uint8_t  g_pro_vibrator_report = 0x00;
+static uint8_t  g_pro_vibrator_report = 0x0B;
 static bool     g_log_raw_30 = false;
 static constexpr int PRO_IDLE_REPORT_HZ = 30;
 static constexpr uint64_t PRO_IDLE_REPORT_INTERVAL_US = 1'000'000ULL / PRO_IDLE_REPORT_HZ;
@@ -1519,6 +1519,14 @@ static void build_get_device_info_response(uint8_t* out, int ctrl) {
 
 static void fill_neutral_controls(ProInputReport30& r) {
     r.conn_info = g_pro_bat_con;
+    // Real USB Pro Controller captures keep bit 0x80 set in the middle button byte
+    // even at rest: neutral buttons are 00 80 00, not 00 00 00.  Keep this base
+    // bit in both 0x30 and 0x21 snapshots because some Switch/game paths appear
+    // to gate motion/HD-rumble capability on the complete controller state, not
+    // merely on the IMU bytes.
+    r.buttons[0] = 0x00;
+    r.buttons[1] = 0x80;
+    r.buttons[2] = 0x00;
     r.left_stick[0]  = 0x00; r.left_stick[1]  = 0x08; r.left_stick[2]  = 0x80;
     r.right_stick[0] = 0x00; r.right_stick[1] = 0x08; r.right_stick[2] = 0x80;
     r.vibrator = g_pro_vibrator_report;
@@ -1526,6 +1534,9 @@ static void fill_neutral_controls(ProInputReport30& r) {
 
 static void fill_neutral_controls(ProInputReport21& r) {
     r.conn_info = g_pro_bat_con;
+    r.buttons[0] = 0x00;
+    r.buttons[1] = 0x80;
+    r.buttons[2] = 0x00;
     r.left_stick[0]  = 0x00; r.left_stick[1]  = 0x08; r.left_stick[2]  = 0x80;
     r.right_stick[0] = 0x00; r.right_stick[1] = 0x08; r.right_stick[2] = 0x80;
     r.vibrator = g_pro_vibrator_report;
@@ -1608,6 +1619,7 @@ static void apply_input_controls_to_pro21(const ExtendedHIDReport& src, ProInput
     // buttons such as R/ZR flicker in-game.
     out.conn_info = g_pro_bat_con;
     memset(out.buttons, 0, sizeof(out.buttons));
+    out.buttons[1] = 0x80; // real neutral USB Pro state is 00 80 00
     out.vibrator = g_pro_vibrator_report;
 
     const HIDReport& in = src.input;
@@ -2201,7 +2213,7 @@ static bool setup_gadget_builtin(bool force, const char* reason) {
     // a configuration string in configs/c.1/strings.
     if (!mkdir_if_needed(functions_dir.c_str())) return false;
 
-    if (!write_text_file(join_path(GADGET_DIR, "bcdDevice").c_str(), "0x0400")) return false;
+    if (!write_text_file(join_path(GADGET_DIR, "bcdDevice").c_str(), "0x0210")) return false;
     if (!write_text_file(join_path(GADGET_DIR, "bcdUSB").c_str(), "0x0200")) return false;
     if (!write_text_file(join_path(GADGET_DIR, "idVendor").c_str(), "0x057e")) return false;
     if (!write_text_file(join_path(GADGET_DIR, "idProduct").c_str(), "0x2009")) return false;
@@ -2615,8 +2627,16 @@ static void writer_thread(int hz) {
                         );
                         rt[h].pending_subcmd_reply = (reply_len >= 0);
                         if (g_verbose) {
-                            std::printf("[pro%d] subcmd 0x%02X reply=0x%02X 0x%02X\n",
+                            std::printf("[pro%d] subcmd 0x%02X reply=0x%02X 0x%02X",
                                         h + 1, subcmd_id, rt[h].pending_reply.ack, rt[h].pending_reply.subcmd_id);
+                            if ((subcmd_id == CMD_SET_DATA_FORMAT || subcmd_id == CMD_ENABLE_IMU ||
+                                 subcmd_id == CMD_SET_IMU_SENS || subcmd_id == CMD_ENABLE_VIBRATION) &&
+                                subcmd_data_len > 0) {
+                                std::printf(" data=");
+                                for (size_t bi = 0; bi < subcmd_data_len && bi < 8; ++bi)
+                                    std::printf("%s%02X", bi ? " " : "", read_buf[11 + bi]);
+                            }
+                            std::printf("\n");
                         }
                     } else if (id == RID_OUTPUT_RUMBLE) {
                         if (hw_slots[h].client_idx != -1)
