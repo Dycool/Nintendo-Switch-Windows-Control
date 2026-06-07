@@ -50,6 +50,7 @@
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "winmm.lib")
 #pragma comment(linker,"\"/manifestdependency:type='win32' \
 name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
 processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -436,24 +437,112 @@ static bool macro_parse_one_command(const std::string& part, MacroStep& st, std:
 }
 
 static bool macro_validate_text(const std::string& raw_text, std::vector<MacroStep>& steps, std::vector<std::string>* normalized = nullptr) {
+    static constexpr size_t MACRO_EXPANDED_STEP_LIMIT = 1000000;
+
     g_macro_last_error.clear();
     steps.clear();
     if (normalized) normalized->clear();
+
     std::string text, err;
-    if (!macro_extract_commands_text(raw_text, text, err)) { macro_set_error(err); return false; }
-    for (char& c : text) if (c == '\n' || c == '\r') c = ';';
+    if (!macro_extract_commands_text(raw_text, text, err)) {
+        macro_set_error(err);
+        return false;
+    }
+
+    for (char& c : text) {
+        if (c == '\n' || c == '\r') c = ';';
+    }
+
+    std::vector<std::string> parts;
     size_t pos = 0;
     while (pos < text.size()) {
         size_t semi = text.find(';', pos);
-        std::string part = macro_trim(text.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos));
+        std::string part = macro_trim(text.substr(
+            pos,
+            semi == std::string::npos ? std::string::npos : semi - pos
+        ));
         pos = (semi == std::string::npos) ? text.size() : semi + 1;
-        if (part.empty()) continue;
-        MacroStep st;
-        if (!macro_parse_one_command(part, st, err)) { macro_set_error(err); return false; }
-        steps.push_back(st);
+
+        // Allow readable macro files:
+        //   # drift wiggle
+        //   R+LSTICK_LEFT 450
+        if (part.empty() || part[0] == '#') continue;
+
+        parts.push_back(part);
         if (normalized) normalized->push_back(part);
     }
-    if (steps.empty()) { macro_set_error("no valid macro commands found"); return false; }
+
+    if (parts.empty()) {
+        macro_set_error("no valid macro commands found");
+        return false;
+    }
+
+    auto append_segment = [&](const std::vector<MacroStep>& segment, uint32_t repeat_count) -> bool {
+        if (segment.empty()) {
+            macro_set_error("LOOP has no commands to repeat");
+            return false;
+        }
+        if (repeat_count == 0) {
+            macro_set_error("LOOP count must be greater than zero");
+            return false;
+        }
+        if (segment.size() > 0 && repeat_count > MACRO_EXPANDED_STEP_LIMIT / segment.size()) {
+            macro_set_error("macro expands to too many steps");
+            return false;
+        }
+        if (steps.size() + segment.size() * (size_t)repeat_count > MACRO_EXPANDED_STEP_LIMIT) {
+            macro_set_error("macro expands to too many steps");
+            return false;
+        }
+        for (uint32_t r = 0; r < repeat_count; ++r) {
+            steps.insert(steps.end(), segment.begin(), segment.end());
+        }
+        return true;
+    };
+
+    std::vector<MacroStep> segment;
+    for (const std::string& part : parts) {
+        size_t last_space = part.find_last_of(" \t");
+        if (last_space == std::string::npos) {
+            macro_set_error("missing duration in command: " + part);
+            return false;
+        }
+
+        std::string cmd = macro_upper(macro_trim(part.substr(0, last_space)));
+        if (cmd == "LOOP") {
+            uint32_t repeat_count = 0;
+            std::string count_s = macro_trim(part.substr(last_space + 1));
+            if (!macro_parse_uint32_strict(count_s, repeat_count)) {
+                macro_set_error("invalid LOOP count in command: " + part);
+                return false;
+            }
+
+            // LOOP n repeats the block since the start or previous LOOP, n total times.
+            if (!append_segment(segment, repeat_count)) return false;
+            segment.clear();
+            continue;
+        }
+
+        MacroStep st;
+        if (!macro_parse_one_command(part, st, err)) {
+            macro_set_error(err);
+            return false;
+        }
+        segment.push_back(st);
+    }
+
+    if (!segment.empty()) {
+        if (steps.size() + segment.size() > MACRO_EXPANDED_STEP_LIMIT) {
+            macro_set_error("macro expands to too many steps");
+            return false;
+        }
+        steps.insert(steps.end(), segment.begin(), segment.end());
+    }
+
+    if (steps.empty()) {
+        macro_set_error("no valid macro commands found");
+        return false;
+    }
     return true;
 }
 
@@ -737,6 +826,8 @@ public:
             DWORD written = 0;
             WriteFile(d->handle, out, sizeof(out), &written, nullptr);
             HidD_SetOutputReport(d->handle, out, sizeof(out));
+        } else if (is_switch_pro(d->info.vid, d->info.pid)) {
+            send_switch_pro_rumble(d, low, high);
         }
     }
 
@@ -745,6 +836,8 @@ private:
         HANDLE handle = INVALID_HANDLE_VALUE;
         RawHidDeviceInfo info{};
         int slot = -1;
+        uint8_t switch_packet_counter = 0;
+        bool switch_rumble_enabled = false;
         std::thread thread;
         ~Device() {
             if (thread.joinable()) thread.detach();
@@ -774,6 +867,82 @@ private:
         if (is_dualsense(vid, pid)) return "DualSense";
         if (is_switch_pro(vid, pid)) return "Nintendo Switch Pro Controller";
         return "Raw HID controller";
+    }
+
+    static size_t output_report_len(const Device* d, size_t needed) {
+        size_t len = d && d->info.output_len ? (size_t)d->info.output_len : 64;
+        return std::max(len, needed);
+    }
+
+    static bool write_hid_output(Device* d, const uint8_t* data, size_t len) {
+        if (!d || d->handle == INVALID_HANDLE_VALUE || !data || len == 0) return false;
+        DWORD written = 0;
+        BOOL ok_write = WriteFile(d->handle, data, (DWORD)len, &written, nullptr);
+        BOOL ok_report = HidD_SetOutputReport(d->handle, const_cast<PVOID>(reinterpret_cast<const void*>(data)), (ULONG)len);
+        return (ok_write && written == len) || ok_report;
+    }
+
+    static void switch_neutral_rumble(uint8_t out4[4]) {
+        out4[0] = 0x00;
+        out4[1] = 0x01;
+        out4[2] = 0x40;
+        out4[3] = 0x40;
+    }
+
+    static uint8_t switch_amp7(uint8_t v) {
+        if (v == 0) return 0;
+        unsigned scaled = 1u + ((unsigned)v * 0x3Fu) / 255u;
+        return (uint8_t)std::clamp<unsigned>(scaled, 1u, 0x40u);
+    }
+
+    static void switch_pack_rumble_motor(uint8_t low, uint8_t high, uint8_t out4[4]) {
+        if (low == 0 && high == 0) {
+            switch_neutral_rumble(out4);
+            return;
+        }
+        const uint8_t low_amp  = switch_amp7(low);
+        const uint8_t high_amp = switch_amp7(high);
+        out4[0] = 0x00;
+        out4[1] = (uint8_t)std::clamp<int>(0x01 + high_amp, 0x01, 0x7F);
+        out4[2] = 0x40;
+        out4[3] = (uint8_t)std::clamp<int>(0x40 + low_amp, 0x40, 0x80);
+    }
+
+    static void switch_fill_rumble8(uint8_t out8[8], uint8_t low, uint8_t high) {
+        uint8_t motor[4];
+        switch_pack_rumble_motor(low, high, motor);
+        memcpy(out8 + 0, motor, 4);
+        memcpy(out8 + 4, motor, 4);
+    }
+
+    static bool switch_send_subcommand(Device* d, uint8_t subcmd, const uint8_t* payload, size_t payload_len) {
+        const size_t needed = 11 + payload_len;
+        std::vector<uint8_t> out(output_report_len(d, needed), 0);
+        out[0] = 0x01;
+        out[1] = d->switch_packet_counter++ & 0x0F;
+        uint8_t neutral[4];
+        switch_neutral_rumble(neutral);
+        memcpy(out.data() + 2, neutral, 4);
+        memcpy(out.data() + 6, neutral, 4);
+        out[10] = subcmd;
+        if (payload && payload_len) memcpy(out.data() + 11, payload, payload_len);
+        return write_hid_output(d, out.data(), out.size());
+    }
+
+    static void switch_enable_rumble_once(Device* d) {
+        if (!d || d->switch_rumble_enabled) return;
+        const uint8_t enable = 0x01;
+        d->switch_rumble_enabled = switch_send_subcommand(d, 0x48, &enable, 1);
+    }
+
+    static void send_switch_pro_rumble(Device* d, uint8_t low, uint8_t high) {
+        if (!d) return;
+        switch_enable_rumble_once(d);
+        std::vector<uint8_t> out(output_report_len(d, 10), 0);
+        out[0] = 0x10;
+        out[1] = d->switch_packet_counter++ & 0x0F;
+        switch_fill_rumble8(out.data() + 2, low, high);
+        write_hid_output(d, out.data(), out.size());
     }
 
     static std::vector<RawHidDeviceInfo> enumerate_supported_devices() {
@@ -988,6 +1157,166 @@ private:
 };
 
 static RawHidManager g_rawHid;
+
+// ── Generic WinMM joystick fallback ────────────────────────────────────────
+// Input-only fallback for DirectInput-style / cheap generic controllers.
+struct GenericJoyState {
+    bool connected = false;
+    ns::HIDReport input{};
+    UINT id = 0;
+    std::string name;
+};
+
+class GenericJoyManager {
+public:
+    void start() {
+        scan_devices();
+    }
+
+    std::array<GenericJoyState, 4> snapshot() {
+        uint64_t now = ns::now_us();
+        if (now - last_scan_us > 1'000'000ULL) scan_devices();
+
+        std::array<GenericJoyState, 4> out{};
+        int slot = 0;
+        for (auto& d : devices) {
+            if (slot >= 4) break;
+            ns::HIDReport rep;
+            if (!poll_device(d, rep)) continue;
+            out[slot].connected = true;
+            out[slot].input = rep;
+            out[slot].id = d.id;
+            out[slot].name = d.name;
+            slot++;
+        }
+        return out;
+    }
+
+private:
+    struct Device {
+        UINT id = 0;
+        JOYCAPSA caps{};
+        std::string name;
+    };
+
+    std::vector<Device> devices;
+    uint64_t last_scan_us = 0;
+
+    static std::string upper_copy(std::string s) {
+        for (char& c : s) c = (char)std::toupper((unsigned char)c);
+        return s;
+    }
+
+    static bool looks_like_xinput(const std::string& name) {
+        std::string n = upper_copy(name);
+        return n.find("XINPUT") != std::string::npos ||
+               n.find("XBOX") != std::string::npos ||
+               n.find("X-BOX") != std::string::npos;
+    }
+
+    static bool looks_like_known_raw(const std::string& name) {
+        std::string n = upper_copy(name);
+        return n.find("DUALSHOCK") != std::string::npos ||
+               n.find("DUALSENSE") != std::string::npos ||
+               n.find("WIRELESS CONTROLLER") != std::string::npos ||
+               n.find("NINTENDO") != std::string::npos ||
+               n.find("SWITCH") != std::string::npos ||
+               n.find("PRO CONTROLLER") != std::string::npos;
+    }
+
+    void scan_devices() {
+        last_scan_us = ns::now_us();
+        std::vector<Device> next;
+        UINT count = joyGetNumDevs();
+        for (UINT id = 0; id < count; ++id) {
+            JOYCAPSA caps{};
+            if (joyGetDevCapsA(id, &caps, sizeof(caps)) != JOYERR_NOERROR) continue;
+            std::string name = caps.szPname[0] ? caps.szPname : "Generic joystick";
+            if (looks_like_xinput(name)) continue;
+            if (looks_like_known_raw(name)) continue;
+
+            Device d{};
+            d.id = id;
+            d.caps = caps;
+            d.name = name;
+            next.push_back(d);
+        }
+        devices.swap(next);
+    }
+
+    static uint8_t axis_to_byte(DWORD value, UINT min_v, UINT max_v, bool invert = false) {
+        if (max_v <= min_v) return 128;
+        double t = (double)((int64_t)value - (int64_t)min_v) / (double)((int64_t)max_v - (int64_t)min_v);
+        t = std::clamp(t, 0.0, 1.0);
+        int v = (int)std::lround(t * 255.0);
+        if (v > 118 && v < 138) v = 128;
+        if (invert) v = 255 - v;
+        return (uint8_t)std::clamp(v, 0, 255);
+    }
+
+    static void apply_buttons(DWORD buttons, ns::HIDReport& r) {
+        auto down = [&](int idx) -> bool { return (buttons & (1u << idx)) != 0; };
+        if (down(0))  r.buttons |= ns::BTN_B;
+        if (down(1))  r.buttons |= ns::BTN_A;
+        if (down(2))  r.buttons |= ns::BTN_Y;
+        if (down(3))  r.buttons |= ns::BTN_X;
+        if (down(4))  r.buttons |= ns::BTN_L;
+        if (down(5))  r.buttons |= ns::BTN_R;
+        if (down(6))  r.buttons |= ns::BTN_ZL;
+        if (down(7))  r.buttons |= ns::BTN_ZR;
+        if (down(8))  r.buttons |= ns::BTN_MINUS;
+        if (down(9))  r.buttons |= ns::BTN_PLUS;
+        if (down(10)) r.buttons |= ns::BTN_LSTICK;
+        if (down(11)) r.buttons |= ns::BTN_RSTICK;
+        if (down(12)) r.buttons |= ns::BTN_HOME;
+        if (down(13)) r.buttons |= ns::BTN_CAPTURE;
+
+        if ((r.buttons & ns::BTN_LSTICK) && (r.buttons & ns::BTN_RSTICK)) {
+            r.buttons |= ns::BTN_HOME;
+            r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK);
+        }
+        if ((r.buttons & ns::BTN_MINUS) && (r.buttons & ns::BTN_PLUS)) {
+            r.buttons |= ns::BTN_CAPTURE;
+            r.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS);
+        }
+    }
+
+    static void apply_pov(DWORD pov, ns::HIDReport& r) {
+        if (pov == JOY_POVCENTERED || pov == 0xFFFFu) return;
+        DWORD deg = pov % 36000u;
+        if      (deg >= 33750 || deg < 2250) r.hat = ns::HAT_N;
+        else if (deg < 6750)                 r.hat = ns::HAT_NE;
+        else if (deg < 11250)                r.hat = ns::HAT_E;
+        else if (deg < 15750)                r.hat = ns::HAT_SE;
+        else if (deg < 20250)                r.hat = ns::HAT_S;
+        else if (deg < 24750)                r.hat = ns::HAT_SW;
+        else if (deg < 29250)                r.hat = ns::HAT_W;
+        else                                 r.hat = ns::HAT_NW;
+    }
+
+    static bool poll_device(const Device& d, ns::HIDReport& r) {
+        JOYINFOEX info{};
+        info.dwSize = sizeof(info);
+        info.dwFlags = JOY_RETURNALL;
+        if (joyGetPosEx(d.id, &info) != JOYERR_NOERROR) return false;
+
+        r.reset();
+        r.lx = axis_to_byte(info.dwXpos, d.caps.wXmin, d.caps.wXmax, false);
+        r.ly = axis_to_byte(info.dwYpos, d.caps.wYmin, d.caps.wYmax, false);
+        if (d.caps.wCaps & JOYCAPS_HASR)
+            r.rx = axis_to_byte(info.dwRpos, d.caps.wRmin, d.caps.wRmax, false);
+        if (d.caps.wCaps & JOYCAPS_HASU)
+            r.ry = axis_to_byte(info.dwUpos, d.caps.wUmin, d.caps.wUmax, false);
+        else if (d.caps.wCaps & JOYCAPS_HASZ)
+            r.ry = axis_to_byte(info.dwZpos, d.caps.wZmin, d.caps.wZmax, false);
+        apply_pov(info.dwPOV, r);
+        apply_buttons(info.dwButtons, r);
+        return true;
+    }
+};
+
+static GenericJoyManager g_genericJoy;
+static bool g_genericEnabled = true;
 
 class RumbleManager {
 public:
@@ -1395,7 +1724,7 @@ static void SaveKeyboardMode(int mode) {
 }
 
 
-enum { IDC_IP = 101, IDC_CONNECT, IDC_KEYBOARD_COMBO = 110, IDC_BINDINGS_BTN = 111, IDC_MACROS_BTN = 112, IDC_EDITOR_CHANGE = 200, IDC_EDITOR_SETUP = 400, IDC_EDITOR_RESET = 500, IDC_EDITOR_KEY_START = 300, IDC_MACRO_EDIT = 600, IDC_MACRO_RUN = 601, IDC_MACRO_SAVE = 602, IDC_MACRO_DELETE = 603, IDC_MACRO_CLOSE = 604, IDC_MACRO_RECORD_START = 605, IDC_MACRO_RECORD_STOP = 606, IDC_MACRO_IMPORT = 607, IDC_MACRO_EXPORT = 608 };
+enum { IDC_IP = 101, IDC_CONNECT, IDC_KEYBOARD_COMBO = 110, IDC_BINDINGS_BTN = 111, IDC_MACROS_BTN = 112, IDC_EDITOR_CHANGE = 200, IDC_EDITOR_SETUP = 400, IDC_EDITOR_RESET = 500, IDC_EDITOR_KEY_START = 300, IDC_MACRO_EDIT = 600, IDC_MACRO_RUN = 601, IDC_MACRO_SAVE = 602, IDC_MACRO_DELETE = 603, IDC_MACRO_CLOSE = 604, IDC_MACRO_RECORD_START = 605, IDC_MACRO_RECORD_STOP = 606, IDC_MACRO_IMPORT = 607, IDC_MACRO_EXPORT = 608, IDC_MACRO_HOTKEY = 609 };
 static HWND CreateButton(HWND parent, const wchar_t* text, int x, int y, int w, int h, int id);
 
 // ── Macro runtime/editor ────────────────────────────────────────────────────
@@ -1405,10 +1734,47 @@ static bool g_macro_running = false;
 static uint64_t g_macro_start_us = 0;
 static std::string g_macro_text;
 static std::string g_macro_upload_pending;
+static std::string g_macro_hotkey;
+static bool g_macro_hotkey_last_down = false;
 static HWND g_hMacroEdit = nullptr;
+static HWND g_hMacroHotkeyEdit = nullptr;
 static const wchar_t* REG_VAL_MACROS = L"MacrosJson";
+static const wchar_t* REG_VAL_MACRO_HOTKEY = L"MacroHotkey";
+
+static std::string MacroConfigDirA() {
+    char appdata[MAX_PATH]{};
+    DWORD n = GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        std::string dir = std::string(appdata) + "\\NSPCControl";
+        CreateDirectoryA(dir.c_str(), nullptr);
+        return dir;
+    }
+
+    char exe[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, exe, MAX_PATH);
+    std::string path = exe;
+    size_t slash = path.find_last_of("\\/");
+    return slash == std::string::npos ? "." : path.substr(0, slash);
+}
+
+static std::string MacroFilePathA() {
+    return MacroConfigDirA() + "\\macros.json";
+}
 
 static std::string LoadSavedMacrosText() {
+    std::string path = MacroFilePathA();
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (f) {
+        std::streamoff len = f.tellg();
+        if (len >= 0 && (uint64_t)len <= MACRO_JSON_MAX_BYTES) {
+            f.seekg(0, std::ios::beg);
+            std::string out((size_t)len, '\0');
+            if (len > 0) f.read(&out[0], len);
+            if (f || len == 0) return out;
+        }
+    }
+
+    // Backward compatibility with older builds that stored tiny macros in registry.
     HKEY hKey = nullptr;
     std::string out;
     if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -1419,20 +1785,75 @@ static std::string LoadSavedMacrosText() {
     }
     return out;
 }
+
+static std::string normalize_key_name(std::string s) {
+    s = macro_upper(macro_trim(s));
+    return s;
+}
+
+static std::string LoadSavedMacroHotkey() {
+    HKEY hKey = nullptr;
+    std::string out;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[64]{}; DWORD len = sizeof(buf); DWORD type = 0;
+        if (RegQueryValueExW(hKey, REG_VAL_MACRO_HOTKEY, nullptr, &type, (LPBYTE)buf, &len) == ERROR_SUCCESS && type == REG_SZ)
+            out = normalize_key_name(narrow(buf));
+        RegCloseKey(hKey);
+    }
+    return out;
+}
+
+static bool MacroHotkeyConflicts(const std::string& hotkey, std::string* conflict_name = nullptr) {
+    std::string hk = normalize_key_name(hotkey);
+    if (hk.empty()) return false;
+    for (const auto& kv : g_keyBindings) {
+        if (normalize_key_name(kv.second) == hk) {
+            if (conflict_name) *conflict_name = kv.first;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool SaveMacroHotkey(const std::string& hotkey_raw, HWND parent) {
+    std::string hk = normalize_key_name(hotkey_raw);
+    std::string conflict;
+    if (MacroHotkeyConflicts(hk, &conflict)) {
+        MessageBoxW(parent, widen("Macro hotkey conflicts with keyboard binding: " + conflict).c_str(),
+                    L"Macro hotkey", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
+    HKEY hKey = nullptr;
+    if (RegCreateKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
+        std::wstring whk = widen(hk);
+        RegSetValueExW(hKey, REG_VAL_MACRO_HOTKEY, 0, REG_SZ,
+                       (const BYTE*)whk.c_str(), (DWORD)((whk.size() + 1) * sizeof(wchar_t)));
+        RegCloseKey(hKey);
+    }
+    g_macro_hotkey = hk;
+    return true;
+}
+
 static bool SaveMacrosText(const std::string& txt) {
     std::string pretty, err;
     if (!macro_validate_to_pretty_json(txt, pretty, err, "Macro")) {
         MessageBoxW(g_hWnd, widen("Invalid macro: " + err).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING);
         return false;
     }
-    const std::string& txt_to_save = pretty;
-    HKEY hKey = nullptr;
-    if (RegCreateKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
-        std::wstring w = widen(txt_to_save);
-        RegSetValueExW(hKey, REG_VAL_MACROS, 0, REG_SZ, (const BYTE*)w.c_str(), (DWORD)((w.size()+1)*sizeof(wchar_t)));
-        RegCloseKey(hKey);
+
+    std::string path = MacroFilePathA();
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        MessageBoxW(g_hWnd, widen("Could not save macros to " + path).c_str(), L"Macro save", MB_OK | MB_ICONERROR);
+        return false;
     }
-    g_macro_text = txt_to_save;
+    f.write(pretty.data(), (std::streamsize)pretty.size());
+    if (!f) {
+        MessageBoxW(g_hWnd, L"Failed while writing macros file.", L"Macro save", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    g_macro_text = pretty;
     return true;
 }
 static bool StartMacroText(const std::string& txt) {
@@ -1441,10 +1862,15 @@ static bool StartMacroText(const std::string& txt) {
         MessageBoxW(g_hWnd, widen("Invalid macro: " + macro_last_error()).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING);
         return false;
     }
+    std::string pretty, err;
+    if (!macro_validate_to_pretty_json(txt, pretty, err, "Macro")) {
+        MessageBoxW(g_hWnd, widen("Invalid macro: " + err).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING);
+        return false;
+    }
     std::lock_guard<std::mutex> lk(g_macro_mtx);
-    g_macro_upload_pending = txt;
+    g_macro_upload_pending = pretty;
     g_macro_steps = std::move(parsed);
-    g_macro_running = false;
+    g_macro_running = false; // server-side playback handles merging; local fallback stays off by default
     g_macro_start_us = ns::now_us();
     return true;
 }
@@ -1521,20 +1947,50 @@ static void MacroRecordSample(const ns::HIDReport& report) {
     }
 }
 static bool ApplyMacroOverride(ns::HIDReport logicalReports[4], bool present[4], bool hasMotion[4], int xinputForSlot[4], int rawForSlot[4]) {
+    (void)hasMotion;
+    (void)xinputForSlot;
+    (void)rawForSlot;
+
     std::lock_guard<std::mutex> lk(g_macro_mtx);
     if (!g_macro_running) return false;
+
     uint64_t elapsed_ms = (ns::now_us() - g_macro_start_us) / 1000ULL;
-    ns::HIDReport mr; bool active = macro_report_at(g_macro_steps, elapsed_ms, mr);
-    for (int i = 0; i < 4; ++i) { logicalReports[i].reset(); present[i] = false; hasMotion[i] = false; xinputForSlot[i] = rawForSlot[i] = -1; }
-    logicalReports[0] = mr; present[0] = true;
-    if (!active && elapsed_ms > macro_total_ms(g_macro_steps) + 120) g_macro_running = false;
-    return true;
+    ns::HIDReport mr;
+    bool active = macro_report_at(g_macro_steps, elapsed_ms, mr);
+
+    if (active) {
+        logicalReports[0].buttons |= mr.buttons;
+        if (mr.hat != ns::HAT_NEUTRAL) logicalReports[0].hat = mr.hat;
+        if (mr.has_lstick || mr.lx != 128 || mr.ly != 128) {
+            logicalReports[0].lx = mr.lx;
+            logicalReports[0].ly = mr.ly;
+        }
+        if (mr.has_rstick || mr.rx != 128 || mr.ry != 128) {
+            logicalReports[0].rx = mr.rx;
+            logicalReports[0].ry = mr.ry;
+        }
+        present[0] = true;
+    }
+
+    if (!active && elapsed_ms > macro_total_ms(g_macro_steps) + 120) {
+        g_macro_running = false;
+        return false;
+    }
+    return active;
 }
 static std::string GetMacroEditText() {
     int len = GetWindowTextLengthW(g_hMacroEdit);
     std::wstring w((size_t)len, L'\0');
     GetWindowTextW(g_hMacroEdit, &w[0], len + 1);
     return narrow(w.c_str());
+}
+
+static std::string GetMacroHotkeyEditText() {
+    if (!g_hMacroHotkeyEdit) return "";
+    int len = GetWindowTextLengthW(g_hMacroHotkeyEdit);
+    std::wstring w((size_t)len, L'\0');
+    GetWindowTextW(g_hMacroHotkeyEdit, &w[0], len + 1);
+    return normalize_key_name(narrow(w.c_str()));
 }
 
 static bool MacroReadFileDialog(HWND parent, std::string& out) {
@@ -1563,25 +2019,42 @@ static LRESULT CALLBACK MacroEditorProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
     case WM_CREATE: {
         HFONT font = CreateFont(14,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Consolas");
         CreateWindowW(L"STATIC", L"JSON/commands, or record live P1 buttons while connected.", WS_VISIBLE|WS_CHILD, 12, 10, 560, 20, hWnd, nullptr, g_hInst, nullptr);
-        g_hMacroEdit = CreateWindowW(L"EDIT", L"", WS_VISIBLE|WS_CHILD|WS_BORDER|ES_LEFT|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL, 12, 36, 560, 170, hWnd, (HMENU)IDC_MACRO_EDIT, g_hInst, nullptr);
+        g_hMacroEdit = CreateWindowW(L"EDIT", L"", WS_VISIBLE|WS_CHILD|WS_BORDER|ES_LEFT|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL, 12, 36, 560, 160, hWnd, (HMENU)IDC_MACRO_EDIT, g_hInst, nullptr);
         SendMessage(g_hMacroEdit, WM_SETFONT, (WPARAM)font, TRUE);
         g_macro_text = LoadSavedMacrosText();
+        g_macro_hotkey = LoadSavedMacroHotkey();
         std::wstring initial = widen(g_macro_text.empty() ? "{\"name\":\"Macro\",\"commands\":\"WAIT 200; A 100; B 100\"}" : g_macro_text);
         SetWindowTextW(g_hMacroEdit, initial.c_str());
-        CreateButton(hWnd, L"Run", 12, 218, 82, 28, IDC_MACRO_RUN);
-        CreateButton(hWnd, L"Save/Add", 104, 218, 92, 28, IDC_MACRO_SAVE);
-        CreateButton(hWnd, L"Delete", 206, 218, 82, 28, IDC_MACRO_DELETE);
-        CreateButton(hWnd, L"Record", 298, 218, 82, 28, IDC_MACRO_RECORD_START);
-        CreateButton(hWnd, L"Stop Rec", 390, 218, 90, 28, IDC_MACRO_RECORD_STOP);
-        CreateButton(hWnd, L"Close", 490, 218, 82, 28, IDC_MACRO_CLOSE);
-        CreateButton(hWnd, L"Import JSON", 12, 252, 110, 28, IDC_MACRO_IMPORT);
-        CreateButton(hWnd, L"Export JSON", 132, 252, 110, 28, IDC_MACRO_EXPORT);
+
+        CreateWindowW(L"STATIC", L"Macro hotkey (optional, must not duplicate keyboard bindings):", WS_VISIBLE|WS_CHILD, 12, 205, 560, 20, hWnd, nullptr, g_hInst, nullptr);
+        g_hMacroHotkeyEdit = CreateWindowW(L"EDIT", widen(g_macro_hotkey).c_str(), WS_VISIBLE|WS_CHILD|WS_BORDER|ES_LEFT, 12, 228, 160, 24, hWnd, (HMENU)IDC_MACRO_HOTKEY, g_hInst, nullptr);
+        SendMessage(g_hMacroHotkeyEdit, WM_SETFONT, (WPARAM)font, TRUE);
+
+        CreateButton(hWnd, L"Run", 12, 264, 82, 28, IDC_MACRO_RUN);
+        CreateButton(hWnd, L"Save/Add", 104, 264, 92, 28, IDC_MACRO_SAVE);
+        CreateButton(hWnd, L"Delete", 206, 264, 82, 28, IDC_MACRO_DELETE);
+        CreateButton(hWnd, L"Record", 298, 264, 82, 28, IDC_MACRO_RECORD_START);
+        CreateButton(hWnd, L"Stop Rec", 390, 264, 90, 28, IDC_MACRO_RECORD_STOP);
+        CreateButton(hWnd, L"Close", 490, 264, 82, 28, IDC_MACRO_CLOSE);
+        CreateButton(hWnd, L"Import JSON", 12, 302, 110, 28, IDC_MACRO_IMPORT);
+        CreateButton(hWnd, L"Export JSON", 132, 302, 110, 28, IDC_MACRO_EXPORT);
         break;
     }
     case WM_COMMAND: {
         int id = LOWORD(wParam);
         if (id == IDC_MACRO_RUN) StartMacroText(GetMacroEditText());
-        else if (id == IDC_MACRO_SAVE) { std::string pretty; std::string err; if (macro_validate_to_pretty_json(GetMacroEditText(), pretty, err, "Macro")) { SaveMacrosText(pretty); SetWindowTextW(g_hMacroEdit, widen(pretty).c_str()); } else MessageBoxW(hWnd, widen("Invalid macro: " + err).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING); }
+        else if (id == IDC_MACRO_SAVE) {
+            std::string pretty; std::string err;
+            std::string hotkey = GetMacroHotkeyEditText();
+            if (!SaveMacroHotkey(hotkey, hWnd)) {
+                // warning already shown
+            } else if (macro_validate_to_pretty_json(GetMacroEditText(), pretty, err, "Macro")) {
+                SaveMacrosText(pretty);
+                SetWindowTextW(g_hMacroEdit, widen(pretty).c_str());
+            } else {
+                MessageBoxW(hWnd, widen("Invalid macro: " + err).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING);
+            }
+        }
         else if (id == IDC_MACRO_DELETE) { SaveMacrosText(""); SetWindowTextW(g_hMacroEdit, L""); }
         else if (id == IDC_MACRO_RECORD_START) { MacroRecordStart(); SetWindowTextW(g_hMacroEdit, L"Recording... play on P1, then press Stop Rec."); }
         else if (id == IDC_MACRO_RECORD_STOP) { std::string rec = MacroRecordStop(); SaveMacrosText(rec); SetWindowTextW(g_hMacroEdit, widen(rec).c_str()); }
@@ -1596,7 +2069,7 @@ static LRESULT CALLBACK MacroEditorProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
     return 0;
 }
 static void ShowMacroEditor(HWND parent) {
-    HWND h = CreateWindowW(L"NSMacroEditor", L"Macros", WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 600, 340, parent, nullptr, g_hInst, nullptr);
+    HWND h = CreateWindowW(L"NSMacroEditor", L"Macros", WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 600, 390, parent, nullptr, g_hInst, nullptr);
     if (h) ShowWindow(h, SW_SHOW);
 }
 
@@ -1703,6 +2176,7 @@ static void apply_keyboard_to_report(ns::HIDReport& rep, bool override_mode) {
 // ── Sender thread (4-Player) ──
 static void SenderThread() {
     g_rawHid.start();
+    if (g_genericEnabled) g_genericJoy.start();
 
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock == INVALID_SOCKET) return;
@@ -1734,6 +2208,16 @@ static void SenderThread() {
             { std::lock_guard<std::mutex> lk(g_macro_mtx); upload.swap(g_macro_upload_pending); }
             if (!upload.empty()) send_macro_udp_packet(sock, dest, g_hmacKey, upload, 0);
         }
+
+        if (!g_macro_hotkey.empty()) {
+            bool down = key_is_down(g_macro_hotkey);
+            if (down && !g_macro_hotkey_last_down) {
+                std::string saved = LoadSavedMacrosText();
+                if (!saved.empty()) StartMacroText(saved);
+            }
+            g_macro_hotkey_last_down = down;
+        }
+
         ns::HIDReport logicalReports[4];
         ns::MotionReport logicalMotion[4];
         bool present[4] = {false, false, false, false};
@@ -1788,6 +2272,25 @@ static void SenderThread() {
             else if (target == 1) c2 = true;
             else if (target == 2) c3 = true;
             else if (target == 3) c4 = true;
+        }
+
+        // Generic WinMM fallback. This is input-only, but catches DirectInput-style pads.
+        if (g_genericEnabled) {
+            auto generic = g_genericJoy.snapshot();
+            for (int i = 0; i < 4; ++i) {
+                if (!generic[i].connected) continue;
+                int target = i;
+                if (present[target]) {
+                    target = -1;
+                    for (int s = 0; s < 4; ++s) {
+                        if (!present[s]) { target = s; break; }
+                    }
+                }
+                if (target < 0) continue;
+                logicalReports[target] = generic[i].input;
+                present[target] = true;
+                activeCount++;
+            }
         }
 
         // Keyboard modes are kept exactly as before, only now they fill the new
@@ -1862,37 +2365,47 @@ static void SenderThread() {
 
 // ── Update P1-P4 status display ──
 static void UpdateControllerStatus() {
-    wchar_t buf[64];
+    wchar_t buf[128];
     HWND hText[4] = { g_hP1Text, g_hP2Text, g_hP3Text, g_hP4Text };
     int km = g_keyboardMode.load();
+    auto raw = g_rawHid.snapshot();
+    std::array<GenericJoyState, 4> generic{};
+    if (g_genericEnabled) generic = g_genericJoy.snapshot();
+
     for (DWORD i = 0; i < 4; i++) {
         if (i == 0 && km != KB_OFF) {
             if (km == KB_SINGLE) {
-                swprintf(buf, 64, L"P1: Keyboard");
+                swprintf(buf, 128, L"P1: Keyboard");
             } else {
-                XINPUT_CAPABILITIES caps{};
-                bool present = (XInputGetCapabilities(0, 0, &caps) == ERROR_SUCCESS);
-                bool conn = g_connected && g_is_connected[0];
-                if (conn || present) {
-                    swprintf(buf, 64, L"P1: %s / Keyboard", conn ? L"Connected" : L"Idle");
-                } else {
-                    swprintf(buf, 64, L"P1: Idle / Keyboard");
-                }
+                XINPUT_CAPABILITIES caps0{};
+                bool xinputPresent = g_connected ? g_is_connected[0] : (XInputGetCapabilities(0, 0, &caps0) == ERROR_SUCCESS);
+                bool rawPresent = raw[0].connected;
+                bool genericPresent = generic[0].connected;
+                if (xinputPresent || rawPresent || genericPresent)
+                    swprintf(buf, 128, L"P1: Controller / Keyboard");
+                else
+                    swprintf(buf, 128, L"P1: Idle / Keyboard");
             }
             SetWindowText(hText[i], buf);
             continue;
         }
+
         XINPUT_CAPABILITIES caps{};
-        bool present = (XInputGetCapabilities(i, 0, &caps) == ERROR_SUCCESS);
-        if (g_connected) {
-            swprintf(buf, 64, L"P%d: %s", i + 1, g_is_connected[i] ? L"Connected" : L"Idle");
+        bool xinputPresent = (XInputGetCapabilities(i, 0, &caps) == ERROR_SUCCESS);
+        if (g_connected && g_is_connected[i]) {
+            swprintf(buf, 128, L"P%d: XInput", i + 1);
+        } else if (raw[i].connected) {
+            std::wstring name = widen(raw[i].name.empty() ? "Raw HID" : raw[i].name);
+            swprintf(buf, 128, L"P%d: %s", i + 1, name.c_str());
+        } else if (generic[i].connected) {
+            std::wstring name = widen(generic[i].name.empty() ? "Generic joystick" : generic[i].name);
+            swprintf(buf, 128, L"P%d: %s", i + 1, name.c_str());
         } else {
-            swprintf(buf, 64, L"P%d: %s", i + 1, present ? L"Available" : L"Not connected");
+            swprintf(buf, 128, L"P%d: %s", i + 1, xinputPresent ? L"Available" : L"Not connected");
         }
         SetWindowText(hText[i], buf);
     }
 }
-
 // ── Connect ──
 static void DoConnect(HWND hWnd) {
     if (g_connected) return;
@@ -1922,6 +2435,9 @@ static void DoConnect(HWND hWnd) {
     g_targetHost = hostA;
     g_targetPort = (uint16_t)port;
     g_packetCount = 0;
+    g_macro_text = LoadSavedMacrosText();
+    g_macro_hotkey = LoadSavedMacroHotkey();
+    g_macro_hotkey_last_down = false;
 
     for (int i = 0; i < 4; i++) {
         g_is_connected[i] = false;
@@ -2412,7 +2928,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
 
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);
+    g_genericEnabled = !(getenv("NSPC_NO_GENERIC") && strcmp(getenv("NSPC_NO_GENERIC"), "0") != 0);
     g_rawHid.start();
+    if (g_genericEnabled) g_genericJoy.start();
 
     // Load icon from embedded resource (ID 1 from ns-gui.rc)
     HICON hIcon =     LoadIcon(hInst, MAKEINTRESOURCE(1));

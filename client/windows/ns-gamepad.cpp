@@ -358,24 +358,114 @@ static bool macro_parse_one_command(const std::string& part, MacroStep& st, std:
 }
 
 static bool macro_validate_text(const std::string& raw_text, std::vector<MacroStep>& steps, std::vector<std::string>* normalized = nullptr) {
+    static constexpr size_t MACRO_EXPANDED_STEP_LIMIT = 1000000;
+
     g_macro_last_error.clear();
     steps.clear();
     if (normalized) normalized->clear();
+
     std::string text, err;
-    if (!macro_extract_commands_text(raw_text, text, err)) { macro_set_error(err); return false; }
-    for (char& c : text) if (c == '\n' || c == '\r') c = ';';
+    if (!macro_extract_commands_text(raw_text, text, err)) {
+        macro_set_error(err);
+        return false;
+    }
+
+    for (char& c : text) {
+        if (c == '\n' || c == '\r') c = ';';
+    }
+
+    std::vector<std::string> parts;
     size_t pos = 0;
     while (pos < text.size()) {
         size_t semi = text.find(';', pos);
-        std::string part = macro_trim(text.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos));
+        std::string part = macro_trim(text.substr(
+            pos,
+            semi == std::string::npos ? std::string::npos : semi - pos
+        ));
         pos = (semi == std::string::npos) ? text.size() : semi + 1;
-        if (part.empty()) continue;
-        MacroStep st;
-        if (!macro_parse_one_command(part, st, err)) { macro_set_error(err); return false; }
-        steps.push_back(st);
+
+        // Allow readable macro files with comments:
+        //   # drift wiggle
+        //   R+LSTICK_LEFT 450
+        if (part.empty() || part[0] == '#') continue;
+
+        parts.push_back(part);
         if (normalized) normalized->push_back(part);
     }
-    if (steps.empty()) { macro_set_error("no valid macro commands found"); return false; }
+
+    if (parts.empty()) {
+        macro_set_error("no valid macro commands found");
+        return false;
+    }
+
+    auto append_segment = [&](const std::vector<MacroStep>& segment, uint32_t repeat_count) -> bool {
+        if (segment.empty()) {
+            macro_set_error("LOOP has no commands to repeat");
+            return false;
+        }
+        if (repeat_count == 0) {
+            macro_set_error("LOOP count must be greater than zero");
+            return false;
+        }
+        if (segment.size() > 0 && repeat_count > MACRO_EXPANDED_STEP_LIMIT / segment.size()) {
+            macro_set_error("macro expands to too many steps");
+            return false;
+        }
+        if (steps.size() + segment.size() * (size_t)repeat_count > MACRO_EXPANDED_STEP_LIMIT) {
+            macro_set_error("macro expands to too many steps");
+            return false;
+        }
+        for (uint32_t r = 0; r < repeat_count; ++r) {
+            steps.insert(steps.end(), segment.begin(), segment.end());
+        }
+        return true;
+    };
+
+    std::vector<MacroStep> segment;
+    for (const std::string& part : parts) {
+        size_t last_space = part.find_last_of(" \t");
+        if (last_space == std::string::npos) {
+            macro_set_error("missing duration in command: " + part);
+            return false;
+        }
+
+        std::string cmd = macro_upper(macro_trim(part.substr(0, last_space)));
+        if (cmd == "LOOP") {
+            uint32_t repeat_count = 0;
+            std::string count_s = macro_trim(part.substr(last_space + 1));
+            if (!macro_parse_uint32_strict(count_s, repeat_count)) {
+                macro_set_error("invalid LOOP count in command: " + part);
+                return false;
+            }
+
+            // LOOP n repeats the block since the start or the previous LOOP,
+            // n total times. The block is then closed and the next command
+            // starts a new block.
+            if (!append_segment(segment, repeat_count)) return false;
+            segment.clear();
+            continue;
+        }
+
+        MacroStep st;
+        if (!macro_parse_one_command(part, st, err)) {
+            macro_set_error(err);
+            return false;
+        }
+        segment.push_back(st);
+    }
+
+    if (!segment.empty()) {
+        if (steps.size() + segment.size() > MACRO_EXPANDED_STEP_LIMIT) {
+            macro_set_error("macro expands to too many steps");
+            return false;
+        }
+        steps.insert(steps.end(), segment.begin(), segment.end());
+    }
+
+    if (steps.empty()) {
+        macro_set_error("no valid macro commands found");
+        return false;
+    }
     return true;
 }
 
@@ -764,6 +854,8 @@ public:
             DWORD written = 0;
             WriteFile(d->handle, out, sizeof(out), &written, nullptr);
             HidD_SetOutputReport(d->handle, out, sizeof(out));
+        } else if (is_switch_pro(d->info.vid, d->info.pid)) {
+            send_switch_pro_rumble(d, low, high);
         }
     }
 
@@ -772,6 +864,8 @@ private:
         HANDLE handle = INVALID_HANDLE_VALUE;
         RawHidDeviceInfo info{};
         int slot = -1;
+        uint8_t switch_packet_counter = 0;
+        bool switch_rumble_enabled = false;
         std::thread thread;
         ~Device() {
             if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
@@ -802,6 +896,99 @@ private:
         if (is_switch_pro(vid, pid)) return "Nintendo Switch Pro Controller";
         return "Raw HID controller";
     }
+
+    static size_t output_report_len(const Device* d, size_t needed) {
+        size_t len = d && d->info.output_len ? (size_t)d->info.output_len : 64;
+        return std::max(len, needed);
+    }
+
+    static bool write_hid_output(Device* d, const uint8_t* data, size_t len) {
+        if (!d || d->handle == INVALID_HANDLE_VALUE || !data || len == 0) return false;
+        DWORD written = 0;
+        BOOL ok_write = WriteFile(d->handle, data, (DWORD)len, &written, nullptr);
+        BOOL ok_feature = HidD_SetOutputReport(d->handle, const_cast<PVOID>(reinterpret_cast<const void*>(data)), (ULONG)len);
+        return (ok_write && written == len) || ok_feature;
+    }
+
+    static void switch_neutral_rumble(uint8_t out4[4]) {
+        // Neutral HD-rumble frame used by Nintendo controllers.
+        out4[0] = 0x00;
+        out4[1] = 0x01;
+        out4[2] = 0x40;
+        out4[3] = 0x40;
+    }
+
+    static uint8_t switch_amp7(uint8_t v) {
+        if (v == 0) return 0;
+        // Conservative 7-bit-ish amplitude. HD rumble can get harsh very quickly,
+        // so do not drive it to the absolute edge from a normal 0..255 motor byte.
+        unsigned scaled = 1u + ((unsigned)v * 0x3Fu) / 255u;
+        return (uint8_t)std::clamp<unsigned>(scaled, 1u, 0x40u);
+    }
+
+    static void switch_pack_rumble_motor(uint8_t low, uint8_t high, uint8_t out4[4]) {
+        if (low == 0 && high == 0) {
+            switch_neutral_rumble(out4);
+            return;
+        }
+
+        // Best-effort conversion from classic low/high motor bytes to Nintendo's
+        // packed HD-rumble bytes. The base frequency bytes stay on the known-safe
+        // neutral carrier, and we add conservative amplitude to each side.
+        const uint8_t low_amp  = switch_amp7(low);
+        const uint8_t high_amp = switch_amp7(high);
+
+        out4[0] = 0x00;
+        out4[1] = (uint8_t)std::clamp<int>(0x01 + high_amp, 0x01, 0x7F);
+        out4[2] = 0x40;
+        out4[3] = (uint8_t)std::clamp<int>(0x40 + low_amp, 0x40, 0x80);
+    }
+
+    static void switch_fill_rumble8(uint8_t out8[8], uint8_t low, uint8_t high) {
+        uint8_t motor[4];
+        switch_pack_rumble_motor(low, high, motor);
+        // Pro Controller expects left and right rumble slots. We mirror the effect
+        // because the bridge receives classic low/high motor magnitudes, not
+        // separate left/right HD-rumble waveforms.
+        memcpy(out8 + 0, motor, 4);
+        memcpy(out8 + 4, motor, 4);
+    }
+
+    static bool switch_send_subcommand(Device* d, uint8_t subcmd, const uint8_t* payload, size_t payload_len) {
+        const size_t needed = 11 + payload_len;
+        std::vector<uint8_t> out(output_report_len(d, needed), 0);
+        out[0] = 0x01; // output report: subcommand + rumble
+        out[1] = d->switch_packet_counter++ & 0x0F;
+        uint8_t neutral[4];
+        switch_neutral_rumble(neutral);
+        memcpy(out.data() + 2, neutral, 4);
+        memcpy(out.data() + 6, neutral, 4);
+        out[10] = subcmd;
+        if (payload && payload_len) memcpy(out.data() + 11, payload, payload_len);
+        return write_hid_output(d, out.data(), out.size());
+    }
+
+    static void switch_enable_rumble_once(Device* d) {
+        if (!d || d->switch_rumble_enabled) return;
+        const uint8_t enable = 0x01;
+        // 0x48 = enable vibration. Without this, 0x10 rumble-only packets may be ignored.
+        d->switch_rumble_enabled = switch_send_subcommand(d, 0x48, &enable, 1);
+    }
+
+    static void send_switch_pro_rumble(Device* d, uint8_t low, uint8_t high) {
+        if (!d) return;
+        switch_enable_rumble_once(d);
+
+        std::vector<uint8_t> out(output_report_len(d, 10), 0);
+        out[0] = 0x10; // output report: rumble only
+        out[1] = d->switch_packet_counter++ & 0x0F;
+        switch_fill_rumble8(out.data() + 2, low, high);
+
+        // Try both normal write and HID output report path. Different Windows HID
+        // stacks expose Switch Pro output in slightly different ways.
+        write_hid_output(d, out.data(), out.size());
+    }
+
 
     static std::vector<RawHidDeviceInfo> enumerate_supported_devices() {
         std::vector<RawHidDeviceInfo> out;
@@ -1005,6 +1192,206 @@ private:
             states[d->slot].motion = motion;
             states[d->slot].has_motion = has_motion;
         }
+    }
+};
+
+// ── Generic WinMM joystick fallback ────────────────────────────────────────
+// XInput only sees Xbox-style pads, and Raw HID only covers the devices we know
+// how to parse deeply. WinMM's joystick API is ugly and old, but it gives us a
+// broad DirectInput-style fallback so generic USB/Bluetooth controllers can at
+// least provide normal buttons/sticks without DS4Windows or vendor software.
+//
+// Notes:
+//   - Input only. Generic WinMM does not expose a standard rumble/gyro path.
+//   - XInput-looking devices are skipped to avoid duplicate Xbox pads.
+//   - When Raw HID is enabled, known DS4/DualSense/Switch-Pro names are skipped
+//     so their richer gyro/raw path wins instead of being duplicated.
+struct GenericJoyState {
+    bool connected = false;
+    ns::HIDReport input{};
+    UINT id = 0;
+    std::string name;
+};
+
+class GenericJoyManager {
+public:
+    explicit GenericJoyManager(bool skip_known_raw_devices) : skip_known_raw(skip_known_raw_devices) {}
+
+    void start() {
+        scan_devices(true);
+        if (devices.empty()) {
+            std::cout << "No generic WinMM joystick fallback devices detected.\n";
+        }
+    }
+
+    std::array<GenericJoyState, 4> snapshot() {
+        uint64_t now = ns::now_us();
+        if (now - last_scan_us > 1'000'000ULL) scan_devices(false);
+
+        std::array<GenericJoyState, 4> out{};
+        int slot = 0;
+        for (auto& d : devices) {
+            if (slot >= 4) break;
+            ns::HIDReport rep;
+            bool ok = poll_device(d, rep);
+            if (!ok) {
+                if (d.was_connected) {
+                    std::cout << "Generic joystick '" << d.name << "' disconnected.\n";
+                    d.was_connected = false;
+                }
+                continue;
+            }
+            if (!d.was_connected) {
+                std::cout << "Generic joystick fallback P" << (slot + 1) << ": " << d.name << "\n";
+                d.was_connected = true;
+            }
+            out[slot].connected = true;
+            out[slot].input = rep;
+            out[slot].id = d.id;
+            out[slot].name = d.name;
+            slot++;
+        }
+        return out;
+    }
+
+private:
+    struct Device {
+        UINT id = 0;
+        JOYCAPSA caps{};
+        std::string name;
+        bool was_connected = false;
+    };
+
+    std::vector<Device> devices;
+    bool skip_known_raw = true;
+    uint64_t last_scan_us = 0;
+
+    static std::string upper_copy(std::string s) {
+        for (char& c : s) c = (char)std::toupper((unsigned char)c);
+        return s;
+    }
+
+    static bool looks_like_xinput(const std::string& name) {
+        std::string n = upper_copy(name);
+        return n.find("XINPUT") != std::string::npos ||
+               n.find("XBOX") != std::string::npos ||
+               n.find("X-BOX") != std::string::npos;
+    }
+
+    static bool looks_like_known_raw(const std::string& name) {
+        std::string n = upper_copy(name);
+        return n.find("DUALSHOCK") != std::string::npos ||
+               n.find("DUALSENSE") != std::string::npos ||
+               n.find("WIRELESS CONTROLLER") != std::string::npos ||
+               n.find("NINTENDO") != std::string::npos ||
+               n.find("SWITCH") != std::string::npos ||
+               n.find("PRO CONTROLLER") != std::string::npos;
+    }
+
+    void scan_devices(bool verbose) {
+        last_scan_us = ns::now_us();
+        std::vector<Device> next;
+        UINT count = joyGetNumDevs();
+        for (UINT id = 0; id < count; ++id) {
+            JOYCAPSA caps{};
+            if (joyGetDevCapsA(id, &caps, sizeof(caps)) != JOYERR_NOERROR) continue;
+            std::string name = caps.szPname[0] ? caps.szPname : "Generic joystick";
+            if (looks_like_xinput(name)) continue;
+            if (skip_known_raw && looks_like_known_raw(name)) continue;
+
+            Device d{};
+            d.id = id;
+            d.caps = caps;
+            d.name = name;
+            for (const auto& old : devices) {
+                if (old.id == id && old.name == name) {
+                    d.was_connected = old.was_connected;
+                    break;
+                }
+            }
+            next.push_back(d);
+        }
+        devices.swap(next);
+        if (verbose && !devices.empty()) {
+            std::cout << "Generic WinMM joystick fallback enabled for " << devices.size()
+                      << " possible device(s).\n";
+        }
+    }
+
+    static uint8_t axis_to_byte(DWORD value, UINT min_v, UINT max_v, bool invert = false) {
+        if (max_v <= min_v) return 128;
+        double t = (double)((int64_t)value - (int64_t)min_v) / (double)((int64_t)max_v - (int64_t)min_v);
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+        int v = (int)std::lround(t * 255.0);
+        if (v > 118 && v < 138) v = 128; // simple center deadzone
+        if (invert) v = 255 - v;
+        return (uint8_t)std::clamp(v, 0, 255);
+    }
+
+    static void apply_buttons(DWORD buttons, ns::HIDReport& r) {
+        auto down = [&](int idx) -> bool { return (buttons & (1u << idx)) != 0; };
+        // Generic DirectInput/WinMM button order is not truly standardized, but
+        // this is the common Xbox-like order most cheap USB pads expose.
+        if (down(0))  r.buttons |= ns::BTN_B;       // physical A / Cross
+        if (down(1))  r.buttons |= ns::BTN_A;       // physical B / Circle
+        if (down(2))  r.buttons |= ns::BTN_Y;       // physical X / Square
+        if (down(3))  r.buttons |= ns::BTN_X;       // physical Y / Triangle
+        if (down(4))  r.buttons |= ns::BTN_L;
+        if (down(5))  r.buttons |= ns::BTN_R;
+        if (down(6))  r.buttons |= ns::BTN_ZL;
+        if (down(7))  r.buttons |= ns::BTN_ZR;
+        if (down(8))  r.buttons |= ns::BTN_MINUS;
+        if (down(9))  r.buttons |= ns::BTN_PLUS;
+        if (down(10)) r.buttons |= ns::BTN_LSTICK;
+        if (down(11)) r.buttons |= ns::BTN_RSTICK;
+        if (down(12)) r.buttons |= ns::BTN_HOME;
+        if (down(13)) r.buttons |= ns::BTN_CAPTURE;
+
+        if ((r.buttons & ns::BTN_LSTICK) && (r.buttons & ns::BTN_RSTICK)) {
+            r.buttons |= ns::BTN_HOME;
+            r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK);
+        }
+        if ((r.buttons & ns::BTN_MINUS) && (r.buttons & ns::BTN_PLUS)) {
+            r.buttons |= ns::BTN_CAPTURE;
+            r.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS);
+        }
+    }
+
+    static void apply_pov(DWORD pov, ns::HIDReport& r) {
+        if (pov == JOY_POVCENTERED || pov == 0xFFFFu) return;
+        // WinMM POV is in hundredths of a degree clockwise from up.
+        DWORD deg = pov % 36000u;
+        if      (deg >= 33750 || deg < 2250)   r.hat = ns::HAT_N;
+        else if (deg < 6750)                   r.hat = ns::HAT_NE;
+        else if (deg < 11250)                  r.hat = ns::HAT_E;
+        else if (deg < 15750)                  r.hat = ns::HAT_SE;
+        else if (deg < 20250)                  r.hat = ns::HAT_S;
+        else if (deg < 24750)                  r.hat = ns::HAT_SW;
+        else if (deg < 29250)                  r.hat = ns::HAT_W;
+        else                                   r.hat = ns::HAT_NW;
+    }
+
+    static bool poll_device(const Device& d, ns::HIDReport& r) {
+        JOYINFOEX info{};
+        info.dwSize = sizeof(info);
+        info.dwFlags = JOY_RETURNALL;
+        if (joyGetPosEx(d.id, &info) != JOYERR_NOERROR) return false;
+
+        r.reset();
+        r.lx = axis_to_byte(info.dwXpos, d.caps.wXmin, d.caps.wXmax, false);
+        r.ly = axis_to_byte(info.dwYpos, d.caps.wYmin, d.caps.wYmax, false);
+
+        if (d.caps.wCaps & JOYCAPS_HASR)
+            r.rx = axis_to_byte(info.dwRpos, d.caps.wRmin, d.caps.wRmax, false);
+        if (d.caps.wCaps & JOYCAPS_HASU)
+            r.ry = axis_to_byte(info.dwUpos, d.caps.wUmin, d.caps.wUmax, false);
+        else if (d.caps.wCaps & JOYCAPS_HASZ)
+            r.ry = axis_to_byte(info.dwZpos, d.caps.wZmin, d.caps.wZmax, false);
+
+        apply_pov(info.dwPOV, r);
+        apply_buttons(info.dwButtons, r);
+        return true;
     }
 };
 
@@ -1369,10 +1756,11 @@ int main(int argc, char** argv) {
     timeBeginPeriod(1);
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP[:PORT]> [-k [single|override]] [--legacy] [--no-raw] [--macro file.json [--upload-macro file.json]]\n";
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP[:PORT]> [-k [single|override]] [--legacy] [--no-raw] [--no-generic] [--macro file.json [--upload-macro file.json]]\n";
         std::cerr << "  -k          Enable keyboard mode (default: single)\n";
         std::cerr << "  --legacy    Send old input-only UDP packets; disables UDP rumble/gyro\n";
         std::cerr << "  --no-raw    Disable raw HID DS4/DualSense/Switch-Pro support\n";
+        std::cerr << "  --no-generic Disable generic WinMM joystick fallback\n";
         std::cerr << "  --macro     Connect, play a P1 macro JSON/string, then exit\n";
         timeEndPeriod(1); return 1;
     }
@@ -1381,15 +1769,25 @@ int main(int argc, char** argv) {
     int port = ns::DEFAULT_PORT;
     bool legacy_udp = false;
     bool raw_hid_enabled = true;
+    bool generic_joy_enabled = true;
     bool macro_mode = false;
     std::string macro_path;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--legacy") == 0) {
             legacy_udp = true;
-         } else if (strcmp(argv[i], "--no-raw") == 0) {
+        } else if (strcmp(argv[i], "--no-raw") == 0) {
             raw_hid_enabled = false;
-        } else if ((strcmp(argv[i], "--macro") == 0 || strcmp(argv[i], "--upload-macro") == 0 || strcmp(argv[i], "--server-macro") == 0) && i + 1 < argc) {
+        } else if (strcmp(argv[i], "--no-generic") == 0) {
+            generic_joy_enabled = false;
+        } else if (strcmp(argv[i], "--macro") == 0 ||
+                   strcmp(argv[i], "--upload-macro") == 0 ||
+                   strcmp(argv[i], "--server-macro") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << argv[i] << " requires a macro JSON/commands file path\n";
+                timeEndPeriod(1);
+                return 1;
+            }
             macro_mode = true;
             macro_path = argv[++i];
         } else if (strcmp(argv[i], "-k") == 0) {
@@ -1409,11 +1807,15 @@ int main(int argc, char** argv) {
                 }
                 host.resize(colon);
             }
+        } else {
+            std::cerr << "Unknown argument: " << argv[i] << "\n";
+            timeEndPeriod(1);
+            return 1;
         }
     }
 
     if (host.empty()) {
-        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP[:PORT]> [-k [single|override]] [--legacy] [--no-raw] [--macro file.json [--upload-macro file.json]]\n";
+        std::cerr << "Usage: " << argv[0] << " <RASPBERRY_PI_IP[:PORT]> [-k [single|override]] [--legacy] [--no-raw] [--no-generic] [--macro file.json [--upload-macro file.json]]\n";
         timeEndPeriod(1); return 1;
     }
 
@@ -1429,12 +1831,19 @@ int main(int argc, char** argv) {
     if (raw_hid_enabled) {
         raw_hid.start();
     } else {
-        std::cout << "Raw HID support disabled; using XInput only.\n";
+        std::cout << "Raw HID support disabled.\n";
+    }
+
+    GenericJoyManager generic_joy(raw_hid_enabled && raw_hid.count_connected() > 0);
+    if (generic_joy_enabled) {
+        generic_joy.start();
+    } else {
+        std::cout << "Generic WinMM joystick fallback disabled.\n";
     }
     if (legacy_udp) {
         std::cout << "Legacy UDP mode: input only. UDP rumble and gyro are disabled.\n";
     } else {
-        std::cout << "Extended UDP mode: rumble replies + gyro/motion enabled.\n";
+        std::cout << "Extended UDP mode: rumble replies + gyro/motion enabled when the controller/API exposes them.\n";
     }
 
     uint8_t hmac_key[32]; derive_key(ns::DEFAULT_SECRET, hmac_key);
@@ -1514,6 +1923,7 @@ int main(int argc, char** argv) {
         bool has_motion[4] = {false, false, false, false};
         int xinput_for_slot[4] = {-1, -1, -1, -1};
         int raw_for_slot[4] = {-1, -1, -1, -1};
+        int generic_for_slot[4] = {-1, -1, -1, -1};
         for (int i = 0; i < 4; ++i) {
             logical_reports[i].reset();
             logical_motion[i].reset();
@@ -1561,6 +1971,31 @@ int main(int argc, char** argv) {
             active_count++;
         }
 
+        // Generic WinMM fallback / extra controllers. This catches old DirectInput
+        // and no-name USB/Bluetooth pads that are neither XInput nor one of our
+        // known Raw HID gyro devices. It is input-only, but that's still much
+        // better than ignoring the controller entirely.
+        if (generic_joy_enabled) {
+            auto generic = generic_joy.snapshot();
+            for (int i = 0; i < 4; ++i) {
+                if (!generic[i].connected) continue;
+
+                int target = i;
+                if (present[target]) {
+                    target = -1;
+                    for (int s = 0; s < 4; ++s) {
+                        if (!present[s]) { target = s; break; }
+                    }
+                }
+                if (target < 0) continue;
+
+                logical_reports[target] = generic[i].input;
+                present[target] = true;
+                generic_for_slot[target] = (int)generic[i].id;
+                active_count++;
+            }
+        }
+
         // Keyboard overrides Player 1, preserving the previous P1 controller in
         // another slot when possible, matching the older client behavior.
         if (kb.mode == 1) {
@@ -1576,6 +2011,7 @@ int main(int argc, char** argv) {
                     present[target] = true;
                     xinput_for_slot[target] = xinput_for_slot[0];
                     raw_for_slot[target] = raw_for_slot[0];
+                    generic_for_slot[target] = generic_for_slot[0];
                     active_count++;
                 }
             }
@@ -1586,6 +2022,7 @@ int main(int argc, char** argv) {
             has_motion[0] = false;
             xinput_for_slot[0] = -1;
             raw_for_slot[0] = -1;
+            generic_for_slot[0] = -1;
             active_count = std::max(active_count, 1);
         } else if (kb.mode == 2) {
             kb.apply(logical_reports[0]);
@@ -1600,7 +2037,7 @@ int main(int argc, char** argv) {
             uint64_t elapsed_ms = (ns::now_us() - macro_start_us) / 1000ULL;
             ns::HIDReport macro_rep;
             bool active_macro = macro_report_at(macro_steps, elapsed_ms, macro_rep);
-            for (int i = 0; i < 4; ++i) { logical_reports[i].reset(); logical_motion[i].reset(); present[i] = false; has_motion[i] = false; xinput_for_slot[i] = raw_for_slot[i] = -1; }
+            for (int i = 0; i < 4; ++i) { logical_reports[i].reset(); logical_motion[i].reset(); present[i] = false; has_motion[i] = false; xinput_for_slot[i] = raw_for_slot[i] = generic_for_slot[i] = -1; }
             logical_reports[0] = macro_rep;
             present[0] = true;
             has_motion[0] = false;
