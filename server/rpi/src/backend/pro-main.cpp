@@ -934,6 +934,8 @@ struct ControllerRuntime {
     int ctrl = 0;
     uint8_t timer = 0;
     bool full_report_enabled = false;
+    bool imu_enabled = false;
+    bool vibration_enabled = false;
     bool pending_subcmd_reply = false;
     uint64_t last_idle_neutral_us = 0;
     uint64_t neutral_burst_until_us = 0;
@@ -1217,20 +1219,24 @@ static void build_standard_report(const ExtendedHIDReport& src, uint8_t timer, P
     pack_stick_12(out.left_stick,  in.lx, in.ly);
     pack_stick_12(out.right_stick, in.rx, in.ry);
 
-    if (g_verbose && !input_is_neutral(in)) {
+    MotionReport m = src.motion;
+    if (!src.has_motion) m.reset();
+
+    if (g_verbose && (!input_is_neutral(in) || src.has_motion)) {
         static uint64_t last_log_us = 0;
         uint64_t t = now_us();
         if (t - last_log_us > 250000) {
             last_log_us = t;
-            std::printf("[input] lx=%3u ly=%3u rx=%3u ry=%3u | L=%02X %02X %02X R=%02X %02X %02X\n",
+            std::printf("[input] lx=%3u ly=%3u rx=%3u ry=%3u | L=%02X %02X %02X R=%02X %02X %02X | motion=%s ax=%6d ay=%6d az=%6d gx=%6d gy=%6d gz=%6d\n",
                         in.lx, in.ly, in.rx, in.ry,
                         out.left_stick[0], out.left_stick[1], out.left_stick[2],
-                        out.right_stick[0], out.right_stick[1], out.right_stick[2]);
+                        out.right_stick[0], out.right_stick[1], out.right_stick[2],
+                        src.has_motion ? "yes" : "no",
+                        (int)m.ax, (int)m.ay, (int)m.az,
+                        (int)m.gx, (int)m.gy, (int)m.gz);
         }
     }
 
-    MotionReport m = src.motion;
-    if (!src.has_motion) m.reset();
 
     out.accel_x_0 = m.ax; out.accel_y_0 = m.ay; out.accel_z_0 = m.az;
     out.gyro_x_0  = m.gx; out.gyro_y_0  = m.gy; out.gyro_z_0  = m.gz;
@@ -1305,23 +1311,29 @@ static int handle_subcommand(ControllerRuntime& rt, uint8_t subcmd, const uint8_
     }
 
     case CMD_SET_NFC_IR_CONFIG:
-        reply->ack = 0xA0;
-        reply->subcmd_id = 0x21;
-        reply->reply_data[0] = 0x01;
-        reply->reply_data[1] = 0x00;
-        reply->reply_data[2] = 0xFF;
-        reply->reply_data[3] = 0x00;
-        reply->reply_data[4] = 0x03;
-        reply->reply_data[5] = 0x00;
-        reply->reply_data[6] = 0x05;
-        reply->reply_data[7] = 0x01;
-        return 8;
+        // The Switch may poll the NFC/IR MCU configuration even for a normal
+        // Pro Controller.  The previous fake data reply made some consoles keep
+        // repeating subcommand 0x21 forever, which flooded report 0x21 replies.
+        // A plain successful ACK is enough for a controller without NFC/IR and
+        // lets the console settle back to steady 0x30 input reports with IMU data.
+        reply->ack = 0x80;
+        return 0;
 
     case CMD_SET_PLAYER_LIGHTS:
-    case CMD_ENABLE_IMU:
-    case CMD_ENABLE_VIBRATION:
         reply->ack = 0x80;
         reply->reply_data[0] = cmd_len > 0 ? cmd_data[0] : 0;
+        return 1;
+
+    case CMD_ENABLE_IMU:
+        rt.imu_enabled = (cmd_len == 0) || cmd_data[0] != 0;
+        reply->ack = 0x80;
+        reply->reply_data[0] = cmd_len > 0 ? cmd_data[0] : 1;
+        return 1;
+
+    case CMD_ENABLE_VIBRATION:
+        rt.vibration_enabled = (cmd_len == 0) || cmd_data[0] != 0;
+        reply->ack = 0x80;
+        reply->reply_data[0] = cmd_len > 0 ? cmd_data[0] : 1;
         return 1;
 
     default:
@@ -1344,8 +1356,18 @@ static void publish_rumble_event(int client_idx, int sub_idx, const uint8_t* pac
 
     uint8_t low = 0, high = 0;
     if (!neutral) {
-        low = std::max<uint8_t>(rb[1], 80);
-        high = std::max<uint8_t>(rb[5], 80);
+        // Nintendo HD-rumble bytes are packed and not directly comparable to
+        // classic low/high motor bytes.  For forwarding to SDL/XInput-style
+        // clients, derive a conservative strength from how far each 4-byte
+        // motor frame moved away from the neutral carrier.  This is much more
+        // reliable than reading only rb[1] and rb[5].
+        int diff_left = 0, diff_right = 0;
+        for (int i = 0; i < 4; ++i) {
+            diff_left  = std::max(diff_left,  std::abs((int)rb[i]     - (int)neutral_rumble[i]));
+            diff_right = std::max(diff_right, std::abs((int)rb[i + 4] - (int)neutral_rumble[i + 4]));
+        }
+        low  = (uint8_t)std::clamp(64 + diff_left  * 3, 80, 255);
+        high = (uint8_t)std::clamp(64 + diff_right * 3, 80, 255);
     }
 
     std::lock_guard<std::mutex> lk(g_mtx[client_idx]);
@@ -1358,9 +1380,10 @@ static void publish_rumble_event(int client_idx, int sub_idx, const uint8_t* pac
     g_clients[client_idx].rumble_seq[sub_idx]++;
 
     if (g_verbose) {
-        std::printf("[rumble] client=%d pad=%d low=%u high=%u duration=%u neutral=%s\n",
+        std::printf("[rumble] client=%d pad=%d low=%u high=%u duration=%u neutral=%s raw=%02X %02X %02X %02X %02X %02X %02X %02X\n",
                     client_idx + 1, sub_idx + 1, ev.low_freq, ev.high_freq,
-                    ev.duration_10ms, neutral ? "yes" : "no");
+                    ev.duration_10ms, neutral ? "yes" : "no",
+                    rb[0], rb[1], rb[2], rb[3], rb[4], rb[5], rb[6], rb[7]);
     }
 }
 
