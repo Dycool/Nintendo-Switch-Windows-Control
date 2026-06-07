@@ -56,7 +56,7 @@ The Raspberry Pi server can emulate **two different controller types**, chosen a
 |---------|------------------------|------------------------|
 | HID report size | 8 bytes | 64 bytes |
 | **Latency** | **Fastest** | Slightly larger packets |
-| **Gyro / 6-axis IMU** | **No** | **Yes** |
+| **Gyro** | **No** | **Yes** |
 | **Rumble** | **No** | **Yes** (bidirectional, Switch → PC) |
 | **Macros** | **Yes** | **Yes** |
 
