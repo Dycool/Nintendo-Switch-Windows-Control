@@ -1870,7 +1870,7 @@ static void SaveKeyboardMode(int mode) {
 }
 
 
-enum { IDC_IP = 101, IDC_CONNECT, IDC_KEYBOARD_COMBO = 110, IDC_BINDINGS_BTN = 111, IDC_MACROS_BTN = 112, IDC_EDITOR_CHANGE = 200, IDC_EDITOR_SETUP = 400, IDC_EDITOR_RESET = 500, IDC_EDITOR_KEY_START = 300, IDC_MACRO_EDIT = 600, IDC_MACRO_RUN = 601, IDC_MACRO_SAVE = 602, IDC_MACRO_DELETE = 603, IDC_MACRO_CLOSE = 604, IDC_MACRO_RECORD_START = 605, IDC_MACRO_RECORD_STOP = 606, IDC_MACRO_IMPORT = 607, IDC_MACRO_EXPORT = 608, IDC_MACRO_HOTKEY = 609, IDC_MACRO_NAME = 610, IDC_MACRO_ADD = 611, IDC_MACRO_RECORD_TOGGLE = 612, IDC_MACRO_RUN_BASE = 700, IDC_MACRO_DELETE_BASE = 800, IDC_MACRO_KEY_BASE = 900, IDC_MACRO_CHANGE_BASE = 1000, IDC_MACRO_EXPORT_BASE = 1100 };
+enum { IDC_IP = 101, IDC_CONNECT, IDC_KEYBOARD_COMBO = 110, IDC_BINDINGS_BTN = 111, IDC_MACROS_BTN = 112, IDC_EDITOR_CHANGE = 200, IDC_EDITOR_SETUP = 400, IDC_EDITOR_RESET = 500, IDC_EDITOR_CLEAR = 501, IDC_EDITOR_KEY_START = 300, IDC_MACRO_EDIT = 600, IDC_MACRO_RUN = 601, IDC_MACRO_SAVE = 602, IDC_MACRO_DELETE = 603, IDC_MACRO_CLOSE = 604, IDC_MACRO_RECORD_START = 605, IDC_MACRO_RECORD_STOP = 606, IDC_MACRO_IMPORT = 607, IDC_MACRO_EXPORT = 608, IDC_MACRO_HOTKEY = 609, IDC_MACRO_NAME = 610, IDC_MACRO_ADD = 611, IDC_MACRO_RECORD_TOGGLE = 612, IDC_MACRO_RUN_BASE = 700, IDC_MACRO_DELETE_BASE = 800, IDC_MACRO_KEY_BASE = 900, IDC_MACRO_RENAME_BASE = 1000, IDC_MACRO_EXPORT_BASE = 1100 };
 static HWND CreateButton(HWND parent, const wchar_t* text, int x, int y, int w, int h, int id);
 
 // ── Macro runtime/editor ────────────────────────────────────────────────────
@@ -2110,6 +2110,26 @@ static std::string MacroEntryToObjectJson(const MacroEntry& e) {
     return out;
 }
 
+static std::string MacroPrettyJsonWithForcedName(const std::string& raw_text, const std::string& forced_name) {
+    std::vector<MacroStep> steps;
+    std::vector<std::string> lines;
+    if (!macro_validate_text(raw_text, steps, &lines)) lines = {"WAIT 200"};
+
+    std::string name = macro_trim(forced_name).empty() ? "Macro" : macro_trim(forced_name);
+    std::string out;
+    out += "{\n";
+    out += "  \"name\": \"" + macro_escape_json(name) + "\",\n";
+    out += "  \"commands\": [\n";
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out += "    \"" + macro_escape_json(lines[i]) + "\"";
+        if (i + 1 < lines.size()) out += ",";
+        out += "\n";
+    }
+    out += "  ]\n";
+    out += "}";
+    return out;
+}
+
 static std::string MacroEntriesToJson(const std::vector<MacroEntry>& entries) {
     std::string out;
     out += "{\n";
@@ -2265,7 +2285,7 @@ static bool UpsertMacroEntry(HWND parent, MacroEntry e, bool force_unique_name) 
     if (e.name.empty()) e.name = macro_extract_name_or_default(pretty, "Macro");
     if (force_unique_name) e.name = UniqueMacroName(e.name);
     e.hotkey = normalize_key_name(e.hotkey);
-    e.json = pretty;
+    e.json = MacroPrettyJsonWithForcedName(pretty, e.name);
 
     int existing = force_unique_name ? -1 : FindMacroEntryByName(e.name);
     if (!ValidateMacroHotkeyForEntry(e.hotkey, existing, parent)) {
@@ -2548,6 +2568,141 @@ static HWND CreateMacroStatic(HWND parent, const wchar_t* text, DWORD style, int
     return hw;
 }
 
+
+struct MacroRenamePromptContext {
+    HWND edit = nullptr;
+    bool done = false;
+    bool ok = false;
+    std::string initial;
+    std::string result;
+};
+
+static LRESULT CALLBACK MacroRenamePromptProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* ctx = reinterpret_cast<MacroRenamePromptContext*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_CREATE: {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        ctx = reinterpret_cast<MacroRenamePromptContext*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
+        HFONT font = MacroEditorFont();
+
+        HWND label = CreateWindowW(L"STATIC", L"Macro name:", WS_VISIBLE | WS_CHILD,
+            18, 16, 304, 18, hWnd, nullptr, g_hInst, nullptr);
+        SendMessageW(label, WM_SETFONT, (WPARAM)font, TRUE);
+
+        std::wstring initial = widen(ctx ? ctx->initial : std::string());
+        HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", initial.c_str(),
+            WS_VISIBLE | WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
+            18, 40, 314, 24, hWnd, (HMENU)100, g_hInst, nullptr);
+        SendMessageW(edit, WM_SETFONT, (WPARAM)font, TRUE);
+        if (ctx) ctx->edit = edit;
+
+        HWND ok = CreateWindowW(L"BUTTON", L"OK", WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            172, 78, 76, 28, hWnd, (HMENU)IDOK, g_hInst, nullptr);
+        SendMessageW(ok, WM_SETFONT, (WPARAM)font, TRUE);
+        HWND cancel = CreateWindowW(L"BUTTON", L"Cancel", WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON,
+            256, 78, 76, 28, hWnd, (HMENU)IDCANCEL, g_hInst, nullptr);
+        SendMessageW(cancel, WM_SETFONT, (WPARAM)font, TRUE);
+
+        SendMessageW(hWnd, DM_SETDEFID, IDOK, 0);
+        SetFocus(edit);
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        if (id == IDOK && ctx) {
+            int len = GetWindowTextLengthW(ctx->edit);
+            std::vector<wchar_t> buf((size_t)len + 1, L'\0');
+            GetWindowTextW(ctx->edit, buf.data(), len + 1);
+            ctx->result = macro_trim(narrow(buf.data()));
+            ctx->ok = true;
+            ctx->done = true;
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        if (id == IDCANCEL && ctx) {
+            ctx->done = true;
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        if (ctx) ctx->done = true;
+        DestroyWindow(hWnd);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static bool EnsureMacroRenamePromptClass() {
+    static bool registered = false;
+    if (registered) return true;
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = MacroRenamePromptProc;
+    wc.hInstance = g_hInst;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = L"NSMacroRenamePrompt";
+    ATOM atom = RegisterClassW(&wc);
+    registered = atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    return registered;
+}
+
+static bool PromptForMacroName(HWND parent, const std::string& current_name, std::string& out_name) {
+    out_name.clear();
+    if (!EnsureMacroRenamePromptClass()) return false;
+
+    MacroRenamePromptContext ctx;
+    ctx.initial = current_name;
+
+    constexpr int dlgW = 360;
+    constexpr int dlgH = 150;
+    RECT pr{};
+    GetWindowRect(parent, &pr);
+    int x = pr.left + ((pr.right - pr.left) - dlgW) / 2;
+    int y = pr.top + ((pr.bottom - pr.top) - dlgH) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"NSMacroRenamePrompt", L"Rename Macro",
+        WS_CAPTION | WS_SYSMENU | WS_POPUP,
+        x, y, dlgW, dlgH, parent, nullptr, g_hInst, &ctx);
+    if (!dlg) return false;
+
+    EnableWindow(parent, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+
+    MSG msg;
+    while (!ctx.done && IsWindow(dlg)) {
+        BOOL got = GetMessageW(&msg, nullptr, 0, 0);
+        if (got <= 0) {
+            if (got == 0) PostQuitMessage((int)msg.wParam);
+            break;
+        }
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+    SetFocus(parent);
+
+    if (!ctx.ok) return false;
+    out_name = ctx.result;
+    return true;
+}
+
+static void BeginMacroHotkeyListen(HWND hWnd, int idx) {
+    if (idx < 0 || idx >= (int)g_macro_entries.size()) return;
+    g_macro_listening_idx = idx;
+    g_macro_listening_static = GetDlgItem(hWnd, IDC_MACRO_KEY_BASE + idx);
+    if (g_macro_listening_static) SetWindowTextW(g_macro_listening_static, L"...");
+    SetFocus(hWnd);
+}
+
 static void DestroyMacroRows() {
     for (HWND h : g_macro_row_controls) if (h) DestroyWindow(h);
     g_macro_row_controls.clear();
@@ -2559,13 +2714,13 @@ static void RefreshMacroRows(HWND hWnd) {
     constexpr int rowH = 26;
     constexpr int nameW = 250;
     constexpr int keyW = 110;
-    constexpr int btnW = 54;
+    constexpr int btnW = 68;
     constexpr int exportW = 64;
     constexpr int delW = 64;
     constexpr int gap = 4;
     const int keyX = x + nameW + gap;
-    const int changeX = keyX + keyW + gap;
-    const int exportX = changeX + btnW + gap;
+    const int renameX = keyX + keyW + gap;
+    const int exportX = renameX + btnW + gap;
     const int deleteX = exportX + exportW + gap;
     int y = 12;
 
@@ -2580,14 +2735,14 @@ static void RefreshMacroRows(HWND hWnd) {
         std::wstring name = widen(e.name.empty() ? "Macro" : e.name);
         std::wstring key = widen(normalize_key_name(e.hotkey));
         HWND run = CreateMacroButton(hWnd, name.c_str(), x, y, nameW, 24, IDC_MACRO_RUN_BASE + i);
-        HWND keyText = CreateMacroStatic(hWnd, key.c_str(), SS_CENTER | WS_BORDER,
+        HWND keyText = CreateMacroStatic(hWnd, key.c_str(), SS_CENTER | SS_NOTIFY | WS_BORDER,
                                          keyX, y, keyW, 22, IDC_MACRO_KEY_BASE + i);
-        HWND change = CreateMacroButton(hWnd, L"Change", changeX, y, btnW, 24, IDC_MACRO_CHANGE_BASE + i);
+        HWND rename = CreateMacroButton(hWnd, L"Rename", renameX, y, btnW, 24, IDC_MACRO_RENAME_BASE + i);
         HWND exp = CreateMacroButton(hWnd, L"Export", exportX, y, exportW, 24, IDC_MACRO_EXPORT_BASE + i);
         HWND del = CreateMacroButton(hWnd, L"Delete", deleteX, y, delW, 24, IDC_MACRO_DELETE_BASE + i);
         g_macro_row_controls.push_back(run);
         g_macro_row_controls.push_back(keyText);
-        g_macro_row_controls.push_back(change);
+        g_macro_row_controls.push_back(rename);
         g_macro_row_controls.push_back(exp);
         g_macro_row_controls.push_back(del);
         y += rowH;
@@ -2632,13 +2787,44 @@ static bool MacroReadFileDialog(HWND parent) {
     return false;
 }
 
-static bool MacroWriteFileDialog(HWND parent, const std::string& text) {
-    wchar_t file[MAX_PATH] = L"ns-macros.json";
-    OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = parent; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"JSON Files\0*.json\0All Files\0*.*\0"; ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+static std::wstring MacroSafeFileStemW(const std::string& raw_name) {
+    std::string trimmed = macro_trim(raw_name);
+    if (trimmed.empty()) trimmed = "Macro";
+
+    std::wstring name = widen(trimmed);
+    for (wchar_t& c : name) {
+        if (c == L'\\' || c == L'/' || c == L':' || c == L'*' ||
+            c == L'?' || c == L'"' || c == L'<' || c == L'>' || c == L'|' ||
+            c < 32) {
+            c = L'_';
+        }
+    }
+
+    while (!name.empty() && (name.back() == L'.' || name.back() == L' ')) name.pop_back();
+    if (name.empty()) name = L"Macro";
+    if (name.size() > 180) name.resize(180);
+    return name;
+}
+
+static bool MacroWriteFileDialog(HWND parent, const std::string& text, const std::wstring& default_file = L"ns-macros.json") {
+    wchar_t file[MAX_PATH]{};
+    wcsncpy_s(file, default_file.c_str(), _TRUNCATE);
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = parent;
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"JSON Files\0*.json\0All Files\0*.*\0";
+    ofn.lpstrDefExt = L"json";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     if (!GetSaveFileNameW(&ofn)) return false;
-    FILE* f = _wfopen(file, L"wb"); if (!f) return false;
-    fwrite(text.data(), 1, text.size(), f); fclose(f); return true;
+
+    FILE* f = _wfopen(file, L"wb");
+    if (!f) return false;
+    fwrite(text.data(), 1, text.size(), f);
+    fclose(f);
+    return true;
 }
 
 static LRESULT CALLBACK MacroEditorProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2663,7 +2849,8 @@ static LRESULT CALLBACK MacroEditorProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
             int idx = id - IDC_MACRO_EXPORT_BASE;
             if (idx >= 0 && idx < (int)g_macro_entries.size()) {
                 std::vector<MacroEntry> one{g_macro_entries[idx]};
-                MacroWriteFileDialog(hWnd, MacroEntriesToJson(one));
+                std::wstring default_file = MacroSafeFileStemW(g_macro_entries[idx].name.empty() ? "Macro" : g_macro_entries[idx].name) + L".json";
+                MacroWriteFileDialog(hWnd, MacroEntriesToJson(one), default_file);
             }
         } else if (id >= IDC_MACRO_DELETE_BASE && id < IDC_MACRO_DELETE_BASE + 100) {
             int idx = id - IDC_MACRO_DELETE_BASE;
@@ -2675,13 +2862,30 @@ static LRESULT CALLBACK MacroEditorProc(HWND hWnd, UINT msg, WPARAM wParam, LPAR
                 SaveMacroEntriesToDisk(hWnd);
                 RefreshMacroRows(hWnd);
             }
-        } else if (id >= IDC_MACRO_CHANGE_BASE && id < IDC_MACRO_CHANGE_BASE + 100) {
-            int idx = id - IDC_MACRO_CHANGE_BASE;
+        } else if (id >= IDC_MACRO_KEY_BASE && id < IDC_MACRO_KEY_BASE + 100) {
+            BeginMacroHotkeyListen(hWnd, id - IDC_MACRO_KEY_BASE);
+        } else if (id >= IDC_MACRO_RENAME_BASE && id < IDC_MACRO_RENAME_BASE + 100) {
+            int idx = id - IDC_MACRO_RENAME_BASE;
             if (idx >= 0 && idx < (int)g_macro_entries.size()) {
-                g_macro_listening_idx = idx;
-                g_macro_listening_static = GetDlgItem(hWnd, IDC_MACRO_KEY_BASE + idx);
-                if (g_macro_listening_static) SetWindowTextW(g_macro_listening_static, L"...");
-                SetFocus(hWnd);
+                g_macro_listening_idx = -1;
+                g_macro_listening_static = nullptr;
+                std::string new_name;
+                std::string old_name = g_macro_entries[idx].name.empty() ? "Macro" : g_macro_entries[idx].name;
+                if (PromptForMacroName(hWnd, old_name, new_name)) {
+                    if (new_name.empty()) {
+                        MessageBoxW(hWnd, L"Macro name cannot be empty.", L"Rename Macro", MB_OK | MB_ICONWARNING);
+                    } else {
+                        int duplicate = FindMacroEntryByName(new_name);
+                        if (duplicate >= 0 && duplicate != idx) {
+                            MessageBoxW(hWnd, L"Another macro already uses that name.", L"Rename Macro", MB_OK | MB_ICONWARNING);
+                        } else {
+                            g_macro_entries[idx].name = new_name;
+                            g_macro_entries[idx].json = MacroPrettyJsonWithForcedName(g_macro_entries[idx].json, new_name);
+                            SaveMacroEntriesToDisk(hWnd);
+                            RefreshMacroRows(hWnd);
+                        }
+                    }
+                }
             }
         } else if (id == IDC_MACRO_RECORD_TOGGLE) {
             if (!g_macro_editor_recording) {
@@ -3470,6 +3674,10 @@ static LRESULT CALLBACK BindingsEditorProc(HWND hDlg, UINT msg, WPARAM wParam, L
                 WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
                 leftBtnX, y, btnW, 30, hDlg, (HMENU)1000, g_hInst, nullptr);
             SendMessage(hCancel, WM_SETFONT, (WPARAM)hBtnFont, TRUE);
+            HWND hClear = CreateWindow(L"BUTTON", L"Clear",
+                WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+                rightBtnX - btnW - 8, y, btnW, 30, hDlg, (HMENU)IDC_EDITOR_CLEAR, g_hInst, nullptr);
+            SendMessage(hClear, WM_SETFONT, (WPARAM)hBtnFont, TRUE);
             HWND hReset = CreateWindow(L"BUTTON", L"Reset",
                 WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
                 rightBtnX, y, btnW, 30, hDlg, (HMENU)IDC_EDITOR_RESET, g_hInst, nullptr);
@@ -3501,6 +3709,14 @@ static LRESULT CALLBACK BindingsEditorProc(HWND hDlg, UINT msg, WPARAM wParam, L
                 g_listeningIdx = 0;
                 g_listeningStatic = GetDlgItem(hDlg, IDC_EDITOR_KEY_START);
                 if (g_listeningStatic) SetWindowText(g_listeningStatic, L"...");
+                SetFocus(hDlg);
+            } else if (id == IDC_EDITOR_CLEAR) { // Clear keyboard binds only; macro hotkeys are stored separately.
+                g_setupMode = false;
+                g_listeningIdx = -1;
+                g_listeningStatic = nullptr;
+                for (const auto& kv : g_bindingKeys)
+                    g_editBindings[kv.first].clear();
+                updateKeyDisplays();
                 SetFocus(hDlg);
             } else if (id == IDC_EDITOR_RESET) { // Reset
                 auto defs = default_key_bindings();
