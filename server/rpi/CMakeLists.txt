@@ -25,6 +25,7 @@ if(USE_UPNP)
         if(PkgConfig_FOUND)
             pkg_check_modules(MINIUPNPC miniupnpc)
         endif()
+
         if(MINIUPNPC_FOUND)
             add_definitions(-DUSE_UPNP)
             message(STATUS "UPnP support enabled (miniupnpc found via pkg-config)")
@@ -37,13 +38,11 @@ else()
 endif()
 
 set(BACKEND_SOURCE "src/backend/hori-main.cpp" CACHE STRING "Backend source file (hori-main.cpp or pro-main.cpp)")
+
 add_executable(ns-backend ${BACKEND_SOURCE})
 target_link_libraries(ns-backend PRIVATE pthread)
+
 if(MINIUPNPC_FOUND)
     target_include_directories(ns-backend PRIVATE ${MINIUPNPC_INCLUDE_DIRS})
     target_link_libraries(ns-backend PRIVATE ${MINIUPNPC_LIBRARIES})
 endif()
-
-add_executable(test-probe src/probe/test_probe.cpp)
-target_link_libraries(test-probe PRIVATE pthread)
-target_compile_options(test-probe PRIVATE -O2 -Wall -Wextra)
