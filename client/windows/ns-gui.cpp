@@ -1961,11 +1961,11 @@ static bool ApplyMacroOverride(ns::HIDReport logicalReports[4], bool present[4],
     if (active) {
         logicalReports[0].buttons |= mr.buttons;
         if (mr.hat != ns::HAT_NEUTRAL) logicalReports[0].hat = mr.hat;
-        if (mr.has_lstick || mr.lx != 128 || mr.ly != 128) {
+        if (mr.lx != 128 || mr.ly != 128) {
             logicalReports[0].lx = mr.lx;
             logicalReports[0].ly = mr.ly;
         }
-        if (mr.has_rstick || mr.rx != 128 || mr.ry != 128) {
+        if (mr.rx != 128 || mr.ry != 128) {
             logicalReports[0].rx = mr.rx;
             logicalReports[0].ry = mr.ry;
         }
