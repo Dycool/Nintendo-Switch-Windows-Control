@@ -1344,8 +1344,6 @@ static void publish_rumble_event(int client_idx, int sub_idx, const uint8_t* pac
 
     uint8_t low = 0, high = 0;
     if (!neutral) {
-        for (int i = 0; i < 4; ++i) low  = std::max(low,  rb[i]);
-        for (int i = 4; i < 8; ++i) high = std::max(high, rb[i]);
         low = std::max<uint8_t>(low, 80);
         high = std::max<uint8_t>(high, 80);
     }

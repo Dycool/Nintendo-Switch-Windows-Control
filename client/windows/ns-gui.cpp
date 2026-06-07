@@ -1109,12 +1109,20 @@ private:
         if (btn2 & 0x02) r.buttons |= ns::BTN_CAPTURE;
 
         if ((int)len >= motion_o + 12) {
-            m.gx = read_le16(b + motion_o + 0);
-            m.gy = read_le16(b + motion_o + 2);
-            m.gz = read_le16(b + motion_o + 4);
-            m.ax = read_le16(b + motion_o + 6);
-            m.ay = read_le16(b + motion_o + 8);
-            m.az = read_le16(b + motion_o + 10);
+            int16_t raw_gx = read_le16(b + motion_o + 0);
+            int16_t raw_gy = read_le16(b + motion_o + 2);
+            int16_t raw_gz = read_le16(b + motion_o + 4);
+            int16_t raw_ax = read_le16(b + motion_o + 6);
+            int16_t raw_ay = read_le16(b + motion_o + 8);
+            int16_t raw_az = read_le16(b + motion_o + 10);
+
+            // Swap and invert to match Nintendo Pro Controller space
+            m.gx = -raw_gy;
+            m.gy = -raw_gz;
+            m.gz = raw_gx;
+            m.ax = -raw_ay;
+            m.ay = -raw_az;
+            m.az = raw_ax;
             has_motion = true;
         }
         return true;
