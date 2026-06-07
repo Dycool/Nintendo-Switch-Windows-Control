@@ -423,21 +423,85 @@ static bool macro_validate_text(const std::string& raw_text, std::vector<MacroSt
     g_macro_last_error.clear();
     steps.clear();
     if (normalized) normalized->clear();
+
     std::string text, err;
-    if (!macro_extract_commands_text(raw_text, text, err)) { macro_set_error(err); return false; }
-    for (char& c : text) if (c == '\n' || c == '\r') c = ';';
+    if (!macro_extract_commands_text(raw_text, text, err)) {
+        macro_set_error(err);
+        return false;
+    }
+
+    for (char& c : text) {
+        if (c == '\n' || c == '\r') c = ';';
+    }
+
+    // LOOP n repeats the block since the start, or since the previous LOOP,
+    // n total times.  Comments beginning with # are ignored.  The expanded
+    // steps are only used locally for validation/timing; normalized JSON keeps
+    // the compact original commands.
+    static constexpr size_t MACRO_EXPANDED_STEP_MAX = 1000000;
+
+    size_t loop_boundary = 0;
     size_t pos = 0;
     while (pos < text.size()) {
         size_t semi = text.find(';', pos);
         std::string part = macro_trim(text.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos));
         pos = (semi == std::string::npos) ? text.size() : semi + 1;
+
         if (part.empty()) continue;
+        if (part[0] == '#') continue;
+
+        size_t last_space = part.find_last_of(" \t");
+        std::string cmd = last_space == std::string::npos ? part : macro_trim(part.substr(0, last_space));
+        std::string arg = last_space == std::string::npos ? "" : macro_trim(part.substr(last_space + 1));
+
+        if (macro_upper(cmd) == "LOOP") {
+            uint32_t repeat_count = 0;
+            if (!macro_parse_uint32_strict(arg, repeat_count)) {
+                macro_set_error("invalid LOOP count in command: " + part);
+                return false;
+            }
+            if (steps.size() == loop_boundary) {
+                macro_set_error("LOOP has no previous commands to repeat: " + part);
+                return false;
+            }
+
+            std::vector<MacroStep> block;
+            block.reserve(steps.size() - loop_boundary);
+            for (size_t i = loop_boundary; i < steps.size(); ++i)
+                block.push_back(steps[i]);
+
+            const size_t repeats_to_add = (size_t)repeat_count - 1u;
+            if (repeats_to_add > 0) {
+                if (block.empty() || block.size() > (MACRO_EXPANDED_STEP_MAX - steps.size()) / repeats_to_add) {
+                    macro_set_error("LOOP expansion exceeds the local 1,000,000 step safety limit: " + part);
+                    return false;
+                }
+                for (size_t n = 0; n < repeats_to_add; ++n)
+                    steps.insert(steps.end(), block.begin(), block.end());
+            }
+
+            loop_boundary = steps.size();
+            if (normalized) normalized->push_back(part);
+            continue;
+        }
+
         MacroStep st;
-        if (!macro_parse_one_command(part, st, err)) { macro_set_error(err); return false; }
+        if (!macro_parse_one_command(part, st, err)) {
+            macro_set_error(err);
+            return false;
+        }
         steps.push_back(st);
+        if (steps.size() > MACRO_EXPANDED_STEP_MAX) {
+            macro_set_error("macro exceeds the local 1,000,000 step safety limit");
+            return false;
+        }
         if (normalized) normalized->push_back(part);
     }
-    if (steps.empty()) { macro_set_error("no valid macro commands found"); return false; }
+
+    if (steps.empty()) {
+        macro_set_error("no valid macro commands found");
+        return false;
+    }
     return true;
 }
 
