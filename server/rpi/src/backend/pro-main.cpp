@@ -70,6 +70,38 @@ enum class ImuMapMode {
 
 static ImuMapMode g_imu_map = ImuMapMode::Direct;
 
+enum class ImuTestMode {
+    Off,
+    Roll,
+    Pitch,
+    Yaw,
+    Shake,
+};
+
+static ImuTestMode g_imu_test = ImuTestMode::Off;
+
+static const char* imu_test_name(ImuTestMode m) {
+    switch (m) {
+        case ImuTestMode::Off:   return "off";
+        case ImuTestMode::Roll:  return "roll";
+        case ImuTestMode::Pitch: return "pitch";
+        case ImuTestMode::Yaw:   return "yaw";
+        case ImuTestMode::Shake: return "shake";
+    }
+    return "off";
+}
+
+static bool parse_imu_test(const std::string& raw) {
+    std::string s = raw;
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    if (s == "off" || s == "none") { g_imu_test = ImuTestMode::Off; return true; }
+    if (s == "roll")  { g_imu_test = ImuTestMode::Roll;  return true; }
+    if (s == "pitch") { g_imu_test = ImuTestMode::Pitch; return true; }
+    if (s == "yaw")   { g_imu_test = ImuTestMode::Yaw;   return true; }
+    if (s == "shake") { g_imu_test = ImuTestMode::Shake; return true; }
+    return false;
+}
+
 static const char* imu_map_name(ImuMapMode m) {
     switch (m) {
         case ImuMapMode::Direct:  return "direct";
@@ -999,6 +1031,50 @@ static uint8_t pro_timer_from_us(uint64_t t_us) {
     return (uint8_t)((t_us / 5000ULL) & 0xFF);
 }
 
+static MotionReport synthetic_imu_sample(uint64_t t_us, int sample_index) {
+    // Deliberately large but valid Pro Controller-like IMU values.
+    // This is diagnostic: if --test-imu roll/pitch/yaw does not move anything
+    // in a motion-aware Switch screen/game, the issue is not SDL3 or axis maps;
+    // the console is not accepting/using IMU from this USB gadget.
+    const int phase = (int)(((t_us / 5000ULL) + (uint64_t)sample_index) & 0x3F);
+    const bool hi = (phase & 0x20) != 0;
+    const int s = hi ? 1 : -1;
+
+    MotionReport m{};
+    // Keep about 1g present so software that cares about gravity/orientation
+    // does not see a physically impossible zero-G controller.
+    m.ax = 0;
+    m.ay = 4096;
+    m.az = 0;
+
+    switch (g_imu_test) {
+        case ImuTestMode::Roll:
+            m.gx = (int16_t)(s * 9000);
+            m.ax = (int16_t)(s * 2800);
+            m.ay = 2800;
+            break;
+        case ImuTestMode::Pitch:
+            m.gy = (int16_t)(s * 9000);
+            m.az = (int16_t)(s * 2800);
+            m.ay = 2800;
+            break;
+        case ImuTestMode::Yaw:
+            m.gz = (int16_t)(s * 9000);
+            break;
+        case ImuTestMode::Shake:
+            m.gx = (int16_t)(s * 12000);
+            m.gy = (int16_t)(-s * 9000);
+            m.gz = (int16_t)(s * 6000);
+            m.ax = (int16_t)(s * 5000);
+            m.ay = (int16_t)(4096 + s * 1500);
+            m.az = (int16_t)(-s * 3500);
+            break;
+        case ImuTestMode::Off:
+            break;
+    }
+    return m;
+}
+
 
 
 // ── Nintendo Pro Controller USB protocol support ─────────────────────────────
@@ -1225,6 +1301,15 @@ static void init_spi_flash(int ctrl) {
     for (int i = 0; i < 12; ++i)
         put_i16_le((uint16_t)(0x6098 + i * 2), imu_vals[i]);
 
+    // User IMU calibration lives at 0x8026/0x8028 according to hid-nintendo.
+    // The Switch often reads around 0x8010 for user stick calibration; keeping
+    // this valid too prevents it from seeing 0xFF garbage if it later requests
+    // user IMU data or caches the block.
+    flash[0x8026] = 0xB2;
+    flash[0x8027] = 0xA1;
+    for (int i = 0; i < 12; ++i)
+        put_i16_le((uint16_t)(0x8028 + i * 2), imu_vals[i]);
+
     g_spi_initialized[ctrl] = true;
 }
 
@@ -1399,11 +1484,19 @@ static void build_standard_report(const ExtendedHIDReport& src,
     pack_stick_12(out.right_stick, in.rx, in.ry);
 
     MotionReport imu[3]{};
-    bool has_imu = imu_enabled && motion_history && motion_history_count > 0;
-    if (has_imu) {
-        for (int i = 0; i < 3; ++i) {
-            if (i < motion_history_count) imu[i] = remap_motion_for_switch(motion_history[i]);
-            else imu[i] = remap_motion_for_switch(motion_history[motion_history_count - 1]);
+    bool has_imu = false;
+    if (imu_enabled && g_imu_test != ImuTestMode::Off) {
+        has_imu = true;
+        uint64_t t = now_us();
+        for (int i = 0; i < 3; ++i)
+            imu[i] = remap_motion_for_switch(synthetic_imu_sample(t, i));
+    } else {
+        has_imu = imu_enabled && motion_history && motion_history_count > 0;
+        if (has_imu) {
+            for (int i = 0; i < 3; ++i) {
+                if (i < motion_history_count) imu[i] = remap_motion_for_switch(motion_history[i]);
+                else imu[i] = remap_motion_for_switch(motion_history[motion_history_count - 1]);
+            }
         }
     }
 
@@ -1412,13 +1505,14 @@ static void build_standard_report(const ExtendedHIDReport& src,
         uint64_t t = now_us();
         if (t - last_log_us > 250000) {
             last_log_us = t;
-            std::printf("[input] lx=%3u ly=%3u rx=%3u ry=%3u | L=%02X %02X %02X R=%02X %02X %02X | imu=%s map=%s samples=%u ax=%6d ay=%6d az=%6d gx=%6d gy=%6d gz=%6d\n",
+            std::printf("[input] lx=%3u ly=%3u rx=%3u ry=%3u | L=%02X %02X %02X R=%02X %02X %02X | imu=%s map=%s test=%s samples=%u ax=%6d ay=%6d az=%6d gx=%6d gy=%6d gz=%6d\n",
                         in.lx, in.ly, in.rx, in.ry,
                         out.left_stick[0], out.left_stick[1], out.left_stick[2],
                         out.right_stick[0], out.right_stick[1], out.right_stick[2],
                         has_imu ? "yes" : "no",
                         imu_map_name(g_imu_map),
-                        (unsigned)(has_imu ? motion_history_count : 0),
+                        imu_test_name(g_imu_test),
+                        (unsigned)(has_imu ? (g_imu_test != ImuTestMode::Off ? 3 : motion_history_count) : 0),
                         (int)imu[0].ax, (int)imu[0].ay, (int)imu[0].az,
                         (int)imu[0].gx, (int)imu[0].gy, (int)imu[0].gz);
         }
@@ -4681,6 +4775,12 @@ int main(int argc, char** argv) {
             if (us_v > 50000) us_v = 50000;
             g_pro_report_interval_us = us_v;
         }
+        else if (a == "--test-imu" && i+1 < argc) {
+            if (!parse_imu_test(argv[++i])) {
+                std::fprintf(stderr, "Unknown --test-imu. Use: off, roll, pitch, yaw, shake\n");
+                return 1;
+            }
+        }
         else if (a == "--log-neutral-rumble") g_log_neutral_rumble = true;
         else if (a == "--test-rumble") g_test_rumble_on_connect = true;
         else if (a == "-w") {
@@ -4693,7 +4793,8 @@ int main(int argc, char** argv) {
             puts("ns-backend  [-p PORT] [-b ADDR] [--upnp] [-w [WEB_PORT]] [-v]");
             puts("            [--force-gadget-setup] [--no-auto-gadget] [--keep-gadget-on-exit]");
             puts("            [--client-timeout-ms MS] [--imu-map direct|invert-x|invert-y|invert-z|swap-yz|switch1|switch2|switch3]");
-            puts("            [--pro-report-us US] [--log-neutral-rumble] [--test-rumble]");
+            puts("            [--pro-report-us US] [--test-imu off|roll|pitch|yaw|shake]");
+            puts("            [--log-neutral-rumble] [--test-rumble]");
             return 0;
         }
     }
@@ -4709,9 +4810,10 @@ int main(int argc, char** argv) {
 
     derive_key(DEFAULT_SECRET, g_hmac_key);
     if (g_verbose)
-        std::printf("[pro] report interval=%llu us, imu-map=%s\n",
+        std::printf("[pro] report interval=%llu us, imu-map=%s, imu-test=%s\n",
                     (unsigned long long)g_pro_report_interval_us,
-                    imu_map_name(g_imu_map));
+                    imu_map_name(g_imu_map),
+                    imu_test_name(g_imu_test));
     signal(SIGINT,  on_signal); signal(SIGTERM, on_signal); signal(SIGPIPE, SIG_IGN);
 
     if (do_upnp) upnp_add_mapping(port);
