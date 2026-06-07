@@ -90,7 +90,7 @@ static ClientSession g_clients[MAX_CLIENTS];
 // This HORI backend has no gyro/rumble path, so it only extracts the first
 // HIDReport from each extended pad and ignores the rest.
 static constexpr uint8_t MODERN_EXT_PROTO_VERSION = 5;
-static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
+static constexpr uint8_t MODERN_EXT_PAD_PRESENT = 0x01;
 
 struct NS_LOCAL_PACKED ModernMotionReportWire {
     int16_t ax, ay, az;
@@ -135,7 +135,7 @@ static bool modern_extended_udp_packet_ok(const ModernExtendedUdpPacketWire& p) 
 }
 
 static bool modern_pad_present(const ModernExtendedHIDReportWire& p) {
-    return (p.input.vendor & EXT_PAD_PRESENT) != 0;
+    return (p.input.vendor & MODERN_EXT_PAD_PRESENT) != 0;
 }
 
 static bool hid_report_neutral(const HIDReport& r) {
@@ -541,7 +541,7 @@ static std::string macro_read_file(const std::string& path) {
     return s;
 }
 
-static std::vector<ServerMacroStep> server_macro_load_file(const std::string& path) {
+[[maybe_unused]] static std::vector<ServerMacroStep> server_macro_load_file(const std::string& path) {
     std::string txt = macro_read_file(path);
     if (txt.empty()) return {};
     return server_macro_parse_text(txt);
@@ -604,7 +604,7 @@ static std::string macro_pretty_json(const std::string& raw_text, const std::str
     return out;
 }
 
-static bool macro_validate_to_pretty_json(const std::string& raw_text, std::string& pretty, std::string& err, const std::string& fallback_name = "Macro") {
+[[maybe_unused]] static bool macro_validate_to_pretty_json(const std::string& raw_text, std::string& pretty, std::string& err, const std::string& fallback_name = "Macro") {
     std::vector<ServerMacroStep> steps;
     if (!server_macro_validate_text(raw_text, steps, nullptr)) { err = macro_last_error(); return false; }
     pretty = macro_pretty_json(raw_text, fallback_name);
@@ -621,7 +621,7 @@ static uint64_t server_macro_total_ms(const std::vector<ServerMacroStep>& steps)
     return total;
 }
 
-static bool server_macro_report_at(const std::vector<ServerMacroStep>& steps, uint64_t elapsed_ms, HIDReport& out) {
+[[maybe_unused]] static bool server_macro_report_at(const std::vector<ServerMacroStep>& steps, uint64_t elapsed_ms, HIDReport& out) {
     out.reset();
     uint64_t t = 0;
     for (const auto& s : steps) {
@@ -894,7 +894,7 @@ static bool server_macro_start(int client_idx, int subpad, const std::string& js
     return true;
 }
 
-static void server_macro_stop_all_for_client(int client_idx) {
+[[maybe_unused]] static void server_macro_stop_all_for_client(int client_idx) {
     if (client_idx < 0 || client_idx >= MAX_CLIENTS) return;
     std::lock_guard<std::mutex> lk(g_server_macro_mtx);
     for (int s = 0; s < 4; ++s) g_server_macros[client_idx][s].running = false;
@@ -1062,6 +1062,12 @@ static bool create_hori_hid_function(int id) {
     return true;
 }
 
+static void run_shell_best_effort(const char* cmd) {
+    int rc = std::system(cmd);
+    if (g_verbose && rc == -1)
+        std::fprintf(stderr, "[gadget] command failed to start: %s\n", cmd);
+}
+
 static bool setup_hori_gadget_builtin(bool force, const char* reason) {
     if (!g_auto_gadget_setup) return hidg_nodes_ready();
 
@@ -1076,8 +1082,8 @@ static bool setup_hori_gadget_builtin(bool force, const char* reason) {
     std::printf("[gadget] %s; creating built-in 4-player HORI gadget\n",
                 reason ? reason : "Preparing HORI gadget");
 
-    std::system("modprobe libcomposite >/dev/null 2>&1 || true");
-    std::system("mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config >/dev/null 2>&1 || true");
+    run_shell_best_effort("modprobe libcomposite >/dev/null 2>&1 || true");
+    run_shell_best_effort("mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config >/dev/null 2>&1 || true");
 
     if (!dir_exists("/sys/kernel/config/usb_gadget")) {
         std::fprintf(stderr,
@@ -2666,12 +2672,21 @@ static int ws_upgrade(const char *key_line, char *resp, size_t resp_sz) {
 
 // ── Format HTML body (heap-allocated, caller must free) ──────────────────────
 static char* html_format(const char *fmt, const char *arg, size_t *out_len) {
-    size_t len = strlen(fmt) + strlen(arg) + 1;
-    char *buf = (char*)malloc(len);
-    if (!buf) { *out_len = 0; return nullptr; }
-    int written = snprintf(buf, len, fmt, arg);
-    if (written < 0 || (size_t)written >= len) { free(buf); *out_len = 0; return nullptr; }
-    *out_len = written;
+    std::string s = fmt ? fmt : "";
+    const char* insert = arg ? arg : "";
+    size_t pos = s.find("%s");
+    if (pos != std::string::npos)
+        s.replace(pos, 2, insert);
+
+    char *buf = (char*)malloc(s.size() + 1);
+    if (!buf) {
+        if (out_len) *out_len = 0;
+        return nullptr;
+    }
+    if (!s.empty())
+        memcpy(buf, s.data(), s.size());
+    buf[s.size()] = '\0';
+    if (out_len) *out_len = s.size();
     return buf;
 }
 
