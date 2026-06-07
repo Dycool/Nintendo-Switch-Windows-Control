@@ -879,7 +879,37 @@ private:
         return SDL_GetGamepadButton(pad, b);
     }
 
-    static ns::HIDReport map_gamepad(SDL_Gamepad* pad) {
+    static std::string upper_copy(std::string s) {
+        for (char& c : s) c = (char)std::toupper((unsigned char)c);
+        return s;
+    }
+
+    static bool contains_upper(const std::string& haystack, const char* needle) {
+        return upper_copy(haystack).find(needle) != std::string::npos;
+    }
+
+    static bool is_nintendo_like(const Device& d) {
+        if (d.vid == 0x057E) return true;
+        const std::string n = upper_copy(d.name);
+        return n.find("NINTENDO") != std::string::npos ||
+               n.find("SWITCH") != std::string::npos ||
+               n.find("JOY-CON") != std::string::npos ||
+               n.find("PRO CONTROLLER") != std::string::npos;
+    }
+
+    static bool should_use_combo_shortcuts(const Device& d) {
+        // Nintendo pads normally expose real HOME/CAPTURE through SDL, so do not
+        // steal L3+R3 or Back+Start from them. Xbox pads often have GUIDE
+        // reserved by Windows/Game Bar and older pads have no Capture button,
+        // so keep the convenient aliases there.
+        if (is_nintendo_like(d)) return false;
+        if (d.vid == 0x045E) return true; // Microsoft/Xbox
+        return contains_upper(d.name, "XBOX") || contains_upper(d.name, "XINPUT") ||
+               contains_upper(d.name, "MICROSOFT");
+    }
+
+    static ns::HIDReport map_gamepad(const Device& d) {
+        SDL_Gamepad* pad = d.pad;
         ns::HIDReport r;
         r.reset();
 
@@ -902,14 +932,15 @@ private:
         if (button(pad, SDL_GAMEPAD_BUTTON_GUIDE))      r.buttons |= ns::BTN_HOME;
         if (button(pad, SDL_GAMEPAD_BUTTON_MISC1))      r.buttons |= ns::BTN_CAPTURE;
 
-        // Keep the old useful combo aliases for pads without GUIDE/MISC1.
-        if ((r.buttons & ns::BTN_LSTICK) && (r.buttons & ns::BTN_RSTICK)) {
-            r.buttons |= ns::BTN_HOME;
-            r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK);
-        }
-        if ((r.buttons & ns::BTN_MINUS) && (r.buttons & ns::BTN_PLUS)) {
-            r.buttons |= ns::BTN_CAPTURE;
-            r.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS);
+        if (should_use_combo_shortcuts(d)) {
+            if ((r.buttons & ns::BTN_LSTICK) && (r.buttons & ns::BTN_RSTICK)) {
+                r.buttons |= ns::BTN_HOME;
+                r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK);
+            }
+            if ((r.buttons & ns::BTN_MINUS) && (r.buttons & ns::BTN_PLUS)) {
+                r.buttons |= ns::BTN_CAPTURE;
+                r.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS);
+            }
         }
 
         bool up = button(pad, SDL_GAMEPAD_BUTTON_DPAD_UP);
@@ -1066,7 +1097,7 @@ private:
             if (!d.pad || d.slot < 0 || d.slot >= 4 || !SDL_GamepadConnected(d.pad)) continue;
             SdlPadState st{};
             st.connected = true;
-            st.input = map_gamepad(d.pad);
+            st.input = map_gamepad(d);
             st.name = d.name;
             st.vid = d.vid;
             st.pid = d.pid;
