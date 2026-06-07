@@ -26,20 +26,13 @@ Connect the Raspberry Pi to the Switch dock via USB:
 
 ## 🚀 Running the Server (Manual Method)
 
-If you are running the pre-compiled release or just built the project from source, you need to run the setup script before starting the backend. 
+The server handles USB gadget setup **automatically** on startup — no separate script needed. Just run:
 
-**1. Make the gadget script executable and run it:**
-This script sets up the `libcomposite` gadget to make the Pi emulate a HORI Pokken Controller. Run it **before** connecting the Pi to the Switch.
-```bash
-chmod +x setup_gadget.sh
-sudo bash setup_gadget.sh
-```
-
-**2. Start the server backend:**
-We run the backend with `chrt -f 99` to give the process maximum real-time priority, ensuring the lowest possible latency.
 ```bash
 sudo chrt -f 99 ./ns-backend
 ```
+
+> **Note:** The `chrt -f 99` gives the process maximum real-time priority for lowest possible latency.
 
 ---
 
@@ -59,9 +52,7 @@ Description=NS PC Control Backend
 After=network.target
 
 [Service]
-# Run the gadget script before starting the backend
-ExecStartPre=/bin/bash /home/YOUR_USER/NS-PC-Control/server/rpi/setup_gadget.sh
-# Start the backend with real-time priority
+# The server handles USB gadget setup automatically.
 ExecStart=/usr/bin/chrt -f 99 /home/YOUR_USER/NS-PC-Control/server/rpi/ns-backend
 Restart=always
 RestartSec=5

@@ -59,6 +59,7 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 namespace ns {
 static constexpr uint32_t PROTO_MAGIC   = 0x4E535743u;
 static constexpr uint8_t  PROTO_VERSION = 4;
+static constexpr uint8_t  WEB_PROTO_VERSION = 5;
 static constexpr uint16_t DEFAULT_PORT  = 7331;
 static constexpr const char* DEFAULT_SECRET = "nsc-R2xvCy7Eyw2nfbZIOGyKZPnostpaRY";
 static constexpr size_t HMAC_TAG_SIZE = 16;
@@ -707,14 +708,6 @@ static int16_t read_le16(const uint8_t* p) {
                                 (static_cast<uint16_t>(p[1]) << 8));
 }
 
-static uint8_t raw12_to_axis8(uint16_t raw) {
-    int delta = (int)raw - 0x800;
-    int v = 128;
-    if (delta > 0) v = 128 + (delta * 127) / 0x600;
-    else if (delta < 0) v = 128 + (delta * 128) / 0x600;
-    return (uint8_t)std::clamp(v, 0, 255);
-}
-
 static uint8_t invert_axis8_centered(uint8_t v) {
     return v == 128 ? 128 : (uint8_t)(255 - v);
 }
@@ -738,10 +731,13 @@ struct RawPadState {
     ns::HIDReport input{};
     ns::MotionReport motion{};
     bool has_motion = false;
+    uint64_t last_input_us = 0;
     uint16_t vid = 0;
     uint16_t pid = 0;
     std::string name;
 };
+
+static constexpr uint64_t RAW_INPUT_STALE_RELEASE_US = 120'000ULL;
 
 struct RawHidDeviceInfo {
     std::string path;
@@ -776,9 +772,17 @@ public:
             }
             if (dev->handle == INVALID_HANDLE_VALUE) continue;
 
+            if (is_switch_pro(info.vid, info.pid)) {
+                init_switch_pro_for_input(dev.get());
+            }
+
             {
                 std::lock_guard<std::mutex> lk(mtx);
                 states[slot].connected = true;
+                states[slot].input.reset();
+                states[slot].motion.reset();
+                states[slot].has_motion = false;
+                states[slot].last_input_us = 0;
                 states[slot].vid = info.vid;
                 states[slot].pid = info.pid;
                 states[slot].name = device_name(info.vid, info.pid);
@@ -838,6 +842,11 @@ private:
         int slot = -1;
         uint8_t switch_packet_counter = 0;
         bool switch_rumble_enabled = false;
+        struct StickCalibration {
+            int cx = 0x800;
+            int cy = 0x800;
+            int samples = 0;
+        } switch_left_cal, switch_right_cal;
         std::thread thread;
         ~Device() {
             if (thread.joinable()) thread.detach();
@@ -880,6 +889,48 @@ private:
         BOOL ok_write = WriteFile(d->handle, data, (DWORD)len, &written, nullptr);
         BOOL ok_report = HidD_SetOutputReport(d->handle, const_cast<PVOID>(reinterpret_cast<const void*>(data)), (ULONG)len);
         return (ok_write && written == len) || ok_report;
+    }
+
+    static void update_switch_stick_calibration(Device::StickCalibration& cal, uint16_t x, uint16_t y) {
+        constexpr int NOMINAL_CENTER = 0x800;
+        constexpr int INIT_WINDOW = 700;
+        constexpr int RECENTER_WINDOW = 220;
+        const int ix = (int)x;
+        const int iy = (int)y;
+
+        if (cal.samples < 24) {
+            if (std::abs(ix - NOMINAL_CENTER) > INIT_WINDOW ||
+                std::abs(iy - NOMINAL_CENTER) > INIT_WINDOW) {
+                return;
+            }
+            const int n = cal.samples + 1;
+            cal.cx = (cal.cx * cal.samples + ix) / n;
+            cal.cy = (cal.cy * cal.samples + iy) / n;
+            cal.samples = n;
+            return;
+        }
+
+        if (std::abs(ix - cal.cx) <= RECENTER_WINDOW &&
+            std::abs(iy - cal.cy) <= RECENTER_WINDOW) {
+            cal.cx = (cal.cx * 63 + ix + 32) / 64;
+            cal.cy = (cal.cy * 63 + iy + 32) / 64;
+        }
+    }
+
+    static uint8_t switch_axis_to_byte(uint16_t raw, int center, bool invert) {
+        constexpr int DEADZONE = 170;
+        constexpr int RANGE = 0x600;
+        int delta = std::clamp((int)raw, 0, 0x0FFF) - center;
+        int mag = std::abs(delta);
+        if (mag <= DEADZONE) return 128;
+
+        mag = std::min(mag, RANGE) - DEADZONE;
+        const int span = RANGE - DEADZONE;
+        int v = 128;
+        if (delta > 0) v = 128 + (mag * 127 + span / 2) / span;
+        else           v = 128 - (mag * 128 + span / 2) / span;
+        uint8_t out = (uint8_t)std::clamp(v, 0, 255);
+        return invert ? invert_axis8_centered(out) : out;
     }
 
     static void switch_neutral_rumble(uint8_t out4[4]) {
@@ -929,10 +980,38 @@ private:
         return write_hid_output(d, out.data(), out.size());
     }
 
+    static bool switch_send_usb_command(Device* d, uint8_t cmd) {
+        std::vector<uint8_t> out(output_report_len(d, 2), 0);
+        out[0] = 0x80;
+        out[1] = cmd;
+        return write_hid_output(d, out.data(), out.size());
+    }
+
     static void switch_enable_rumble_once(Device* d) {
         if (!d || d->switch_rumble_enabled) return;
         const uint8_t enable = 0x01;
         d->switch_rumble_enabled = switch_send_subcommand(d, 0x48, &enable, 1);
+    }
+
+    static void init_switch_pro_for_input(Device* d) {
+        if (!d) return;
+        // Put the physical Switch Pro into the same high-rate standard report
+        // mode that the console uses, and enable IMU data. Without this, many
+        // Windows HID paths only expose buttons/sticks sporadically and never
+        // provide report 0x30 motion samples.
+        switch_send_usb_command(d, 0x02);
+        Sleep(5);
+        switch_send_usb_command(d, 0x03);
+        Sleep(5);
+        switch_send_usb_command(d, 0x02);
+        Sleep(5);
+        switch_send_usb_command(d, 0x04);
+        Sleep(5);
+        switch_enable_rumble_once(d);
+        const uint8_t enable_imu = 0x01;
+        switch_send_subcommand(d, 0x40, &enable_imu, 1);
+        const uint8_t standard_full_report = 0x30;
+        switch_send_subcommand(d, 0x03, &standard_full_report, 1);
     }
 
     static void send_switch_pro_rumble(Device* d, uint8_t low, uint8_t high) {
@@ -1079,9 +1158,56 @@ private:
         return true;
     }
 
-    static bool parse_switch_pro(const uint8_t* b, DWORD len, ns::HIDReport& r, ns::MotionReport& m, bool& has_motion) {
-        r.reset(); m.reset(); has_motion = false;
-        if (len < 25 || b[0] != 0x30) return false;
+    static uint8_t switch_simple_axis_to_byte(int16_t raw, bool invert) {
+        int v = ((int)raw + 32768) * 255 / 65535;
+        uint8_t out = (uint8_t)std::clamp(v, 0, 255);
+        return invert ? invert_axis8_centered(out) : out;
+    }
+
+    static void switch_hat_to_report(uint8_t hat, ns::HIDReport& r) {
+        switch (hat & 0x0F) {
+            case 0: r.hat = ns::HAT_N;  break;
+            case 1: r.hat = ns::HAT_NE; break;
+            case 2: r.hat = ns::HAT_E;  break;
+            case 3: r.hat = ns::HAT_SE; break;
+            case 4: r.hat = ns::HAT_S;  break;
+            case 5: r.hat = ns::HAT_SW; break;
+            case 6: r.hat = ns::HAT_W;  break;
+            case 7: r.hat = ns::HAT_NW; break;
+            default: r.hat = ns::HAT_NEUTRAL; break;
+        }
+    }
+
+    static bool parse_switch_simple(const uint8_t* b, DWORD len, ns::HIDReport& r) {
+        if (len < 12 || b[0] != 0x3F) return false;
+
+        const uint8_t b0 = b[1];
+        const uint8_t b1 = b[2];
+        if (b0 & 0x04) r.buttons |= ns::BTN_Y;
+        if (b0 & 0x01) r.buttons |= ns::BTN_B;
+        if (b0 & 0x02) r.buttons |= ns::BTN_A;
+        if (b0 & 0x08) r.buttons |= ns::BTN_X;
+        if (b0 & 0x10) r.buttons |= ns::BTN_L;
+        if (b0 & 0x20) r.buttons |= ns::BTN_R;
+        if (b0 & 0x40) r.buttons |= ns::BTN_ZL;
+        if (b0 & 0x80) r.buttons |= ns::BTN_ZR;
+        if (b1 & 0x01) r.buttons |= ns::BTN_MINUS;
+        if (b1 & 0x02) r.buttons |= ns::BTN_PLUS;
+        if (b1 & 0x04) r.buttons |= ns::BTN_LSTICK;
+        if (b1 & 0x08) r.buttons |= ns::BTN_RSTICK;
+        if (b1 & 0x10) r.buttons |= ns::BTN_HOME;
+        if (b1 & 0x20) r.buttons |= ns::BTN_CAPTURE;
+
+        switch_hat_to_report(b[3], r);
+        r.lx = switch_simple_axis_to_byte(read_le16(b + 4), false);
+        r.ly = switch_simple_axis_to_byte(read_le16(b + 6), false);
+        r.rx = switch_simple_axis_to_byte(read_le16(b + 8), false);
+        r.ry = switch_simple_axis_to_byte(read_le16(b + 10), false);
+        return true;
+    }
+
+    static bool parse_switch_full_controls(Device* d, const uint8_t* b, DWORD len, ns::HIDReport& r) {
+        if (len < 12) return false;
 
         uint8_t br = b[3], bm = b[4], bl = b[5];
         if (br & 0x01) r.buttons |= ns::BTN_Y;
@@ -1109,18 +1235,33 @@ private:
         uint16_t ly = (((uint16_t)b[7] >> 4) & 0x0F) | ((uint16_t)b[8] << 4);
         uint16_t rx = (uint16_t)b[9] | (((uint16_t)b[10] & 0x0F) << 8);
         uint16_t ry = (((uint16_t)b[10] >> 4) & 0x0F) | ((uint16_t)b[11] << 4);
-        r.lx = raw12_to_axis8(lx);
-        r.ly = invert_axis8_centered(raw12_to_axis8(ly));
-        r.rx = raw12_to_axis8(rx);
-        r.ry = invert_axis8_centered(raw12_to_axis8(ry));
-
-        m.ax = read_le16(b + 13); m.ay = read_le16(b + 15); m.az = read_le16(b + 17);
-        m.gx = read_le16(b + 19); m.gy = read_le16(b + 21); m.gz = read_le16(b + 23);
-        has_motion = true;
+        update_switch_stick_calibration(d->switch_left_cal, lx, ly);
+        update_switch_stick_calibration(d->switch_right_cal, rx, ry);
+        r.lx = switch_axis_to_byte(lx, d->switch_left_cal.cx, false);
+        r.ly = switch_axis_to_byte(ly, d->switch_left_cal.cy, true);
+        r.rx = switch_axis_to_byte(rx, d->switch_right_cal.cx, false);
+        r.ry = switch_axis_to_byte(ry, d->switch_right_cal.cy, true);
         return true;
     }
 
+    static bool parse_switch_pro(Device* d, const uint8_t* b, DWORD len, ns::HIDReport& r, ns::MotionReport& m, bool& has_motion) {
+        r.reset(); m.reset(); has_motion = false;
+        if (b[0] == 0x3F)
+            return parse_switch_simple(b, len, r);
+
+        if ((b[0] == 0x21 || b[0] == 0x30 || b[0] == 0x31) && parse_switch_full_controls(d, b, len, r)) {
+            if ((b[0] == 0x30 || b[0] == 0x31) && len >= 25) {
+                m.ax = read_le16(b + 13); m.ay = read_le16(b + 15); m.az = read_le16(b + 17);
+                m.gx = read_le16(b + 19); m.gy = read_le16(b + 21); m.gz = read_le16(b + 23);
+                has_motion = true;
+            }
+            return true;
+        }
+        return false;
+    }
+
     void read_loop(Device* d) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         std::vector<uint8_t> buf(std::max<USHORT>(d->info.input_len, 64));
         while (running.load()) {
             DWORD got = 0;
@@ -1129,6 +1270,10 @@ private:
                 if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_INVALID_HANDLE || err == ERROR_OPERATION_ABORTED) {
                     std::lock_guard<std::mutex> lk(mtx);
                     states[d->slot].connected = false;
+                    states[d->slot].input.reset();
+                    states[d->slot].motion.reset();
+                    states[d->slot].has_motion = false;
+                    states[d->slot].last_input_us = 0;
                     break;
                 }
                 Sleep(5);
@@ -1144,7 +1289,7 @@ private:
             else if (is_dualsense(d->info.vid, d->info.pid))
                 ok = parse_dualsense(buf.data(), got, input, motion, has_motion);
             else if (is_switch_pro(d->info.vid, d->info.pid))
-                ok = parse_switch_pro(buf.data(), got, input, motion, has_motion);
+                ok = parse_switch_pro(d, buf.data(), got, input, motion, has_motion);
 
             if (!ok) continue;
             std::lock_guard<std::mutex> lk(mtx);
@@ -1152,6 +1297,7 @@ private:
             states[d->slot].input = input;
             states[d->slot].motion = motion;
             states[d->slot].has_motion = has_motion;
+            states[d->slot].last_input_us = ns::now_us();
         }
     }
 };
@@ -1724,7 +1870,7 @@ static void SaveKeyboardMode(int mode) {
 }
 
 
-enum { IDC_IP = 101, IDC_CONNECT, IDC_KEYBOARD_COMBO = 110, IDC_BINDINGS_BTN = 111, IDC_MACROS_BTN = 112, IDC_EDITOR_CHANGE = 200, IDC_EDITOR_SETUP = 400, IDC_EDITOR_RESET = 500, IDC_EDITOR_KEY_START = 300, IDC_MACRO_EDIT = 600, IDC_MACRO_RUN = 601, IDC_MACRO_SAVE = 602, IDC_MACRO_DELETE = 603, IDC_MACRO_CLOSE = 604, IDC_MACRO_RECORD_START = 605, IDC_MACRO_RECORD_STOP = 606, IDC_MACRO_IMPORT = 607, IDC_MACRO_EXPORT = 608, IDC_MACRO_HOTKEY = 609 };
+enum { IDC_IP = 101, IDC_CONNECT, IDC_KEYBOARD_COMBO = 110, IDC_BINDINGS_BTN = 111, IDC_MACROS_BTN = 112, IDC_EDITOR_CHANGE = 200, IDC_EDITOR_SETUP = 400, IDC_EDITOR_RESET = 500, IDC_EDITOR_KEY_START = 300, IDC_MACRO_EDIT = 600, IDC_MACRO_RUN = 601, IDC_MACRO_SAVE = 602, IDC_MACRO_DELETE = 603, IDC_MACRO_CLOSE = 604, IDC_MACRO_RECORD_START = 605, IDC_MACRO_RECORD_STOP = 606, IDC_MACRO_IMPORT = 607, IDC_MACRO_EXPORT = 608, IDC_MACRO_HOTKEY = 609, IDC_MACRO_NAME = 610, IDC_MACRO_ADD = 611, IDC_MACRO_RECORD_TOGGLE = 612, IDC_MACRO_RUN_BASE = 700, IDC_MACRO_DELETE_BASE = 800, IDC_MACRO_KEY_BASE = 900, IDC_MACRO_CHANGE_BASE = 1000, IDC_MACRO_EXPORT_BASE = 1100 };
 static HWND CreateButton(HWND parent, const wchar_t* text, int x, int y, int w, int h, int id);
 
 // ── Macro runtime/editor ────────────────────────────────────────────────────
@@ -1734,12 +1880,26 @@ static bool g_macro_running = false;
 static uint64_t g_macro_start_us = 0;
 static std::string g_macro_text;
 static std::string g_macro_upload_pending;
-static std::string g_macro_hotkey;
-static bool g_macro_hotkey_last_down = false;
-static HWND g_hMacroEdit = nullptr;
-static HWND g_hMacroHotkeyEdit = nullptr;
 static const wchar_t* REG_VAL_MACROS = L"MacrosJson";
 static const wchar_t* REG_VAL_MACRO_HOTKEY = L"MacroHotkey";
+
+struct MacroEntry {
+    std::string name;
+    std::string hotkey;
+    std::string json;
+};
+
+static std::vector<MacroEntry> g_macro_entries;
+static std::unordered_map<std::string, bool> g_macro_hotkey_down;
+static bool g_macro_editor_recording = false;
+static HWND g_hMacroRecordToggleBtn = nullptr;
+static std::vector<HWND> g_macro_row_controls;
+static int g_macro_listening_idx = -1;
+static HWND g_macro_listening_static = nullptr;
+static constexpr UINT_PTR MACRO_RECORD_TIMER_ID = 2;
+
+static bool key_is_down(const std::string& name);
+static void apply_keyboard_to_report(ns::HIDReport& rep, bool override_mode);
 
 static std::string MacroConfigDirA() {
     char appdata[MAX_PATH]{};
@@ -1761,44 +1921,102 @@ static std::string MacroFilePathA() {
     return MacroConfigDirA() + "\\macros.json";
 }
 
-static std::string LoadSavedMacrosText() {
-    std::string path = MacroFilePathA();
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (f) {
-        std::streamoff len = f.tellg();
-        if (len >= 0 && (uint64_t)len <= MACRO_JSON_MAX_BYTES) {
-            f.seekg(0, std::ios::beg);
-            std::string out((size_t)len, '\0');
-            if (len > 0) f.read(&out[0], len);
-            if (f || len == 0) return out;
-        }
-    }
-
-    // Backward compatibility with older builds that stored tiny macros in registry.
-    HKEY hKey = nullptr;
-    std::string out;
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        wchar_t buf[8192]{}; DWORD len = sizeof(buf); DWORD type = 0;
-        if (RegQueryValueExW(hKey, REG_VAL_MACROS, nullptr, &type, (LPBYTE)buf, &len) == ERROR_SUCCESS && type == REG_SZ)
-            out = narrow(buf);
-        RegCloseKey(hKey);
-    }
-    return out;
-}
-
 static std::string normalize_key_name(std::string s) {
     s = macro_upper(macro_trim(s));
     return s;
 }
 
-static std::string LoadSavedMacroHotkey() {
-    HKEY hKey = nullptr;
-    std::string out;
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        wchar_t buf[64]{}; DWORD len = sizeof(buf); DWORD type = 0;
-        if (RegQueryValueExW(hKey, REG_VAL_MACRO_HOTKEY, nullptr, &type, (LPBYTE)buf, &len) == ERROR_SUCCESS && type == REG_SZ)
-            out = normalize_key_name(narrow(buf));
-        RegCloseKey(hKey);
+static std::string vk_to_key_name(UINT vk) {
+    if (vk >= 'A' && vk <= 'Z') return std::string(1, (char)vk);
+    if (vk >= '0' && vk <= '9') return std::string(1, (char)vk);
+    struct { UINT vk; const char* n; } map[] = {
+        {VK_UP,"UP"},{VK_DOWN,"DOWN"},{VK_LEFT,"LEFT"},{VK_RIGHT,"RIGHT"},
+        {VK_LSHIFT,"LSHIFT"},{VK_RSHIFT,"RSHIFT"},
+        {VK_LCONTROL,"LCTRL"},{VK_RCONTROL,"RCTRL"},
+        {VK_LMENU,"LALT"},{VK_RMENU,"RALT"},
+        {VK_SPACE,"SPACE"},{VK_RETURN,"ENTER"},{VK_TAB,"TAB"},
+        {VK_ESCAPE,"ESC"},{VK_BACK,"BACKSPACE"},
+        {VK_F1,"F1"},{VK_F2,"F2"},{VK_F3,"F3"},{VK_F4,"F4"},
+        {VK_F5,"F5"},{VK_F6,"F6"},{VK_F7,"F7"},{VK_F8,"F8"},
+        {VK_F9,"F9"},{VK_F10,"F10"},{VK_F11,"F11"},{VK_F12,"F12"},
+        {VK_HOME,"HOME"},{VK_SNAPSHOT,"SNAPSHOT"},
+    };
+    for (auto& m : map)
+        if (vk == m.vk) return m.n;
+    return "";
+}
+
+static bool json_find_string_value(const std::string& raw, const std::string& key, std::string& out) {
+    out.clear();
+    std::string quoted = "\"" + key + "\"";
+    size_t pos = raw.find(quoted);
+    if (pos == std::string::npos) return false;
+    pos += quoted.size();
+    macro_skip_ws(raw, pos);
+    if (pos >= raw.size() || raw[pos] != ':') return false;
+    ++pos;
+    macro_skip_ws(raw, pos);
+    std::string err;
+    return macro_read_json_string_at(raw, pos, out, err);
+}
+
+static bool find_json_array_range_for_key(const std::string& raw, const std::string& key, size_t& begin, size_t& end) {
+    begin = end = std::string::npos;
+    std::string quoted = "\"" + key + "\"";
+    size_t pos = raw.find(quoted);
+    if (pos == std::string::npos) return false;
+    pos += quoted.size();
+    macro_skip_ws(raw, pos);
+    if (pos >= raw.size() || raw[pos] != ':') return false;
+    ++pos;
+    macro_skip_ws(raw, pos);
+    if (pos >= raw.size() || raw[pos] != '[') return false;
+    begin = pos + 1;
+
+    bool in_str = false, esc = false;
+    int depth = 1;
+    for (++pos; pos < raw.size(); ++pos) {
+        char c = raw[pos];
+        if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '[') ++depth;
+        else if (c == ']') {
+            --depth;
+            if (depth == 0) { end = pos; return true; }
+        }
+    }
+    return false;
+}
+
+static std::vector<std::string> split_top_level_objects(const std::string& raw, size_t begin, size_t end) {
+    std::vector<std::string> out;
+    bool in_str = false, esc = false;
+    int depth = 0;
+    size_t obj_start = std::string::npos;
+    for (size_t pos = begin; pos < end && pos < raw.size(); ++pos) {
+        char c = raw[pos];
+        if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '{') {
+            if (depth == 0) obj_start = pos;
+            ++depth;
+        } else if (c == '}') {
+            --depth;
+            if (depth == 0 && obj_start != std::string::npos) {
+                out.push_back(raw.substr(obj_start, pos - obj_start + 1));
+                obj_start = std::string::npos;
+            }
+        }
     }
     return out;
 }
@@ -1815,47 +2033,208 @@ static bool MacroHotkeyConflicts(const std::string& hotkey, std::string* conflic
     return false;
 }
 
-static bool SaveMacroHotkey(const std::string& hotkey_raw, HWND parent) {
-    std::string hk = normalize_key_name(hotkey_raw);
+static bool MacroEntryHotkeyConflicts(const std::string& hotkey, int skip_index, std::string* conflict_name = nullptr) {
+    std::string hk = normalize_key_name(hotkey);
+    if (hk.empty()) return false;
+    for (int i = 0; i < (int)g_macro_entries.size(); ++i) {
+        if (i == skip_index) continue;
+        if (normalize_key_name(g_macro_entries[i].hotkey) == hk) {
+            if (conflict_name) *conflict_name = g_macro_entries[i].name.empty() ? "another macro" : g_macro_entries[i].name;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ValidateMacroHotkeyForEntry(const std::string& hotkey, int skip_index, HWND parent) {
     std::string conflict;
-    if (MacroHotkeyConflicts(hk, &conflict)) {
-        MessageBoxW(parent, widen("Macro hotkey conflicts with keyboard binding: " + conflict).c_str(),
-                    L"Macro hotkey", MB_OK | MB_ICONWARNING);
+    if (MacroHotkeyConflicts(hotkey, &conflict)) {
+        MessageBoxW(parent, widen("Macro keybind conflicts with keyboard binding: " + conflict).c_str(),
+                    L"Macro keybind", MB_OK | MB_ICONWARNING);
         return false;
+    }
+    if (MacroEntryHotkeyConflicts(hotkey, skip_index, &conflict)) {
+        MessageBoxW(parent, widen("Macro keybind is already used by: " + conflict).c_str(),
+                    L"Macro keybind", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    return true;
+}
+
+static int FindMacroEntryByName(const std::string& name) {
+    std::string wanted = macro_upper(macro_trim(name));
+    if (wanted.empty()) return -1;
+    for (int i = 0; i < (int)g_macro_entries.size(); ++i) {
+        if (macro_upper(g_macro_entries[i].name) == wanted) return i;
+    }
+    return -1;
+}
+
+static std::string UniqueMacroName(const std::string& base_raw) {
+    std::string base = macro_trim(base_raw);
+    if (base.empty()) base = "Recorded Macro";
+    std::string name = base;
+    int suffix = 2;
+    while (FindMacroEntryByName(name) >= 0) {
+        name = base + " " + std::to_string(suffix++);
+    }
+    return name;
+}
+
+static void RebuildMacroHotkeyState() {
+    g_macro_hotkey_down.clear();
+    for (const auto& e : g_macro_entries) {
+        std::string hk = normalize_key_name(e.hotkey);
+        if (!hk.empty()) g_macro_hotkey_down[hk] = false;
+    }
+}
+
+static std::string MacroEntryToObjectJson(const MacroEntry& e) {
+    std::vector<MacroStep> steps;
+    std::vector<std::string> lines;
+    if (!macro_validate_text(e.json, steps, &lines)) lines = {"WAIT 200"};
+
+    std::string name = macro_trim(e.name).empty() ? macro_extract_name_or_default(e.json, "Macro") : e.name;
+    std::string out;
+    out += "    {\n";
+    out += "      \"name\": \"" + macro_escape_json(name) + "\",\n";
+    out += "      \"hotkey\": \"" + macro_escape_json(normalize_key_name(e.hotkey)) + "\",\n";
+    out += "      \"commands\": [\n";
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out += "        \"" + macro_escape_json(lines[i]) + "\"";
+        if (i + 1 < lines.size()) out += ",";
+        out += "\n";
+    }
+    out += "      ]\n";
+    out += "    }";
+    return out;
+}
+
+static std::string MacroEntriesToJson(const std::vector<MacroEntry>& entries) {
+    std::string out;
+    out += "{\n";
+    out += "  \"macros\": [\n";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        out += MacroEntryToObjectJson(entries[i]);
+        if (i + 1 < entries.size()) out += ",";
+        out += "\n";
+    }
+    out += "  ]\n";
+    out += "}\n";
+    return out;
+}
+
+static bool ParseMacroEntriesText(const std::string& raw, std::vector<MacroEntry>& out, std::string& err) {
+    out.clear();
+    err.clear();
+    if (raw.size() > MACRO_JSON_MAX_BYTES) { err = "macro JSON exceeds 50MB limit"; return false; }
+    std::string t = macro_trim(raw);
+    if (t.empty()) return true;
+
+    size_t arr_begin = 0, arr_end = 0;
+    if (find_json_array_range_for_key(t, "macros", arr_begin, arr_end)) {
+        auto objects = split_top_level_objects(t, arr_begin, arr_end);
+        for (const std::string& obj : objects) {
+            std::string pretty;
+            if (!macro_validate_to_pretty_json(obj, pretty, err, "Macro")) return false;
+            MacroEntry e;
+            e.json = pretty;
+            e.name = macro_extract_name_or_default(obj, "Macro");
+            json_find_string_value(obj, "hotkey", e.hotkey);
+            e.hotkey = normalize_key_name(e.hotkey);
+            out.push_back(e);
+        }
+        return true;
+    }
+
+    // Backward compatibility: old builds stored one macro directly.
+    std::string pretty;
+    if (!macro_validate_to_pretty_json(t, pretty, err, "Macro")) return false;
+    MacroEntry e;
+    e.json = pretty;
+    e.name = macro_extract_name_or_default(t, "Macro");
+    json_find_string_value(t, "hotkey", e.hotkey);
+    e.hotkey = normalize_key_name(e.hotkey);
+    out.push_back(e);
+    return true;
+}
+
+static std::string LoadSavedMacrosText() {
+    std::string path = MacroFilePathA();
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (f) {
+        std::streamoff len = f.tellg();
+        if (len >= 0 && (uint64_t)len <= MACRO_JSON_MAX_BYTES) {
+            f.seekg(0, std::ios::beg);
+            std::string out((size_t)len, '\0');
+            if (len > 0) f.read(&out[0], len);
+            if (f || len == 0) return out;
+        }
     }
 
     HKEY hKey = nullptr;
-    if (RegCreateKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
-        std::wstring whk = widen(hk);
-        RegSetValueExW(hKey, REG_VAL_MACRO_HOTKEY, 0, REG_SZ,
-                       (const BYTE*)whk.c_str(), (DWORD)((whk.size() + 1) * sizeof(wchar_t)));
+    std::string out;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[8192]{}; DWORD len = sizeof(buf); DWORD type = 0;
+        if (RegQueryValueExW(hKey, REG_VAL_MACROS, nullptr, &type, (LPBYTE)buf, &len) == ERROR_SUCCESS && type == REG_SZ)
+            out = narrow(buf);
         RegCloseKey(hKey);
     }
-    g_macro_hotkey = hk;
-    return true;
+    return out;
 }
 
-static bool SaveMacrosText(const std::string& txt) {
-    std::string pretty, err;
-    if (!macro_validate_to_pretty_json(txt, pretty, err, "Macro")) {
-        MessageBoxW(g_hWnd, widen("Invalid macro: " + err).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING);
-        return false;
+static std::string LoadSavedMacroHotkey() {
+    HKEY hKey = nullptr;
+    std::string out;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, REG_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t buf[64]{}; DWORD len = sizeof(buf); DWORD type = 0;
+        if (RegQueryValueExW(hKey, REG_VAL_MACRO_HOTKEY, nullptr, &type, (LPBYTE)buf, &len) == ERROR_SUCCESS && type == REG_SZ)
+            out = normalize_key_name(narrow(buf));
+        RegCloseKey(hKey);
+    }
+    return out;
+}
+
+static void LoadMacroEntries() {
+    std::string err;
+    std::vector<MacroEntry> loaded;
+    if (!ParseMacroEntriesText(LoadSavedMacrosText(), loaded, err)) loaded.clear();
+
+    if (loaded.size() == 1 && loaded[0].hotkey.empty()) {
+        // One-time migration from older single-macro registry hotkey.
+        loaded[0].hotkey = LoadSavedMacroHotkey();
     }
 
+    std::lock_guard<std::mutex> lk(g_macro_mtx);
+    g_macro_entries = std::move(loaded);
+    RebuildMacroHotkeyState();
+    g_macro_text = MacroEntriesToJson(g_macro_entries);
+}
+
+static bool SaveMacroEntriesToDisk(HWND parent = g_hWnd) {
+    std::string json;
+    {
+        json = MacroEntriesToJson(g_macro_entries);
+    }
+    if (json.size() > MACRO_JSON_MAX_BYTES) {
+        MessageBoxW(parent, L"Macro JSON exceeds the 50MB limit.", L"Macro save", MB_OK | MB_ICONWARNING);
+        return false;
+    }
     std::string path = MacroFilePathA();
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) {
-        MessageBoxW(g_hWnd, widen("Could not save macros to " + path).c_str(), L"Macro save", MB_OK | MB_ICONERROR);
+        MessageBoxW(parent, widen("Could not save macros to " + path).c_str(), L"Macro save", MB_OK | MB_ICONERROR);
         return false;
     }
-    f.write(pretty.data(), (std::streamsize)pretty.size());
+    f.write(json.data(), (std::streamsize)json.size());
     if (!f) {
-        MessageBoxW(g_hWnd, L"Failed while writing macros file.", L"Macro save", MB_OK | MB_ICONERROR);
+        MessageBoxW(parent, L"Failed while writing macros file.", L"Macro save", MB_OK | MB_ICONERROR);
         return false;
     }
-    g_macro_text = pretty;
+    g_macro_text = json;
     return true;
 }
+
 static bool StartMacroText(const std::string& txt) {
     std::vector<MacroStep> parsed;
     if (!macro_validate_text(txt, parsed, nullptr)) {
@@ -1875,10 +2254,86 @@ static bool StartMacroText(const std::string& txt) {
     return true;
 }
 
+static bool UpsertMacroEntry(HWND parent, MacroEntry e, bool force_unique_name) {
+    std::string pretty, err;
+    if (!macro_validate_to_pretty_json(e.json, pretty, err, e.name.empty() ? "Macro" : e.name)) {
+        MessageBoxW(parent, widen("Invalid macro: " + err).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
+    e.name = macro_trim(e.name);
+    if (e.name.empty()) e.name = macro_extract_name_or_default(pretty, "Macro");
+    if (force_unique_name) e.name = UniqueMacroName(e.name);
+    e.hotkey = normalize_key_name(e.hotkey);
+    e.json = pretty;
+
+    int existing = force_unique_name ? -1 : FindMacroEntryByName(e.name);
+    if (!ValidateMacroHotkeyForEntry(e.hotkey, existing, parent)) {
+        e.hotkey.clear();
+    }
+
+    if (existing >= 0) g_macro_entries[existing] = std::move(e);
+    else g_macro_entries.push_back(std::move(e));
+    RebuildMacroHotkeyState();
+    return SaveMacroEntriesToDisk(parent);
+}
+
+static bool ReadRawFileDialog(HWND parent, std::string& out) {
+    out.clear();
+    wchar_t file[MAX_PATH]{};
+    OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = parent; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"JSON Files\0*.json\0All Files\0*.*\0"; ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return false;
+    FILE* f = _wfopen(file, L"rb"); if (!f) return false;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    if (len < 0 || (uint64_t)len > MACRO_JSON_MAX_BYTES) { fclose(f); MessageBoxW(parent, L"Macro JSON exceeds the 50MB limit.", L"Macro validation", MB_OK | MB_ICONWARNING); return false; }
+    out.assign((size_t)std::max<long>(0, len), '\0');
+    if (len > 0) fread(&out[0], 1, (size_t)len, f);
+    fclose(f);
+    return true;
+}
+
+static void PollMacroEntryHotkeys() {
+    std::vector<std::string> to_run;
+    {
+        std::lock_guard<std::mutex> lk(g_macro_mtx);
+        for (const auto& e : g_macro_entries) {
+            std::string hk = normalize_key_name(e.hotkey);
+            if (hk.empty()) continue;
+            if (MacroHotkeyConflicts(hk, nullptr)) continue;
+            bool down = key_is_down(hk);
+            bool was_down = g_macro_hotkey_down[hk];
+            g_macro_hotkey_down[hk] = down;
+            if (down && !was_down) to_run.push_back(e.json);
+        }
+    }
+    for (const auto& json : to_run) StartMacroText(json);
+}
+
 static bool g_macro_recording = false;
-static uint16_t g_macro_record_last_buttons = 0xFFFF;
+struct MacroRecordFrame {
+    uint16_t buttons = 0;
+    uint8_t hat = ns::HAT_NEUTRAL;
+    int8_t lx = 0;
+    int8_t ly = 0;
+    int8_t rx = 0;
+    int8_t ry = 0;
+};
+
+static MacroRecordFrame g_macro_record_last_frame{};
+static bool g_macro_record_have_frame = false;
+static bool g_macro_record_has_input = false;
 static uint64_t g_macro_record_last_change_us = 0;
 static std::string g_macro_record_commands;
+
+static bool operator==(const MacroRecordFrame& a, const MacroRecordFrame& b) {
+    return a.buttons == b.buttons && a.hat == b.hat &&
+           a.lx == b.lx && a.ly == b.ly && a.rx == b.rx && a.ry == b.ry;
+}
+
+static bool operator!=(const MacroRecordFrame& a, const MacroRecordFrame& b) {
+    return !(a == b);
+}
 
 static std::string macro_buttons_to_text(uint16_t buttons) {
     struct BtnName { uint16_t bit; const char* name; } names[] = {
@@ -1898,14 +2353,60 @@ static std::string macro_buttons_to_text(uint16_t buttons) {
     return out;
 }
 
-static void MacroRecordAppendLocked(uint16_t buttons, uint64_t duration_ms) {
+static MacroRecordFrame MacroRecordFrameFromReport(const ns::HIDReport& report) {
+    auto axis_dir = [](uint8_t v) -> int8_t {
+        if (v < 80) return -1;
+        if (v > 176) return 1;
+        return 0;
+    };
+
+    MacroRecordFrame f{};
+    f.buttons = report.buttons;
+    f.hat = report.hat;
+    f.lx = axis_dir(report.lx);
+    f.ly = axis_dir(report.ly);
+    f.rx = axis_dir(report.rx);
+    f.ry = axis_dir(report.ry);
+    return f;
+}
+
+static void macro_append_token(std::string& out, const char* token) {
+    if (!out.empty()) out += "+";
+    out += token;
+}
+
+static std::string macro_record_frame_to_text(const MacroRecordFrame& f) {
+    std::string out = macro_buttons_to_text(f.buttons);
+    switch (f.hat) {
+        case ns::HAT_N:  macro_append_token(out, "DPAD_UP"); break;
+        case ns::HAT_NE: macro_append_token(out, "DPAD_UP"); macro_append_token(out, "DPAD_RIGHT"); break;
+        case ns::HAT_E:  macro_append_token(out, "DPAD_RIGHT"); break;
+        case ns::HAT_SE: macro_append_token(out, "DPAD_DOWN"); macro_append_token(out, "DPAD_RIGHT"); break;
+        case ns::HAT_S:  macro_append_token(out, "DPAD_DOWN"); break;
+        case ns::HAT_SW: macro_append_token(out, "DPAD_DOWN"); macro_append_token(out, "DPAD_LEFT"); break;
+        case ns::HAT_W:  macro_append_token(out, "DPAD_LEFT"); break;
+        case ns::HAT_NW: macro_append_token(out, "DPAD_UP"); macro_append_token(out, "DPAD_LEFT"); break;
+        default: break;
+    }
+    if (f.lx < 0) macro_append_token(out, "LSTICK_LEFT");
+    else if (f.lx > 0) macro_append_token(out, "LSTICK_RIGHT");
+    if (f.ly < 0) macro_append_token(out, "LSTICK_UP");
+    else if (f.ly > 0) macro_append_token(out, "LSTICK_DOWN");
+    if (f.rx < 0) macro_append_token(out, "RSTICK_LEFT");
+    else if (f.rx > 0) macro_append_token(out, "RSTICK_RIGHT");
+    if (f.ry < 0) macro_append_token(out, "RSTICK_UP");
+    else if (f.ry > 0) macro_append_token(out, "RSTICK_DOWN");
+    return out;
+}
+
+static void MacroRecordAppendLocked(const MacroRecordFrame& frame, uint64_t duration_ms) {
     if (duration_ms < 10) return;
     if (!g_macro_record_commands.empty()) g_macro_record_commands += "; ";
-    if (buttons == 0) {
+    std::string combo = macro_record_frame_to_text(frame);
+    if (combo.empty()) {
         g_macro_record_commands += "WAIT " + std::to_string(duration_ms);
     } else {
-        std::string combo = macro_buttons_to_text(buttons);
-        if (combo.empty()) combo = "WAIT";
+        g_macro_record_has_input = true;
         g_macro_record_commands += combo + " " + std::to_string(duration_ms);
     }
 }
@@ -1913,20 +2414,26 @@ static void MacroRecordAppendLocked(uint16_t buttons, uint64_t duration_ms) {
 static void MacroRecordStart() {
     std::lock_guard<std::mutex> lk(g_macro_mtx);
     g_macro_recording = true;
-    g_macro_record_last_buttons = 0xFFFF;
+    g_macro_record_last_frame = MacroRecordFrame{};
+    g_macro_record_have_frame = false;
+    g_macro_record_has_input = false;
     g_macro_record_last_change_us = ns::now_us();
     g_macro_record_commands.clear();
 }
 
 static std::string MacroRecordStop() {
     std::lock_guard<std::mutex> lk(g_macro_mtx);
-    if (g_macro_recording && g_macro_record_last_buttons != 0xFFFF) {
+    if (g_macro_recording && g_macro_record_have_frame) {
         uint64_t now = ns::now_us();
-        MacroRecordAppendLocked(g_macro_record_last_buttons, (now - g_macro_record_last_change_us) / 1000ULL);
+        MacroRecordAppendLocked(g_macro_record_last_frame, (now - g_macro_record_last_change_us) / 1000ULL);
     }
     g_macro_recording = false;
-    g_macro_record_last_buttons = 0xFFFF;
-    std::string commands = g_macro_record_commands.empty() ? "WAIT 200" : g_macro_record_commands;
+    g_macro_record_have_frame = false;
+    if (!g_macro_record_has_input) {
+        g_macro_record_commands.clear();
+        return "";
+    }
+    std::string commands = g_macro_record_commands;
     return macro_pretty_json(commands, "Recorded Macro");
 }
 
@@ -1934,17 +2441,59 @@ static void MacroRecordSample(const ns::HIDReport& report) {
     std::lock_guard<std::mutex> lk(g_macro_mtx);
     if (!g_macro_recording || g_macro_running) return;
     uint64_t now = ns::now_us();
-    uint16_t buttons = report.buttons;
-    if (g_macro_record_last_buttons == 0xFFFF) {
-        g_macro_record_last_buttons = buttons;
+    MacroRecordFrame frame = MacroRecordFrameFromReport(report);
+    if (!g_macro_record_have_frame) {
+        g_macro_record_last_frame = frame;
+        g_macro_record_have_frame = true;
         g_macro_record_last_change_us = now;
         return;
     }
-    if (buttons != g_macro_record_last_buttons) {
-        MacroRecordAppendLocked(g_macro_record_last_buttons, (now - g_macro_record_last_change_us) / 1000ULL);
-        g_macro_record_last_buttons = buttons;
+    if (frame != g_macro_record_last_frame) {
+        MacroRecordAppendLocked(g_macro_record_last_frame, (now - g_macro_record_last_change_us) / 1000ULL);
+        g_macro_record_last_frame = frame;
         g_macro_record_last_change_us = now;
     }
+}
+
+static bool PollMacroRecordP1(ns::HIDReport& report) {
+    report.reset();
+
+    auto raw = g_rawHid.snapshot();
+    if (raw[0].connected) {
+        report = raw[0].input;
+        uint64_t now = ns::now_us();
+        if (raw[0].last_input_us == 0 || now - raw[0].last_input_us > RAW_INPUT_STALE_RELEASE_US)
+            report.reset();
+        return true;
+    }
+
+    XINPUT_STATE state{};
+    if (XInputGetState(0, &state) == ERROR_SUCCESS) {
+        report = map_xinput_to_switch(state.Gamepad);
+        return true;
+    }
+
+    if (g_genericEnabled) {
+        auto generic = g_genericJoy.snapshot();
+        if (generic[0].connected) {
+            report = generic[0].input;
+            return true;
+        }
+    }
+
+    int km = g_keyboardMode.load();
+    if (km != KB_OFF) {
+        apply_keyboard_to_report(report, km == KB_OVERRIDE);
+        return true;
+    }
+
+    return false;
+}
+
+static void MacroRecordSampleP1() {
+    ns::HIDReport report;
+    PollMacroRecordP1(report);
+    MacroRecordSample(report);
 }
 static bool ApplyMacroOverride(ns::HIDReport logicalReports[4], bool present[4], bool hasMotion[4], int xinputForSlot[4], int rawForSlot[4]) {
     (void)hasMotion;
@@ -1978,33 +2527,111 @@ static bool ApplyMacroOverride(ns::HIDReport logicalReports[4], bool present[4],
     }
     return active;
 }
-static std::string GetMacroEditText() {
-    int len = GetWindowTextLengthW(g_hMacroEdit);
-    std::wstring w((size_t)len, L'\0');
-    GetWindowTextW(g_hMacroEdit, &w[0], len + 1);
-    return narrow(w.c_str());
+static HFONT MacroEditorFont() {
+    static HFONT hFont = CreateFont(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Consolas");
+    return hFont;
 }
 
-static std::string GetMacroHotkeyEditText() {
-    if (!g_hMacroHotkeyEdit) return "";
-    int len = GetWindowTextLengthW(g_hMacroHotkeyEdit);
-    std::wstring w((size_t)len, L'\0');
-    GetWindowTextW(g_hMacroHotkeyEdit, &w[0], len + 1);
-    return normalize_key_name(narrow(w.c_str()));
+static HWND CreateMacroButton(HWND parent, const wchar_t* text, int x, int y, int w, int h, int id) {
+    HWND hw = CreateWindowW(L"BUTTON", text, WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        x, y, w, h, parent, (HMENU)(INT_PTR)id, g_hInst, nullptr);
+    SendMessage(hw, WM_SETFONT, (WPARAM)MacroEditorFont(), TRUE);
+    return hw;
 }
 
-static bool MacroReadFileDialog(HWND parent, std::string& out) {
-    wchar_t file[MAX_PATH]{};
-    OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = parent; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrFilter = L"JSON Files\0*.json\0All Files\0*.*\0"; ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (!GetOpenFileNameW(&ofn)) return false;
-    FILE* f = _wfopen(file, L"rb"); if (!f) return false;
-    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
-    if (len < 0 || (uint64_t)len > MACRO_JSON_MAX_BYTES) { fclose(f); MessageBoxW(parent, L"Macro JSON exceeds the 50MB limit.", L"Macro validation", MB_OK | MB_ICONWARNING); return false; }
-    out.assign((size_t)std::max<long>(0, len), '\0'); if (len > 0) fread(&out[0], 1, (size_t)len, f); fclose(f);
-    std::string pretty, err; if (!macro_validate_to_pretty_json(out, pretty, err, "Imported Macro")) { MessageBoxW(parent, widen("Invalid macro JSON: " + err).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING); return false; }
-    out = pretty; return true;
+static HWND CreateMacroStatic(HWND parent, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id = 0) {
+    HWND hw = CreateWindowW(L"STATIC", text, WS_VISIBLE | WS_CHILD | style,
+        x, y, w, h, parent, id ? (HMENU)(INT_PTR)id : nullptr, g_hInst, nullptr);
+    SendMessage(hw, WM_SETFONT, (WPARAM)MacroEditorFont(), TRUE);
+    return hw;
 }
+
+static void DestroyMacroRows() {
+    for (HWND h : g_macro_row_controls) if (h) DestroyWindow(h);
+    g_macro_row_controls.clear();
+}
+
+static void RefreshMacroRows(HWND hWnd) {
+    DestroyMacroRows();
+    constexpr int x = 14;
+    constexpr int rowH = 26;
+    constexpr int nameW = 250;
+    constexpr int keyW = 110;
+    constexpr int btnW = 54;
+    constexpr int exportW = 64;
+    constexpr int delW = 64;
+    constexpr int gap = 4;
+    const int keyX = x + nameW + gap;
+    const int changeX = keyX + keyW + gap;
+    const int exportX = changeX + btnW + gap;
+    const int deleteX = exportX + exportW + gap;
+    int y = 12;
+
+    if (g_macro_entries.empty()) {
+        HWND empty = CreateMacroStatic(hWnd, L"No macros", SS_CENTER, x, y, nameW, 22);
+        g_macro_row_controls.push_back(empty);
+        y += rowH;
+    }
+
+    for (int i = 0; i < (int)g_macro_entries.size(); ++i) {
+        const auto& e = g_macro_entries[i];
+        std::wstring name = widen(e.name.empty() ? "Macro" : e.name);
+        std::wstring key = widen(normalize_key_name(e.hotkey));
+        HWND run = CreateMacroButton(hWnd, name.c_str(), x, y, nameW, 24, IDC_MACRO_RUN_BASE + i);
+        HWND keyText = CreateMacroStatic(hWnd, key.c_str(), SS_CENTER | WS_BORDER,
+                                         keyX, y, keyW, 22, IDC_MACRO_KEY_BASE + i);
+        HWND change = CreateMacroButton(hWnd, L"Change", changeX, y, btnW, 24, IDC_MACRO_CHANGE_BASE + i);
+        HWND exp = CreateMacroButton(hWnd, L"Export", exportX, y, exportW, 24, IDC_MACRO_EXPORT_BASE + i);
+        HWND del = CreateMacroButton(hWnd, L"Delete", deleteX, y, delW, 24, IDC_MACRO_DELETE_BASE + i);
+        g_macro_row_controls.push_back(run);
+        g_macro_row_controls.push_back(keyText);
+        g_macro_row_controls.push_back(change);
+        g_macro_row_controls.push_back(exp);
+        g_macro_row_controls.push_back(del);
+        y += rowH;
+    }
+
+    y += 8;
+    const int dialogW = 620;
+    const int rightBtnX = deleteX + delW - 88;
+    HWND importBtn = CreateMacroButton(hWnd, L"Import", x, y, 88, 30, IDC_MACRO_IMPORT);
+    g_hMacroRecordToggleBtn = CreateMacroButton(hWnd, L"Record P1", rightBtnX, y, 88, 30, IDC_MACRO_RECORD_TOGGLE);
+    y += 38;
+    HWND exportBtn = CreateMacroButton(hWnd, L"Export", x, y, 88, 30, IDC_MACRO_EXPORT);
+    HWND closeBtn = CreateMacroButton(hWnd, L"Close", rightBtnX, y, 88, 30, IDC_MACRO_CLOSE);
+    g_macro_row_controls.push_back(importBtn);
+    g_macro_row_controls.push_back(g_hMacroRecordToggleBtn);
+    g_macro_row_controls.push_back(exportBtn);
+    g_macro_row_controls.push_back(closeBtn);
+
+    y += 38;
+    RECT rc{0, 0, dialogW, std::max(190, y + 18)};
+    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
+    SetWindowPos(hWnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER);
+}
+
+static bool MacroReadFileDialog(HWND parent) {
+    std::string raw;
+    if (!ReadRawFileDialog(parent, raw)) return false;
+
+    std::vector<MacroEntry> imported;
+    std::string err;
+    if (ParseMacroEntriesText(raw, imported, err) && !imported.empty()) {
+        if (imported.size() > 1 || raw.find("\"macros\"") != std::string::npos) {
+            g_macro_entries = std::move(imported);
+            RebuildMacroHotkeyState();
+            SaveMacroEntriesToDisk(parent);
+            return true;
+        }
+        return UpsertMacroEntry(parent, imported[0], false);
+    }
+
+    MessageBoxW(parent, widen("Invalid macro JSON: " + err).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING);
+    return false;
+}
+
 static bool MacroWriteFileDialog(HWND parent, const std::string& text) {
     wchar_t file[MAX_PATH] = L"ns-macros.json";
     OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = parent; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH;
@@ -2017,59 +2644,131 @@ static bool MacroWriteFileDialog(HWND parent, const std::string& text) {
 static LRESULT CALLBACK MacroEditorProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
-        HFONT font = CreateFont(14,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Consolas");
-        CreateWindowW(L"STATIC", L"JSON/commands, or record live P1 buttons while connected.", WS_VISIBLE|WS_CHILD, 12, 10, 560, 20, hWnd, nullptr, g_hInst, nullptr);
-        g_hMacroEdit = CreateWindowW(L"EDIT", L"", WS_VISIBLE|WS_CHILD|WS_BORDER|ES_LEFT|ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL, 12, 36, 560, 160, hWnd, (HMENU)IDC_MACRO_EDIT, g_hInst, nullptr);
-        SendMessage(g_hMacroEdit, WM_SETFONT, (WPARAM)font, TRUE);
-        g_macro_text = LoadSavedMacrosText();
-        g_macro_hotkey = LoadSavedMacroHotkey();
-        std::wstring initial = widen(g_macro_text.empty() ? "{\"name\":\"Macro\",\"commands\":\"WAIT 200; A 100; B 100\"}" : g_macro_text);
-        SetWindowTextW(g_hMacroEdit, initial.c_str());
-
-        CreateWindowW(L"STATIC", L"Macro hotkey (optional, must not duplicate keyboard bindings):", WS_VISIBLE|WS_CHILD, 12, 205, 560, 20, hWnd, nullptr, g_hInst, nullptr);
-        g_hMacroHotkeyEdit = CreateWindowW(L"EDIT", widen(g_macro_hotkey).c_str(), WS_VISIBLE|WS_CHILD|WS_BORDER|ES_LEFT, 12, 228, 160, 24, hWnd, (HMENU)IDC_MACRO_HOTKEY, g_hInst, nullptr);
-        SendMessage(g_hMacroHotkeyEdit, WM_SETFONT, (WPARAM)font, TRUE);
-
-        CreateButton(hWnd, L"Run", 12, 264, 82, 28, IDC_MACRO_RUN);
-        CreateButton(hWnd, L"Save/Add", 104, 264, 92, 28, IDC_MACRO_SAVE);
-        CreateButton(hWnd, L"Delete", 206, 264, 82, 28, IDC_MACRO_DELETE);
-        CreateButton(hWnd, L"Record", 298, 264, 82, 28, IDC_MACRO_RECORD_START);
-        CreateButton(hWnd, L"Stop Rec", 390, 264, 90, 28, IDC_MACRO_RECORD_STOP);
-        CreateButton(hWnd, L"Close", 490, 264, 82, 28, IDC_MACRO_CLOSE);
-        CreateButton(hWnd, L"Import JSON", 12, 302, 110, 28, IDC_MACRO_IMPORT);
-        CreateButton(hWnd, L"Export JSON", 132, 302, 110, 28, IDC_MACRO_EXPORT);
+        LoadMacroEntries();
+        g_macro_editor_recording = false;
+        g_macro_listening_idx = -1;
+        g_macro_listening_static = nullptr;
+        RefreshMacroRows(hWnd);
         break;
     }
     case WM_COMMAND: {
         int id = LOWORD(wParam);
-        if (id == IDC_MACRO_RUN) StartMacroText(GetMacroEditText());
-        else if (id == IDC_MACRO_SAVE) {
-            std::string pretty; std::string err;
-            std::string hotkey = GetMacroHotkeyEditText();
-            if (!SaveMacroHotkey(hotkey, hWnd)) {
-                // warning already shown
-            } else if (macro_validate_to_pretty_json(GetMacroEditText(), pretty, err, "Macro")) {
-                SaveMacrosText(pretty);
-                SetWindowTextW(g_hMacroEdit, widen(pretty).c_str());
-            } else {
-                MessageBoxW(hWnd, widen("Invalid macro: " + err).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING);
-            }
+        if (g_macro_editor_recording && id != IDC_MACRO_RECORD_TOGGLE && id != IDC_MACRO_CLOSE) {
+            return 0;
         }
-        else if (id == IDC_MACRO_DELETE) { SaveMacrosText(""); SetWindowTextW(g_hMacroEdit, L""); }
-        else if (id == IDC_MACRO_RECORD_START) { MacroRecordStart(); SetWindowTextW(g_hMacroEdit, L"Recording... play on P1, then press Stop Rec."); }
-        else if (id == IDC_MACRO_RECORD_STOP) { std::string rec = MacroRecordStop(); SaveMacrosText(rec); SetWindowTextW(g_hMacroEdit, widen(rec).c_str()); }
-        else if (id == IDC_MACRO_IMPORT) { std::string txt; if (MacroReadFileDialog(hWnd, txt)) { SaveMacrosText(txt); SetWindowTextW(g_hMacroEdit, widen(txt).c_str()); } }
-        else if (id == IDC_MACRO_EXPORT) { std::string pretty, err; if (macro_validate_to_pretty_json(GetMacroEditText(), pretty, err, "Macro")) MacroWriteFileDialog(hWnd, pretty); else MessageBoxW(hWnd, widen("Invalid macro: " + err).c_str(), L"Macro validation", MB_OK | MB_ICONWARNING); }
-        else if (id == IDC_MACRO_CLOSE) DestroyWindow(hWnd);
+        if (id >= IDC_MACRO_RUN_BASE && id < IDC_MACRO_RUN_BASE + 100) {
+            int idx = id - IDC_MACRO_RUN_BASE;
+            if (idx >= 0 && idx < (int)g_macro_entries.size()) StartMacroText(g_macro_entries[idx].json);
+        } else if (id >= IDC_MACRO_EXPORT_BASE && id < IDC_MACRO_EXPORT_BASE + 100) {
+            int idx = id - IDC_MACRO_EXPORT_BASE;
+            if (idx >= 0 && idx < (int)g_macro_entries.size()) {
+                std::vector<MacroEntry> one{g_macro_entries[idx]};
+                MacroWriteFileDialog(hWnd, MacroEntriesToJson(one));
+            }
+        } else if (id >= IDC_MACRO_DELETE_BASE && id < IDC_MACRO_DELETE_BASE + 100) {
+            int idx = id - IDC_MACRO_DELETE_BASE;
+            if (idx >= 0 && idx < (int)g_macro_entries.size()) {
+                g_macro_entries.erase(g_macro_entries.begin() + idx);
+                RebuildMacroHotkeyState();
+                g_macro_listening_idx = -1;
+                g_macro_listening_static = nullptr;
+                SaveMacroEntriesToDisk(hWnd);
+                RefreshMacroRows(hWnd);
+            }
+        } else if (id >= IDC_MACRO_CHANGE_BASE && id < IDC_MACRO_CHANGE_BASE + 100) {
+            int idx = id - IDC_MACRO_CHANGE_BASE;
+            if (idx >= 0 && idx < (int)g_macro_entries.size()) {
+                g_macro_listening_idx = idx;
+                g_macro_listening_static = GetDlgItem(hWnd, IDC_MACRO_KEY_BASE + idx);
+                if (g_macro_listening_static) SetWindowTextW(g_macro_listening_static, L"...");
+                SetFocus(hWnd);
+            }
+        } else if (id == IDC_MACRO_RECORD_TOGGLE) {
+            if (!g_macro_editor_recording) {
+                MacroRecordStart();
+                MacroRecordSampleP1();
+                g_macro_editor_recording = true;
+                SetTimer(hWnd, MACRO_RECORD_TIMER_ID, 16, nullptr);
+                if (g_hMacroRecordToggleBtn) SetWindowTextW(g_hMacroRecordToggleBtn, L"Stop");
+            } else {
+                MacroRecordSampleP1();
+                std::string recorded = MacroRecordStop();
+                g_macro_editor_recording = false;
+                KillTimer(hWnd, MACRO_RECORD_TIMER_ID);
+                if (!recorded.empty()) {
+                    MacroEntry e;
+                    e.name = "Recorded Macro";
+                    e.hotkey = "";
+                    e.json = recorded;
+                    UpsertMacroEntry(hWnd, e, true);
+                }
+                RefreshMacroRows(hWnd);
+            }
+        } else if (id == IDC_MACRO_IMPORT) {
+            if (MacroReadFileDialog(hWnd)) {
+                RefreshMacroRows(hWnd);
+            }
+        } else if (id == IDC_MACRO_EXPORT) {
+            SaveMacroEntriesToDisk(hWnd);
+            MacroWriteFileDialog(hWnd, MacroEntriesToJson(g_macro_entries));
+        } else if (id == IDC_MACRO_CLOSE) {
+            PostMessageW(hWnd, WM_CLOSE, 0, 0);
+        }
         break;
     }
-    case WM_CLOSE: DestroyWindow(hWnd); break;
+    case WM_TIMER:
+        if (wParam == MACRO_RECORD_TIMER_ID && g_macro_editor_recording) {
+            MacroRecordSampleP1();
+            return 0;
+        }
+        break;
+    case WM_KEYDOWN:
+        if (g_macro_listening_idx >= 0) {
+            int idx = g_macro_listening_idx;
+            if (idx >= 0 && idx < (int)g_macro_entries.size()) {
+                if ((UINT)wParam == VK_ESCAPE) {
+                    g_macro_entries[idx].hotkey.clear();
+                    RebuildMacroHotkeyState();
+                    SaveMacroEntriesToDisk(hWnd);
+                    if (g_macro_listening_static) SetWindowTextW(g_macro_listening_static, L"");
+                } else {
+                    std::string key = vk_to_key_name((UINT)wParam);
+                    if (!key.empty()) {
+                        if (ValidateMacroHotkeyForEntry(key, idx, hWnd)) {
+                            g_macro_entries[idx].hotkey = key;
+                            RebuildMacroHotkeyState();
+                            SaveMacroEntriesToDisk(hWnd);
+                            if (g_macro_listening_static) SetWindowTextW(g_macro_listening_static, widen(key).c_str());
+                        } else if (g_macro_listening_static) {
+                            SetWindowTextW(g_macro_listening_static, widen(g_macro_entries[idx].hotkey).c_str());
+                        }
+                    }
+                }
+            }
+            g_macro_listening_idx = -1;
+            g_macro_listening_static = nullptr;
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        if (g_macro_editor_recording) {
+            MacroRecordStop();
+            g_macro_editor_recording = false;
+            KillTimer(hWnd, MACRO_RECORD_TIMER_ID);
+        }
+        DestroyWindow(hWnd);
+        break;
+    case WM_DESTROY:
+        if (GetCapture() == hWnd) ReleaseCapture();
+        g_macro_listening_idx = -1;
+        g_macro_listening_static = nullptr;
+        break;
     default: return DefWindowProc(hWnd, msg, wParam, lParam);
     }
     return 0;
 }
 static void ShowMacroEditor(HWND parent) {
-    HWND h = CreateWindowW(L"NSMacroEditor", L"Macros", WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 600, 390, parent, nullptr, g_hInst, nullptr);
+    HWND h = CreateWindowW(L"NSMacroEditor", L"Macros", WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 620, 280, parent, nullptr, g_hInst, nullptr);
     if (h) ShowWindow(h, SW_SHOW);
 }
 
@@ -2175,6 +2874,7 @@ static void apply_keyboard_to_report(ns::HIDReport& rep, bool override_mode) {
 
 // ── Sender thread (4-Player) ──
 static void SenderThread() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     g_rawHid.start();
     if (g_genericEnabled) g_genericJoy.start();
 
@@ -2209,14 +2909,7 @@ static void SenderThread() {
             if (!upload.empty()) send_macro_udp_packet(sock, dest, g_hmacKey, upload, 0);
         }
 
-        if (!g_macro_hotkey.empty()) {
-            bool down = key_is_down(g_macro_hotkey);
-            if (down && !g_macro_hotkey_last_down) {
-                std::string saved = LoadSavedMacrosText();
-                if (!saved.empty()) StartMacroText(saved);
-            }
-            g_macro_hotkey_last_down = down;
-        }
+        PollMacroEntryHotkeys();
 
         ns::HIDReport logicalReports[4];
         ns::MotionReport logicalMotion[4];
@@ -2234,12 +2927,18 @@ static void SenderThread() {
         // Raw HID first: DS4, DualSense, and Switch Pro get motion/gyro without
         // DS4Windows, Steam Input, or any helper app.
         auto raw = g_rawHid.snapshot();
+        uint64_t rawNow = ns::now_us();
         for (int i = 0; i < 4; ++i) {
             if (!raw[i].connected) continue;
-            logicalReports[i] = raw[i].input;
+            bool fresh = raw[i].last_input_us != 0 &&
+                         rawNow - raw[i].last_input_us <= RAW_INPUT_STALE_RELEASE_US;
+            if (fresh)
+                logicalReports[i] = raw[i].input;
+            else
+                logicalReports[i].reset();
             present[i] = true;
             rawForSlot[i] = i;
-            if (raw[i].has_motion) {
+            if (fresh && raw[i].has_motion) {
                 logicalMotion[i] = raw[i].motion;
                 hasMotion[i] = true;
             }
@@ -2332,7 +3031,7 @@ static void SenderThread() {
         ExtendedUdpPacket pkt{};
         memset(&pkt, 0, sizeof(pkt));
         pkt.magic = ns::PROTO_MAGIC;
-        pkt.version = ns::PROTO_VERSION;
+        pkt.version = ns::WEB_PROTO_VERSION;
         pkt.flags = ns::FLAG_NONE;
         pkt.seq = seq++;
         pkt.timestamp_us = ns::now_us();
@@ -2354,8 +3053,8 @@ static void SenderThread() {
         pump_udp_rumble(sock, rumble, xinputForSlot, rawForSlot);
         rumble.update_timeouts(xinputForSlot, rawForSlot);
 
-        if (activeCount > 0) std::this_thread::sleep_for(std::chrono::milliseconds(4));
-        else std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (activeCount > 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        else std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     rumble.stop_all();
@@ -2396,12 +3095,12 @@ static void UpdateControllerStatus() {
             swprintf(buf, 128, L"P%d: XInput", i + 1);
         } else if (raw[i].connected) {
             std::wstring name = widen(raw[i].name.empty() ? "Raw HID" : raw[i].name);
-            swprintf(buf, 128, L"P%d: %s", i + 1, name.c_str());
+            swprintf(buf, 128, L"P%d: %ls", i + 1, name.c_str());
         } else if (generic[i].connected) {
             std::wstring name = widen(generic[i].name.empty() ? "Generic joystick" : generic[i].name);
-            swprintf(buf, 128, L"P%d: %s", i + 1, name.c_str());
+            swprintf(buf, 128, L"P%d: %ls", i + 1, name.c_str());
         } else {
-            swprintf(buf, 128, L"P%d: %s", i + 1, xinputPresent ? L"Available" : L"Not connected");
+            swprintf(buf, 128, L"P%d: %ls", i + 1, xinputPresent ? L"Available" : L"Not connected");
         }
         SetWindowText(hText[i], buf);
     }
@@ -2435,9 +3134,7 @@ static void DoConnect(HWND hWnd) {
     g_targetHost = hostA;
     g_targetPort = (uint16_t)port;
     g_packetCount = 0;
-    g_macro_text = LoadSavedMacrosText();
-    g_macro_hotkey = LoadSavedMacroHotkey();
-    g_macro_hotkey_last_down = false;
+    LoadMacroEntries();
 
     for (int i = 0; i < 4; i++) {
         g_is_connected[i] = false;
@@ -2924,6 +3621,7 @@ static LRESULT CALLBACK BindingsEditorProc(HWND hDlg, UINT msg, WPARAM wParam, L
 // ── Entry point ──
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     timeBeginPeriod(1);
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
     g_hInst = hInst;
 
     WSADATA wsa{};

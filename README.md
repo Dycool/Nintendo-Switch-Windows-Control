@@ -31,8 +31,8 @@ https://github.com/user-attachments/assets/aef8eb25-dd14-4335-a3f7-b1953800f856
 
 **1. Raspberry Pi (Server):**
 * Download `ns-pc-control-raspberry-pi.zip` to your Pi.
-* Run the gadget setup: `sudo bash setup_gadget.sh`
 * Start the backend: `sudo chrt -f 99 ./ns-backend`
+  (The server handles USB gadget setup automatically — no separate script needed.)
 
 **2. PC (Client):**
 * Download the appropriate zip for your OS (Windows, Mac, or Linux).

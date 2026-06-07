@@ -1330,7 +1330,7 @@ static int handle_subcommand(ControllerRuntime& rt, uint8_t subcmd, const uint8_
     }
 }
 
-static void publish_rumble_event(int client_idx, int sub_idx, const uint8_t* packet, ssize_t len) {
+static void publish_rumble_event(int client_idx, int sub_idx, const uint8_t* packet, ssize_t len, bool publish_neutral) {
     if (client_idx < 0 || client_idx >= MAX_CLIENTS || sub_idx < 0 || sub_idx >= 4 || len < 10)
         return;
 
@@ -1339,6 +1339,8 @@ static void publish_rumble_event(int client_idx, int sub_idx, const uint8_t* pac
     bool all_zero = true;
     for (int i = 0; i < 8; ++i) if (rb[i] != 0) { all_zero = false; break; }
     bool neutral = all_zero || memcmp(rb, neutral_rumble, 8) == 0;
+    if (neutral && !publish_neutral)
+        return;
 
     uint8_t low = 0, high = 0;
     if (!neutral) {
@@ -1923,16 +1925,19 @@ static void writer_thread(int hz) {
                 // commands to any of them.  Ignoring those commands until a pad maps
                 // to the port breaks keyboard/mobile/web input and leaves stale output
                 // reports queued in /dev/hidgX.
-                struct pollfd pfd = {fds[h], POLLIN, 0};
-                uint8_t read_buf[PRO_REPORT_SIZE];
-                if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+                for (int output_reads = 0; output_reads < 8; ++output_reads) {
+                    struct pollfd pfd = {fds[h], POLLIN, 0};
+                    uint8_t read_buf[PRO_REPORT_SIZE];
+                    if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN))
+                        break;
+
                     ssize_t r = read(fds[h], read_buf, PRO_REPORT_SIZE);
                     if (r <= 0) continue;
 
                     uint8_t id = read_buf[0];
                     if (id == RID_OUTPUT_CMD) {
                         if (hw_slots[h].client_idx != -1)
-                            publish_rumble_event(hw_slots[h].client_idx, hw_slots[h].sub_idx, read_buf, r);
+                            publish_rumble_event(hw_slots[h].client_idx, hw_slots[h].sub_idx, read_buf, r, false);
 
                         uint8_t subcmd_id = read_buf[10];
                         size_t subcmd_data_len = r > 11 ? std::min((size_t)53, (size_t)(r - 11)) : 0;
@@ -1950,7 +1955,7 @@ static void writer_thread(int hz) {
                         }
                     } else if (id == RID_OUTPUT_RUMBLE) {
                         if (hw_slots[h].client_idx != -1)
-                            publish_rumble_event(hw_slots[h].client_idx, hw_slots[h].sub_idx, read_buf, r);
+                            publish_rumble_event(hw_slots[h].client_idx, hw_slots[h].sub_idx, read_buf, r, true);
                     } else if (id == 0x80) {
                         uint8_t resp_81[PRO_REPORT_SIZE] = {};
                         resp_81[0] = 0x81;
