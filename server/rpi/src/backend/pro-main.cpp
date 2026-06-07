@@ -84,33 +84,19 @@ enum class ImuTestMode {
 
 static ImuTestMode g_imu_test = ImuTestMode::Off;
 
-enum class ImuWireLayout {
-    AccelThenGyro, // bytes 13..24: ax ay az gx gy gz
-    GyroThenAccel, // bytes 13..24: gx gy gz ax ay az
-};
-
-static ImuWireLayout g_imu_layout = ImuWireLayout::AccelThenGyro;
-
-static const char* imu_layout_name(ImuWireLayout l) {
-    switch (l) {
-        case ImuWireLayout::AccelThenGyro: return "accel-gyro";
-        case ImuWireLayout::GyroThenAccel: return "gyro-accel";
-    }
-    return "accel-gyro";
-}
+// Real USB Pro Controller report 0x30 layout, confirmed from usbmon captures:
+// bytes 13..48 contain 3 IMU samples, each:
+//   accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z as int16 little-endian.
+// Keep the old --imu-layout flag accepted as a no-op for script compatibility,
+// but do not support gyro-first anymore because it is not what real hardware sends.
+static const char* imu_layout_name() { return "accel-gyro"; }
 
 static bool parse_imu_layout(const std::string& raw) {
     std::string s = raw;
     for (char& c : s) c = (char)std::tolower((unsigned char)c);
-    if (s == "accel-gyro" || s == "ag" || s == "default") {
-        g_imu_layout = ImuWireLayout::AccelThenGyro;
-        return true;
-    }
-    if (s == "gyro-accel" || s == "ga" || s == "gyro-first") {
-        g_imu_layout = ImuWireLayout::GyroThenAccel;
-        return true;
-    }
-    return false;
+    return s == "accel-gyro" || s == "ag" || s == "default" ||
+           s == "real" || s == "pro" || s == "gyro-accel" ||
+           s == "ga" || s == "gyro-first";
 }
 
 static const char* imu_test_name(ImuTestMode m) {
@@ -1093,20 +1079,22 @@ static MotionReport synthetic_imu_sample(uint64_t t_us, int sample_index) {
     MotionReport m{};
     // Keep about 1g present so software that cares about gravity/orientation
     // does not see a physically impossible zero-G controller.
-    m.ax = 0;
-    m.ay = 4096;
-    m.az = 0;
+    // Real idle capture was roughly ax=-850, ay=0, az=4050 with gyro near zero.
+    // Use that as the neutral pose instead of an impossible zero-G or wrong axis.
+    m.ax = -850;
+    m.ay = 0;
+    m.az = 4050;
 
     switch (g_imu_test) {
         case ImuTestMode::Roll:
             m.gx = (int16_t)(s * 9000);
-            m.ax = (int16_t)(s * 2800);
-            m.ay = 2800;
+            m.ax = (int16_t)(-850 + s * 2800);
+            m.az = 3000;
             break;
         case ImuTestMode::Pitch:
             m.gy = (int16_t)(s * 9000);
-            m.az = (int16_t)(s * 2800);
-            m.ay = 2800;
+            m.ay = (int16_t)(s * 2800);
+            m.az = 3000;
             break;
         case ImuTestMode::Yaw:
             m.gz = (int16_t)(s * 9000);
@@ -1115,16 +1103,16 @@ static MotionReport synthetic_imu_sample(uint64_t t_us, int sample_index) {
             m.gx = (int16_t)(s * 12000);
             m.gy = (int16_t)(-s * 9000);
             m.gz = (int16_t)(s * 6000);
-            m.ax = (int16_t)(s * 5000);
-            m.ay = (int16_t)(4096 + s * 1500);
-            m.az = (int16_t)(-s * 3500);
+            m.ax = (int16_t)(-850 + s * 5000);
+            m.ay = (int16_t)(s * 1500);
+            m.az = (int16_t)(4050 - s * 3500);
             break;
         case ImuTestMode::Gentle:
             // More physically plausible than shake: steady gravity plus
             // a moderate angular velocity. Some consumers reject absurd IMU.
-            m.ax = 0;
-            m.ay = 4096;
-            m.az = 0;
+            m.ax = -850;
+            m.ay = 0;
+            m.az = 4050;
             m.gx = (int16_t)(s * 1800);
             m.gy = (int16_t)(-s * 900);
             m.gz = (int16_t)(s * 450);
@@ -1148,7 +1136,7 @@ static uint64_t g_pro_report_interval_us = 15'000ULL;
 // reports a low connection nibble with LSB 0. SDL/hid-nintendo notes that this
 // byte carries connection/USB status, so keep it configurable while defaulting
 // to a more normal wired/full battery style 0x81.
-static uint8_t  g_pro_bat_con = 0x81;
+static uint8_t  g_pro_bat_con = 0x91;
 // Byte 12 of report 0x30/0x21 is the controller's vibrator input/status byte.
 // Usually 0 is fine, but keep it configurable for exact-protocol experiments.
 static uint8_t  g_pro_vibrator_report = 0x00;
@@ -1689,7 +1677,7 @@ static void build_standard_report(const ExtendedHIDReport& src,
                         out.right_stick[0], out.right_stick[1], out.right_stick[2],
                         has_imu ? "yes" : "no",
                         imu_map_name(g_imu_map),
-                        imu_layout_name(g_imu_layout),
+                        imu_layout_name(),
                         imu_test_name(g_imu_test),
                         (unsigned)(has_imu ? (g_imu_test != ImuTestMode::Off ? 3 : motion_history_count) : 0),
                         (int)imu[0].ax, (int)imu[0].ay, (int)imu[0].az,
@@ -1698,29 +1686,20 @@ static void build_standard_report(const ExtendedHIDReport& src,
     }
 
     auto store_imu_sample = [](ProInputReport30& dst, int idx, const MotionReport& m) {
-        int16_t first0, first1, first2, second0, second1, second2;
-        if (g_imu_layout == ImuWireLayout::AccelThenGyro) {
-            first0 = m.ax; first1 = m.ay; first2 = m.az;
-            second0 = m.gx; second1 = m.gy; second2 = m.gz;
-        } else {
-            first0 = m.gx; first1 = m.gy; first2 = m.gz;
-            second0 = m.ax; second1 = m.ay; second2 = m.az;
-        }
-
-        // ProInputReport30 is packed, so GCC does not allow binding its fields
-        // to int16_t&.  Assign fields directly instead.
+        // Real Pro Controller USB report 0x30 stores accel first, then gyro.
+        // ProInputReport30 is packed, so assign directly instead of binding
+        // packed fields to int16_t&.
         if (idx == 0) {
-            dst.accel_x_0 = first0;  dst.accel_y_0 = first1;  dst.accel_z_0 = first2;
-            dst.gyro_x_0  = second0; dst.gyro_y_0  = second1; dst.gyro_z_0  = second2;
+            dst.accel_x_0 = m.ax; dst.accel_y_0 = m.ay; dst.accel_z_0 = m.az;
+            dst.gyro_x_0  = m.gx; dst.gyro_y_0  = m.gy; dst.gyro_z_0  = m.gz;
         } else if (idx == 1) {
-            dst.accel_x_1 = first0;  dst.accel_y_1 = first1;  dst.accel_z_1 = first2;
-            dst.gyro_x_1  = second0; dst.gyro_y_1  = second1; dst.gyro_z_1  = second2;
+            dst.accel_x_1 = m.ax; dst.accel_y_1 = m.ay; dst.accel_z_1 = m.az;
+            dst.gyro_x_1  = m.gx; dst.gyro_y_1  = m.gy; dst.gyro_z_1  = m.gz;
         } else {
-            dst.accel_x_2 = first0;  dst.accel_y_2 = first1;  dst.accel_z_2 = first2;
-            dst.gyro_x_2  = second0; dst.gyro_y_2  = second1; dst.gyro_z_2  = second2;
+            dst.accel_x_2 = m.ax; dst.accel_y_2 = m.ay; dst.accel_z_2 = m.az;
+            dst.gyro_x_2  = m.gx; dst.gyro_y_2  = m.gy; dst.gyro_z_2  = m.gz;
         }
     };
-
     store_imu_sample(out, 0, imu[0]);
     store_imu_sample(out, 1, imu[1]);
     store_imu_sample(out, 2, imu[2]);
@@ -4658,8 +4637,33 @@ static bool req_match(const char *buf, const char *path) {
 }
 
 
+static bool parse_ipv4_addr(const std::string& s, uint32_t& out_net_order) {
+    in_addr a{};
+    if (inet_pton(AF_INET, s.c_str(), &a) != 1)
+        return false;
+    out_net_order = a.s_addr;
+    return true;
+}
+
+static void print_usage(const char* argv0) {
+    std::printf("Usage: %s [-p PORT] [-b ADDR] [-w [WEB_PORT]] [--upnp] [-v]\n", argv0);
+    std::puts("       [--force-gadget-setup] [--no-auto-gadget] [--keep-gadget-on-exit] [--gadget-pads 1..4]");
+    std::puts("       [--random-identity] [--client-timeout-ms MS]");
+    std::puts("       [--imu-map direct|invert-x|invert-y|invert-z|swap-yz|switch1|switch2|switch3]");
+    std::puts("       [--pro-report-us US] [--test-imu off|roll|pitch|yaw|shake|gentle]");
+    std::puts("       [--bat-con BYTE] [--vibrator-report BYTE] [--log-raw-30]");
+    std::puts("");
+    std::puts("Common:");
+    std::puts("  -b 0.0.0.0      bind UDP and web server to all interfaces");
+    std::puts("  -b 127.0.0.1    local-only UDP/web");
+    std::puts("  -w              enable web server on port 8080");
+    std::puts("  -w 7332         enable web server on custom port");
+    std::puts("  --upnp          add UDP port mapping when compiled with USE_UPNP");
+}
+
+
 // ── Web Server Thread (single-threaded poll reactor, fully non-blocking) ─────
-static void web_server_thread(int web_port, uint16_t udp_port) {
+static void web_server_thread(int web_port, uint16_t udp_port, std::string bind_addr) {
     (void)udp_port;
     int srv = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (srv < 0) { perror("web socket"); return; }
@@ -4670,12 +4674,16 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(web_port);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (!parse_ipv4_addr(bind_addr, addr.sin_addr.s_addr)) {
+        std::fprintf(stderr, "[web] invalid bind address: %s\n", bind_addr.c_str());
+        close(srv);
+        return;
+    }
 
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("web bind"); close(srv); return; }
     if (listen(srv, 8) < 0) { perror("web listen"); close(srv); return; }
 
-    std::printf("[web] HTTP + WebSocket server listening on port %d\n", web_port);
+    std::printf("[web] HTTP + WebSocket server listening on %s:%d\n", bind_addr.c_str(), web_port);
 
     struct pollfd pfds[1 + MAX_WS_CLIENTS];
     static WebClient clients[MAX_WS_CLIENTS];
@@ -4975,91 +4983,130 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // ── UDP receive loop (main thread) ────────────────────────────────────────────
+
 int main(int argc, char** argv) {
     uint16_t    port      = DEFAULT_PORT;
     std::string bind_addr = "0.0.0.0";
     bool        do_upnp   = false;
     int         web_port  = 0; // 0 = disabled
 
+    auto need_value = [&](int i, const char* opt) -> bool {
+        if (i + 1 < argc) return true;
+        std::fprintf(stderr, "%s needs a value\n", opt);
+        return false;
+    };
+
     for (int i = 1; i < argc; ++i) {
         std::string a(argv[i]);
-        if      (a == "-p" && i+1 < argc) port      = (uint16_t)std::atoi(argv[++i]);
-        else if (a == "-b" && i+1 < argc) bind_addr = argv[++i];
-        else if (a == "-v")               g_verbose  = true;
-        else if (a == "--upnp")           do_upnp    = true;
-        else if (a == "--no-auto-gadget") g_auto_gadget_setup = false;
-        else if (a == "--force-gadget-setup") g_force_gadget_setup = true;
-        else if (a == "--keep-gadget-on-exit") g_teardown_gadget_exit = false;
-        else if (a == "--client-timeout-ms" && i+1 < argc) {
+
+        if ((a == "-h") || (a == "--help")) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (a == "-p" || a == "--port") {
+            if (!need_value(i, a.c_str())) return 1;
+            long v = std::strtol(argv[++i], nullptr, 10);
+            if (v <= 0 || v > 65535) {
+                std::fprintf(stderr, "Invalid port: %ld\n", v);
+                return 1;
+            }
+            port = (uint16_t)v;
+        } else if (a == "-b" || a == "--bind") {
+            if (!need_value(i, a.c_str())) return 1;
+            bind_addr = argv[++i];
+        } else if (a == "-v" || a == "--verbose") {
+            g_verbose = true;
+        } else if (a == "--upnp" || a == "-u") {
+            do_upnp = true;
+        } else if (a == "--no-auto-gadget") {
+            g_auto_gadget_setup = false;
+        } else if (a == "--force-gadget-setup") {
+            g_force_gadget_setup = true;
+        } else if (a == "--keep-gadget-on-exit") {
+            g_teardown_gadget_exit = false;
+        } else if (a == "--client-timeout-ms") {
+            if (!need_value(i, a.c_str())) return 1;
             uint64_t ms_v = (uint64_t)std::strtoull(argv[++i], nullptr, 10);
             if (ms_v < 1000) ms_v = 1000;
             g_client_timeout_us = ms_v * 1000ULL;
-        }
-        else if (a == "--imu-map" && i+1 < argc) {
+        } else if (a == "--imu-map") {
+            if (!need_value(i, a.c_str())) return 1;
             if (!parse_imu_map(argv[++i])) {
                 std::fprintf(stderr, "Unknown --imu-map. Use: direct, invert-x, invert-y, invert-z, swap-yz, switch1, switch2, switch3\n");
                 return 1;
             }
-        }
-        else if (a == "--pro-report-us" && i+1 < argc) {
+        } else if (a == "--pro-report-us") {
+            if (!need_value(i, a.c_str())) return 1;
             uint64_t us_v = (uint64_t)std::strtoull(argv[++i], nullptr, 10);
-            // Keep sane bounds. 15ms is the real USB Pro Controller cadence;
-            // 8ms is useful for experiments, but lower starts to look unlike
-            // the real device and can make IMU consumers unhappy.
             if (us_v < 8000) us_v = 8000;
             if (us_v > 50000) us_v = 50000;
             g_pro_report_interval_us = us_v;
-        }
-        else if (a == "--test-imu" && i+1 < argc) {
+        } else if (a == "--test-imu") {
+            if (!need_value(i, a.c_str())) return 1;
             if (!parse_imu_test(argv[++i])) {
                 std::fprintf(stderr, "Unknown --test-imu. Use: off, roll, pitch, yaw, shake, gentle\n");
                 return 1;
             }
-        }
-        else if (a == "--imu-layout" && i+1 < argc) {
+        } else if (a == "--imu-layout") {
+            // Compatibility no-op: real hardware is accel-gyro, but old scripts may still pass this.
+            if (!need_value(i, a.c_str())) return 1;
             if (!parse_imu_layout(argv[++i])) {
-                std::fprintf(stderr, "Unknown --imu-layout. Use: accel-gyro or gyro-accel\n");
+                std::fprintf(stderr, "Unknown --imu-layout. Real layout is accel-gyro.\n");
                 return 1;
             }
-        }
-        else if (a == "--bat-con" && i+1 < argc) {
+        } else if (a == "--bat-con") {
+            if (!need_value(i, a.c_str())) return 1;
             if (!parse_u8_arg(argv[++i], g_pro_bat_con)) {
-                std::fprintf(stderr, "Invalid --bat-con byte. Examples: 0x81, 0x91, 0x8E\n");
+                std::fprintf(stderr, "Invalid --bat-con byte. Examples: 0x91, 0x81, 0x8E\n");
                 return 1;
             }
-        }
-        else if ((a == "--vibrator-report" || a == "--vibrator-byte") && i+1 < argc) {
+        } else if (a == "--vibrator-report" || a == "--vibrator-byte") {
+            if (!need_value(i, a.c_str())) return 1;
             if (!parse_u8_arg(argv[++i], g_pro_vibrator_report)) {
                 std::fprintf(stderr, "Invalid --vibrator-report byte. Examples: 0x00, 0x80\n");
                 return 1;
             }
-        }
-        else if (a == "--log-raw-30") g_log_raw_30 = true;
-        else if (a == "--log-neutral-rumble") g_log_neutral_rumble = true;
-        else if (a == "--test-rumble") g_test_rumble_on_connect = true;
-        else if (a == "--random-identity") g_random_identity = true;
-        else if (a == "--no-user-imu-cal") g_no_user_imu_cal = true;
-        else if (a == "--gadget-pads" && i+1 < argc) {
+        } else if (a == "--log-raw-30") {
+            g_log_raw_30 = true;
+        } else if (a == "--log-neutral-rumble") {
+            g_log_neutral_rumble = true;
+        } else if (a == "--test-rumble") {
+            g_test_rumble_on_connect = true;
+        } else if (a == "--random-identity") {
+            g_random_identity = true;
+        } else if (a == "--no-user-imu-cal") {
+            g_no_user_imu_cal = true;
+        } else if (a == "--gadget-pads") {
+            if (!need_value(i, a.c_str())) return 1;
             int n = std::atoi(argv[++i]);
             if (n < 1) n = 1;
             if (n > 4) n = 4;
             g_hid_port_count = n;
-        }
-        else if (a == "-w") {
-            if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9')
+        } else if (a == "-w" || a == "--web") {
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
                 web_port = std::atoi(argv[++i]);
             else
                 web_port = 8080;
+            if (web_port <= 0 || web_port > 65535) {
+                std::fprintf(stderr, "Invalid web port: %d\n", web_port);
+                return 1;
+            }
+        } else if (a.rfind("-w", 0) == 0 && a.size() > 2) {
+            web_port = std::atoi(a.c_str() + 2);
+            if (web_port <= 0 || web_port > 65535) {
+                std::fprintf(stderr, "Invalid web port: %s\n", a.c_str() + 2);
+                return 1;
+            }
+        } else {
+            std::fprintf(stderr, "Unknown argument: %s\n", a.c_str());
+            print_usage(argv[0]);
+            return 1;
         }
-        else if (a == "-h") {
-            puts("ns-backend  [-p PORT] [-b ADDR] [--upnp] [-w [WEB_PORT]] [-v]");
-            puts("            [--force-gadget-setup] [--no-auto-gadget] [--keep-gadget-on-exit] [--gadget-pads 1..4]");
-            puts("            [--random-identity]");
-            puts("            [--client-timeout-ms MS] [--imu-map direct|invert-x|invert-y|invert-z|swap-yz|switch1|switch2|switch3]");
-            puts("            [--pro-report-us US] [--test-imu off|roll|pitch|yaw|shake]");
-            puts("            [--log-neutral-rumble] [--test-rumble] [--no-user-imu-cal]");
-            return 0;
-        }
+    }
+
+    uint32_t bind_net_order = 0;
+    if (!parse_ipv4_addr(bind_addr, bind_net_order)) {
+        std::fprintf(stderr, "Invalid bind address for -b/--bind: %s\n", bind_addr.c_str());
+        return 1;
     }
 
     if (g_random_identity)
@@ -5080,18 +5127,27 @@ int main(int argc, char** argv) {
         std::printf("[pro] report interval=%llu us, imu-map=%s, imu-layout=%s, imu-test=%s, bat_con=0x%02X, vibrator=0x%02X\n",
                     (unsigned long long)g_pro_report_interval_us,
                     imu_map_name(g_imu_map),
-                    imu_layout_name(g_imu_layout),
+                    imu_layout_name(),
                     imu_test_name(g_imu_test),
                     g_pro_bat_con,
                     g_pro_vibrator_report);
     signal(SIGINT,  on_signal); signal(SIGTERM, on_signal); signal(SIGPIPE, SIG_IGN);
 
-    if (do_upnp) upnp_add_mapping(port);
+    if (do_upnp) {
+        if (!upnp_add_mapping(port)) {
+#ifdef USE_UPNP
+            std::fprintf(stderr, "UPnP: failed to add UDP port mapping for %u\n", port);
+#else
+            std::fprintf(stderr, "UPnP: this binary was built without USE_UPNP support\n");
+#endif
+        }
+    }
 
-    // Start web server if requested
+    // Start web server if requested.  -b applies to both UDP and web so local-only
+    // runs stay local-only, and 0.0.0.0 exposes both.
     std::thread web_thread;
     if (web_port > 0)
-        web_thread = std::thread(web_server_thread, web_port, port);
+        web_thread = std::thread(web_server_thread, web_port, port, bind_addr);
 
     int sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (sock < 0) { perror("socket"); return 1; }
@@ -5103,7 +5159,7 @@ int main(int argc, char** argv) {
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rbuf, sizeof(rbuf));
 
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(port);
-    addr.sin_addr.s_addr = inet_addr(bind_addr.c_str());
+    addr.sin_addr.s_addr = bind_net_order;
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); close(sock); return 1; }
     
     std::printf("UDP %s:%u writer=%d Hz\n",
