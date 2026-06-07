@@ -777,9 +777,11 @@ static ns::MotionReport map_gc_motion_to_switch(const GamepadState& st) {
 
     // GameController rotationRate is rad/s.  The backend just forwards int16
     // gyro samples, so this scale is intentionally conservative and tunable.
-    m.gx = clamp_i16_from_float(st.gx.load(std::memory_order_relaxed) * 1000.0f);
-    m.gy = clamp_i16_from_float(st.gy.load(std::memory_order_relaxed) * 1000.0f);
-    m.gz = clamp_i16_from_float(st.gz.load(std::memory_order_relaxed) * 1000.0f);
+    constexpr float RAD_TO_DEG = 57.29577951308232f;
+    constexpr float SWITCH_GYRO_SCALE = RAD_TO_DEG * 16.0f;
+    m.gx = clamp_i16_from_float(st.gx.load(std::memory_order_relaxed) * SWITCH_GYRO_SCALE);
+    m.gy = clamp_i16_from_float(st.gy.load(std::memory_order_relaxed) * SWITCH_GYRO_SCALE);
+    m.gz = clamp_i16_from_float(st.gz.load(std::memory_order_relaxed) * SWITCH_GYRO_SCALE);
     return m;
 }
 

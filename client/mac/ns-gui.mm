@@ -34,6 +34,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <unordered_map>
 #include <mutex>
 #include <cerrno>
@@ -819,9 +820,11 @@ static ns::MotionReport map_gc_motion_to_switch(const GamepadState& st) {
     m.ax = clamp_i16_from_float(st.ax.load(std::memory_order_relaxed) * 4096.0f);
     m.ay = clamp_i16_from_float(st.ay.load(std::memory_order_relaxed) * 4096.0f);
     m.az = clamp_i16_from_float(st.az.load(std::memory_order_relaxed) * 4096.0f);
-    m.gx = clamp_i16_from_float(st.gx.load(std::memory_order_relaxed) * 1000.0f);
-    m.gy = clamp_i16_from_float(st.gy.load(std::memory_order_relaxed) * 1000.0f);
-    m.gz = clamp_i16_from_float(st.gz.load(std::memory_order_relaxed) * 1000.0f);
+    constexpr float RAD_TO_DEG = 57.29577951308232f;
+    constexpr float SWITCH_GYRO_SCALE = RAD_TO_DEG * 16.0f;
+    m.gx = clamp_i16_from_float(st.gx.load(std::memory_order_relaxed) * SWITCH_GYRO_SCALE);
+    m.gy = clamp_i16_from_float(st.gy.load(std::memory_order_relaxed) * SWITCH_GYRO_SCALE);
+    m.gz = clamp_i16_from_float(st.gz.load(std::memory_order_relaxed) * SWITCH_GYRO_SCALE);
     return m;
 }
 
@@ -1133,25 +1136,103 @@ static std::string g_macroUploadPending;
 
 static std::mutex g_macroRecordMutex;
 static bool g_macroRecording = false;
-static uint16_t g_macroRecordLastButtons = 0xFFFF;
-static uint64_t g_macroRecordLastChangeUs = 0;
-static std::string g_macroRecordCommands;
 
 static NSString* const kMacroDefaultsKey = @"macrosJson";
-
 static NSString* const kMacroHotkeyDefaultsKey = @"macroHotkey";
-static std::mutex g_macroHotkeyMutex;
-static std::string g_macroHotkey;
-static bool g_macroHotkeyLastDown = false;
 
 static bool mac_key_down(const std::string& name);
+
+struct MacroEntryMac {
+    std::string name;
+    std::string hotkey;
+    std::string json;
+};
+
+static std::mutex g_macroEntriesMutex;
+static std::vector<MacroEntryMac> g_macroEntriesMac;
+static std::map<std::string, bool> g_macroHotkeyDownMac;
+static std::atomic<bool> g_macroEntriesLoadedMac{false};
 
 static std::string NormalizeMacroKeyMac(std::string s) {
     return macro_upper(macro_trim(s));
 }
 
+static bool JsonFindStringValueMac(const std::string& raw, const std::string& key, std::string& out) {
+    out.clear();
+    std::string quoted = "\"" + key + "\"";
+    size_t pos = raw.find(quoted);
+    if (pos == std::string::npos) return false;
+    pos += quoted.size();
+    macro_skip_ws(raw, pos);
+    if (pos >= raw.size() || raw[pos] != ':') return false;
+    ++pos;
+    macro_skip_ws(raw, pos);
+    std::string err;
+    return macro_read_json_string_at(raw, pos, out, err);
+}
 
-static std::string LoadMacroTextMac() {
+static bool FindJsonArrayRangeForKeyMac(const std::string& raw, const std::string& key, size_t& begin, size_t& end) {
+    begin = end = std::string::npos;
+    std::string quoted = "\"" + key + "\"";
+    size_t pos = raw.find(quoted);
+    if (pos == std::string::npos) return false;
+    pos += quoted.size();
+    macro_skip_ws(raw, pos);
+    if (pos >= raw.size() || raw[pos] != ':') return false;
+    ++pos;
+    macro_skip_ws(raw, pos);
+    if (pos >= raw.size() || raw[pos] != '[') return false;
+    begin = pos + 1;
+
+    bool in_str = false, esc = false;
+    int depth = 1;
+    for (++pos; pos < raw.size(); ++pos) {
+        char c = raw[pos];
+        if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '[') ++depth;
+        else if (c == ']') {
+            --depth;
+            if (depth == 0) { end = pos; return true; }
+        }
+    }
+    return false;
+}
+
+static std::vector<std::string> SplitTopLevelObjectsMac(const std::string& raw, size_t begin, size_t end) {
+    std::vector<std::string> out;
+    bool in_str = false, esc = false;
+    int depth = 0;
+    size_t obj_start = std::string::npos;
+    for (size_t pos = begin; pos < end && pos < raw.size(); ++pos) {
+        char c = raw[pos];
+        if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') { in_str = true; continue; }
+        if (c == '{') {
+            if (depth == 0) obj_start = pos;
+            ++depth;
+        } else if (c == '}') {
+            --depth;
+            if (depth == 0 && obj_start != std::string::npos) {
+                out.push_back(raw.substr(obj_start, pos - obj_start + 1));
+                obj_start = std::string::npos;
+            }
+        }
+    }
+    return out;
+}
+
+static std::string LoadSavedMacrosTextMac() {
     NSString* saved = [[NSUserDefaults standardUserDefaults] stringForKey:kMacroDefaultsKey];
     if (!saved) return std::string();
     std::string out([saved UTF8String]);
@@ -1170,6 +1251,159 @@ static void ShowMacroErrorMac(const std::string& msg) {
 }
 
 static bool StartMacroTextMac(const std::string& txt);
+
+static std::string LoadSavedMacroHotkeyMac() {
+    NSString* saved = [[NSUserDefaults standardUserDefaults] stringForKey:kMacroHotkeyDefaultsKey];
+    if (!saved) return std::string();
+    return NormalizeMacroKeyMac(std::string([saved UTF8String]));
+}
+
+static int FindMacroEntryByNameMac(const std::string& name) {
+    std::string wanted = macro_upper(macro_trim(name));
+    if (wanted.empty()) return -1;
+    for (int i = 0; i < (int)g_macroEntriesMac.size(); ++i) {
+        if (macro_upper(g_macroEntriesMac[i].name) == wanted) return i;
+    }
+    return -1;
+}
+
+static std::string UniqueMacroNameMac(const std::string& base_raw) {
+    std::string base = macro_trim(base_raw);
+    if (base.empty()) base = "Recorded Macro";
+    std::string name = base;
+    int suffix = 2;
+    while (FindMacroEntryByNameMac(name) >= 0) {
+        name = base + " " + std::to_string(suffix++);
+    }
+    return name;
+}
+
+static void RebuildMacroHotkeyStateMac() {
+    g_macroHotkeyDownMac.clear();
+    for (const auto& e : g_macroEntriesMac) {
+        std::string hk = NormalizeMacroKeyMac(e.hotkey);
+        if (!hk.empty()) g_macroHotkeyDownMac[hk] = false;
+    }
+}
+
+static std::string MacroPrettyJsonWithForcedNameMac(const std::string& raw_text, const std::string& forced_name) {
+    std::vector<MacroStep> steps;
+    std::vector<std::string> lines;
+    if (!macro_validate_text(raw_text, steps, &lines)) lines = {"WAIT 200"};
+
+    std::string name = macro_trim(forced_name).empty() ? "Macro" : macro_trim(forced_name);
+    std::string out;
+    out += "{\n";
+    out += "  \"name\": \"" + macro_escape_json(name) + "\",\n";
+    out += "  \"commands\": [\n";
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out += "    \"" + macro_escape_json(lines[i]) + "\"";
+        if (i + 1 < lines.size()) out += ",";
+        out += "\n";
+    }
+    out += "  ]\n";
+    out += "}";
+    return out;
+}
+
+static std::string MacroEntryToObjectJsonMac(const MacroEntryMac& e) {
+    std::vector<MacroStep> steps;
+    std::vector<std::string> lines;
+    if (!macro_validate_text(e.json, steps, &lines)) lines = {"WAIT 200"};
+
+    std::string name = macro_trim(e.name).empty() ? macro_extract_name_or_default(e.json, "Macro") : e.name;
+    std::string out;
+    out += "    {\n";
+    out += "      \"name\": \"" + macro_escape_json(name) + "\",\n";
+    out += "      \"hotkey\": \"" + macro_escape_json(NormalizeMacroKeyMac(e.hotkey)) + "\",\n";
+    out += "      \"commands\": [\n";
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out += "        \"" + macro_escape_json(lines[i]) + "\"";
+        if (i + 1 < lines.size()) out += ",";
+        out += "\n";
+    }
+    out += "      ]\n";
+    out += "    }";
+    return out;
+}
+
+static std::string MacroEntriesToJsonMac(const std::vector<MacroEntryMac>& entries) {
+    std::string out;
+    out += "{\n";
+    out += "  \"macros\": [\n";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        out += MacroEntryToObjectJsonMac(entries[i]);
+        if (i + 1 < entries.size()) out += ",";
+        out += "\n";
+    }
+    out += "  ]\n";
+    out += "}\n";
+    return out;
+}
+
+static bool ParseMacroEntriesTextMac(const std::string& raw, std::vector<MacroEntryMac>& out, std::string& err) {
+    out.clear();
+    err.clear();
+    if (raw.size() > MACRO_JSON_MAX_BYTES) { err = "macro JSON exceeds 50MB limit"; return false; }
+    std::string t = macro_trim(raw);
+    if (t.empty()) return true;
+
+    size_t arr_begin = 0, arr_end = 0;
+    if (FindJsonArrayRangeForKeyMac(t, "macros", arr_begin, arr_end)) {
+        auto objects = SplitTopLevelObjectsMac(t, arr_begin, arr_end);
+        for (const std::string& obj : objects) {
+            std::string pretty;
+            if (!macro_validate_to_pretty_json(obj, pretty, err, "Macro")) return false;
+            MacroEntryMac e;
+            e.json = pretty;
+            e.name = macro_extract_name_or_default(obj, "Macro");
+            JsonFindStringValueMac(obj, "hotkey", e.hotkey);
+            e.hotkey = NormalizeMacroKeyMac(e.hotkey);
+            out.push_back(e);
+        }
+        return true;
+    }
+
+    std::string pretty;
+    if (!macro_validate_to_pretty_json(t, pretty, err, "Macro")) return false;
+    MacroEntryMac e;
+    e.json = pretty;
+    e.name = macro_extract_name_or_default(t, "Macro");
+    JsonFindStringValueMac(t, "hotkey", e.hotkey);
+    e.hotkey = NormalizeMacroKeyMac(e.hotkey);
+    out.push_back(e);
+    return true;
+}
+
+static void LoadMacroEntriesMac() {
+    std::string err;
+    std::vector<MacroEntryMac> loaded;
+    if (!ParseMacroEntriesTextMac(LoadSavedMacrosTextMac(), loaded, err)) loaded.clear();
+    if (loaded.size() == 1 && loaded[0].hotkey.empty()) {
+        loaded[0].hotkey = LoadSavedMacroHotkeyMac();
+    }
+
+    std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+    g_macroEntriesMac = std::move(loaded);
+    RebuildMacroHotkeyStateMac();
+    g_macroEntriesLoadedMac.store(true, std::memory_order_release);
+}
+
+static bool SaveMacroEntriesMac() {
+    std::string json;
+    {
+        std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+        json = MacroEntriesToJsonMac(g_macroEntriesMac);
+    }
+    if (json.size() > MACRO_JSON_MAX_BYTES) {
+        ShowMacroErrorMac("Macro JSON exceeds the 50MB limit.");
+        return false;
+    }
+    NSString* ns = [NSString stringWithUTF8String:json.c_str()];
+    [[NSUserDefaults standardUserDefaults] setObject:ns forKey:kMacroDefaultsKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    return true;
+}
 
 static bool ReadMacroURLLimitedMac(NSURL* url, std::string& out, std::string& err) {
     out.clear();
@@ -1200,15 +1434,6 @@ static bool ReadMacroURLLimitedMac(NSURL* url, std::string& out, std::string& er
     return true;
 }
 
-static std::string LoadMacroHotkeyMac() {
-    std::lock_guard<std::mutex> lk(g_macroHotkeyMutex);
-    if (!g_macroHotkey.empty()) return g_macroHotkey;
-    NSString* saved = [[NSUserDefaults standardUserDefaults] stringForKey:kMacroHotkeyDefaultsKey];
-    if (!saved) return std::string();
-    g_macroHotkey = NormalizeMacroKeyMac(std::string([saved UTF8String]));
-    return g_macroHotkey;
-}
-
 static bool MacroHotkeyConflictsMac(const std::string& hotkey, const std::unordered_map<std::string, std::string>& bindings, std::string* conflict_name = nullptr) {
     std::string hk = NormalizeMacroKeyMac(hotkey);
     if (hk.empty()) return false;
@@ -1221,68 +1446,74 @@ static bool MacroHotkeyConflictsMac(const std::string& hotkey, const std::unorde
     return false;
 }
 
-static bool SaveMacroHotkeyMac(const std::string& hotkey_raw, const std::unordered_map<std::string, std::string>& bindings) {
-    std::string hk = NormalizeMacroKeyMac(hotkey_raw);
+static bool MacroEntryHotkeyConflictsMac(const std::string& hotkey, int skip_index, std::string* conflict_name = nullptr) {
+    std::string hk = NormalizeMacroKeyMac(hotkey);
+    if (hk.empty()) return false;
+    for (int i = 0; i < (int)g_macroEntriesMac.size(); ++i) {
+        if (i == skip_index) continue;
+        if (NormalizeMacroKeyMac(g_macroEntriesMac[i].hotkey) == hk) {
+            if (conflict_name) *conflict_name = g_macroEntriesMac[i].name.empty() ? "another macro" : g_macroEntriesMac[i].name;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ValidateMacroHotkeyForEntryMac(const std::string& hotkey, int skip_index, const std::unordered_map<std::string, std::string>& bindings) {
     std::string conflict;
-    if (MacroHotkeyConflictsMac(hk, bindings, &conflict)) {
-        ShowMacroErrorMac("Macro hotkey conflicts with keyboard binding: " + conflict);
+    if (MacroHotkeyConflictsMac(hotkey, bindings, &conflict)) {
+        ShowMacroErrorMac("Macro keybind conflicts with keyboard binding: " + conflict);
         return false;
     }
-
-    {
-        std::lock_guard<std::mutex> lk(g_macroHotkeyMutex);
-        g_macroHotkey = hk;
-        g_macroHotkeyLastDown = false;
+    if (MacroEntryHotkeyConflictsMac(hotkey, skip_index, &conflict)) {
+        ShowMacroErrorMac("Macro keybind is already used by: " + conflict);
+        return false;
     }
-    NSString* ns = [NSString stringWithUTF8String:hk.c_str()];
-    [[NSUserDefaults standardUserDefaults] setObject:ns forKey:kMacroHotkeyDefaultsKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
     return true;
 }
 
-static void PollMacroHotkeyMac(const std::unordered_map<std::string, std::string>& bindings) {
-    std::string hk;
-    bool was_down = false;
-    {
-        std::lock_guard<std::mutex> lk(g_macroHotkeyMutex);
-        hk = g_macroHotkey;
-        was_down = g_macroHotkeyLastDown;
-    }
-    if (hk.empty()) return;
-    if (MacroHotkeyConflictsMac(hk, bindings, nullptr)) return;
-
-    bool down = mac_key_down(hk);
-    {
-        std::lock_guard<std::mutex> lk(g_macroHotkeyMutex);
-        g_macroHotkeyLastDown = down;
-    }
-    if (down && !was_down) {
-        std::string saved = LoadMacroTextMac();
-        if (!macro_trim(saved).empty()) StartMacroTextMac(saved);
-    }
-}
-
-
-static bool SaveMacroTextMac(const std::string& txt) {
-    if (macro_trim(txt).empty()) {
-        [[NSUserDefaults standardUserDefaults] setObject:@"" forKey:kMacroDefaultsKey];
-        [[NSUserDefaults standardUserDefaults] synchronize];
-        return true;
-    }
-
+static bool UpsertMacroEntryMac(MacroEntryMac e, bool force_unique_name, const std::unordered_map<std::string, std::string>& bindings) {
     std::string pretty, err;
-    if (!macro_validate_to_pretty_json(txt, pretty, err, "Macro")) {
+    if (!macro_validate_to_pretty_json(e.json, pretty, err, e.name.empty() ? "Macro" : e.name)) {
         ShowMacroErrorMac("Invalid macro: " + err);
         return false;
     }
-    if (pretty.size() > MACRO_JSON_MAX_BYTES) {
-        ShowMacroErrorMac("Macro JSON exceeds the 50MB limit.");
-        return false;
+
+    {
+        std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+        e.name = macro_trim(e.name);
+        if (e.name.empty()) e.name = macro_extract_name_or_default(pretty, "Macro");
+        if (force_unique_name) e.name = UniqueMacroNameMac(e.name);
+        e.hotkey = NormalizeMacroKeyMac(e.hotkey);
+        e.json = MacroPrettyJsonWithForcedNameMac(pretty, e.name);
+
+        int existing = force_unique_name ? -1 : FindMacroEntryByNameMac(e.name);
+        if (!ValidateMacroHotkeyForEntryMac(e.hotkey, existing, bindings)) {
+            e.hotkey.clear();
+        }
+        if (existing >= 0) g_macroEntriesMac[existing] = std::move(e);
+        else g_macroEntriesMac.push_back(std::move(e));
+        RebuildMacroHotkeyStateMac();
     }
-    NSString* ns = [NSString stringWithUTF8String:pretty.c_str()];
-    [[NSUserDefaults standardUserDefaults] setObject:ns forKey:kMacroDefaultsKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    return true;
+    return SaveMacroEntriesMac();
+}
+
+static void PollMacroHotkeyMac(const std::unordered_map<std::string, std::string>& bindings) {
+    if (!g_macroEntriesLoadedMac.load(std::memory_order_acquire)) LoadMacroEntriesMac();
+    std::vector<std::string> to_run;
+    {
+        std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+        for (const auto& e : g_macroEntriesMac) {
+            std::string hk = NormalizeMacroKeyMac(e.hotkey);
+            if (hk.empty()) continue;
+            if (MacroHotkeyConflictsMac(hk, bindings, nullptr)) continue;
+            bool down = mac_key_down(hk);
+            bool was_down = g_macroHotkeyDownMac[hk];
+            g_macroHotkeyDownMac[hk] = down;
+            if (down && !was_down) to_run.push_back(e.json);
+        }
+    }
+    for (const auto& json : to_run) StartMacroTextMac(json);
 }
 
 static bool StartMacroTextMac(const std::string& txt) {
@@ -1306,6 +1537,30 @@ static bool StartMacroTextMac(const std::string& txt) {
     return true;
 }
 
+struct MacroRecordFrameMac {
+    uint16_t buttons = 0;
+    uint8_t hat = ns::HAT_NEUTRAL;
+    int8_t lx = 0;
+    int8_t ly = 0;
+    int8_t rx = 0;
+    int8_t ry = 0;
+};
+
+static MacroRecordFrameMac g_macroRecordLastFrame{};
+static bool g_macroRecordHaveFrame = false;
+static bool g_macroRecordHasInput = false;
+static uint64_t g_macroRecordLastChangeUs = 0;
+static std::string g_macroRecordCommands;
+
+static bool operator==(const MacroRecordFrameMac& a, const MacroRecordFrameMac& b) {
+    return a.buttons == b.buttons && a.hat == b.hat &&
+           a.lx == b.lx && a.ly == b.ly && a.rx == b.rx && a.ry == b.ry;
+}
+
+static bool operator!=(const MacroRecordFrameMac& a, const MacroRecordFrameMac& b) {
+    return !(a == b);
+}
+
 static std::string MacroButtonsToTextMac(uint16_t buttons) {
     struct BtnName { uint16_t bit; const char* name; } names[] = {
         {ns::BTN_A, "A"}, {ns::BTN_B, "B"}, {ns::BTN_X, "X"}, {ns::BTN_Y, "Y"},
@@ -1324,14 +1579,60 @@ static std::string MacroButtonsToTextMac(uint16_t buttons) {
     return out;
 }
 
-static void MacroRecordAppendMacLocked(uint16_t buttons, uint64_t duration_ms) {
+static MacroRecordFrameMac MacroRecordFrameFromReportMac(const ns::HIDReport& report) {
+    auto axis_dir = [](uint8_t v) -> int8_t {
+        if (v < 80) return -1;
+        if (v > 176) return 1;
+        return 0;
+    };
+
+    MacroRecordFrameMac f{};
+    f.buttons = report.buttons;
+    f.hat = report.hat;
+    f.lx = axis_dir(report.lx);
+    f.ly = axis_dir(report.ly);
+    f.rx = axis_dir(report.rx);
+    f.ry = axis_dir(report.ry);
+    return f;
+}
+
+static void MacroAppendTokenMac(std::string& out, const char* token) {
+    if (!out.empty()) out += "+";
+    out += token;
+}
+
+static std::string MacroRecordFrameToTextMac(const MacroRecordFrameMac& f) {
+    std::string out = MacroButtonsToTextMac(f.buttons);
+    switch (f.hat) {
+        case ns::HAT_N:  MacroAppendTokenMac(out, "DPAD_UP"); break;
+        case ns::HAT_NE: MacroAppendTokenMac(out, "DPAD_UP"); MacroAppendTokenMac(out, "DPAD_RIGHT"); break;
+        case ns::HAT_E:  MacroAppendTokenMac(out, "DPAD_RIGHT"); break;
+        case ns::HAT_SE: MacroAppendTokenMac(out, "DPAD_DOWN"); MacroAppendTokenMac(out, "DPAD_RIGHT"); break;
+        case ns::HAT_S:  MacroAppendTokenMac(out, "DPAD_DOWN"); break;
+        case ns::HAT_SW: MacroAppendTokenMac(out, "DPAD_DOWN"); MacroAppendTokenMac(out, "DPAD_LEFT"); break;
+        case ns::HAT_W:  MacroAppendTokenMac(out, "DPAD_LEFT"); break;
+        case ns::HAT_NW: MacroAppendTokenMac(out, "DPAD_UP"); MacroAppendTokenMac(out, "DPAD_LEFT"); break;
+        default: break;
+    }
+    if (f.lx < 0) MacroAppendTokenMac(out, "LSTICK_LEFT");
+    else if (f.lx > 0) MacroAppendTokenMac(out, "LSTICK_RIGHT");
+    if (f.ly < 0) MacroAppendTokenMac(out, "LSTICK_UP");
+    else if (f.ly > 0) MacroAppendTokenMac(out, "LSTICK_DOWN");
+    if (f.rx < 0) MacroAppendTokenMac(out, "RSTICK_LEFT");
+    else if (f.rx > 0) MacroAppendTokenMac(out, "RSTICK_RIGHT");
+    if (f.ry < 0) MacroAppendTokenMac(out, "RSTICK_UP");
+    else if (f.ry > 0) MacroAppendTokenMac(out, "RSTICK_DOWN");
+    return out;
+}
+
+static void MacroRecordAppendMacLocked(const MacroRecordFrameMac& frame, uint64_t duration_ms) {
     if (duration_ms < 10) return;
     if (!g_macroRecordCommands.empty()) g_macroRecordCommands += "; ";
-    if (buttons == 0) {
+    std::string combo = MacroRecordFrameToTextMac(frame);
+    if (combo.empty()) {
         g_macroRecordCommands += "WAIT " + std::to_string(duration_ms);
     } else {
-        std::string combo = MacroButtonsToTextMac(buttons);
-        if (combo.empty()) combo = "WAIT";
+        g_macroRecordHasInput = true;
         g_macroRecordCommands += combo + " " + std::to_string(duration_ms);
     }
 }
@@ -1339,20 +1640,31 @@ static void MacroRecordAppendMacLocked(uint16_t buttons, uint64_t duration_ms) {
 static void StartMacroRecordingMac() {
     std::lock_guard<std::mutex> lk(g_macroRecordMutex);
     g_macroRecording = true;
-    g_macroRecordLastButtons = 0xFFFF;
+    g_macroRecordLastFrame = MacroRecordFrameMac{};
+    g_macroRecordHaveFrame = false;
+    g_macroRecordHasInput = false;
     g_macroRecordLastChangeUs = ns::now_us();
     g_macroRecordCommands.clear();
 }
 
+static bool IsMacroRecordingMac() {
+    std::lock_guard<std::mutex> lk(g_macroRecordMutex);
+    return g_macroRecording;
+}
+
 static std::string StopMacroRecordingMac() {
     std::lock_guard<std::mutex> lk(g_macroRecordMutex);
-    if (g_macroRecording && g_macroRecordLastButtons != 0xFFFF) {
+    if (g_macroRecording && g_macroRecordHaveFrame) {
         uint64_t now = ns::now_us();
-        MacroRecordAppendMacLocked(g_macroRecordLastButtons, (now - g_macroRecordLastChangeUs) / 1000ULL);
+        MacroRecordAppendMacLocked(g_macroRecordLastFrame, (now - g_macroRecordLastChangeUs) / 1000ULL);
     }
     g_macroRecording = false;
-    g_macroRecordLastButtons = 0xFFFF;
-    std::string commands = g_macroRecordCommands.empty() ? "WAIT 200" : g_macroRecordCommands;
+    g_macroRecordHaveFrame = false;
+    if (!g_macroRecordHasInput) {
+        g_macroRecordCommands.clear();
+        return "";
+    }
+    std::string commands = g_macroRecordCommands;
     return macro_pretty_json(commands, "Recorded Macro");
 }
 
@@ -1360,15 +1672,16 @@ static void SampleMacroRecordingMac(const ns::HIDReport& report) {
     std::lock_guard<std::mutex> lk(g_macroRecordMutex);
     if (!g_macroRecording) return;
     uint64_t now = ns::now_us();
-    uint16_t buttons = report.buttons;
-    if (g_macroRecordLastButtons == 0xFFFF) {
-        g_macroRecordLastButtons = buttons;
+    MacroRecordFrameMac frame = MacroRecordFrameFromReportMac(report);
+    if (!g_macroRecordHaveFrame) {
+        g_macroRecordLastFrame = frame;
+        g_macroRecordHaveFrame = true;
         g_macroRecordLastChangeUs = now;
         return;
     }
-    if (buttons != g_macroRecordLastButtons) {
-        MacroRecordAppendMacLocked(g_macroRecordLastButtons, (now - g_macroRecordLastChangeUs) / 1000ULL);
-        g_macroRecordLastButtons = buttons;
+    if (frame != g_macroRecordLastFrame) {
+        MacroRecordAppendMacLocked(g_macroRecordLastFrame, (now - g_macroRecordLastChangeUs) / 1000ULL);
+        g_macroRecordLastFrame = frame;
         g_macroRecordLastChangeUs = now;
     }
 }
@@ -1414,6 +1727,12 @@ static bool ApplyMacroOverrideMac(ns::HIDReport[4], bool[4], bool[4], int[4]) {
     uint8_t hmacKey[32];
     std::atomic<uint32_t> packetCount;
     BindingsEditor* _bindingsEditor;
+    NSWindow* macroWindow;
+    NSMutableArray* macroRowControls;
+    NSButton* macroRecordBtn;
+    NSTimer* macroRecordTimer;
+    id macroKeyMonitor;
+    NSInteger macroListeningIndex;
 }
 - (void)connect;
 - (void)disconnect;
@@ -1423,6 +1742,17 @@ static bool ApplyMacroOverrideMac(ns::HIDReport[4], bool[4], bool[4], int[4]) {
 - (void)kbComboChanged;
 - (void)openBindingsEditor;
 - (void)openMacros;
+- (void)refreshMacroRows;
+- (void)macroRun:(id)sender;
+- (void)macroKey:(id)sender;
+- (void)macroRename:(id)sender;
+- (void)macroExportOne:(id)sender;
+- (void)macroDelete:(id)sender;
+- (void)macroImport:(id)sender;
+- (void)macroRecordToggle:(id)sender;
+- (void)macroRecordTick:(id)sender;
+- (void)macroExportAll:(id)sender;
+- (void)macroClose:(id)sender;
 @end
 
 static std::unordered_map<std::string, std::string> default_key_bindings() {
@@ -1475,6 +1805,33 @@ static bool mac_key_down(const std::string& name) {
     for (auto& km : kmap)
         if (name == km.n) return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, km.c);
     return false;
+}
+
+static std::string MacEventKeyName(NSEvent* event) {
+    switch ([event keyCode]) {
+        case 0x00: return "A"; case 0x0B: return "B"; case 0x08: return "C"; case 0x02: return "D";
+        case 0x0E: return "E"; case 0x03: return "F"; case 0x05: return "G"; case 0x04: return "H";
+        case 0x22: return "I"; case 0x26: return "J"; case 0x28: return "K"; case 0x25: return "L";
+        case 0x2E: return "M"; case 0x2D: return "N"; case 0x1F: return "O"; case 0x23: return "P";
+        case 0x0C: return "Q"; case 0x0F: return "R"; case 0x01: return "S"; case 0x11: return "T";
+        case 0x20: return "U"; case 0x09: return "V"; case 0x0D: return "W"; case 0x07: return "X";
+        case 0x10: return "Y"; case 0x06: return "Z";
+        case 0x1D: return "0"; case 0x12: return "1"; case 0x13: return "2"; case 0x14: return "3";
+        case 0x15: return "4"; case 0x17: return "5"; case 0x16: return "6"; case 0x1A: return "7";
+        case 0x1C: return "8"; case 0x19: return "9";
+        case 0x7E: return "UP"; case 0x7D: return "DOWN"; case 0x7B: return "LEFT"; case 0x7C: return "RIGHT";
+        case 0x38: return "LSHIFT"; case 0x3C: return "RSHIFT";
+        case 0x3B: return "LCTRL"; case 0x3E: return "RCTRL";
+        case 0x3A: return "LALT"; case 0x3D: return "RALT";
+        case 0x31: return "SPACE"; case 0x24: return "ENTER"; case 0x30: return "TAB";
+        case 0x35: return "ESC"; case 0x33: return "BACKSPACE";
+        case 0x7A: return "F1"; case 0x78: return "F2"; case 0x63: return "F3"; case 0x76: return "F4";
+        case 0x60: return "F5"; case 0x61: return "F6"; case 0x62: return "F7"; case 0x64: return "F8";
+        case 0x65: return "F9"; case 0x6D: return "F10"; case 0x67: return "F11"; case 0x6F: return "F12";
+        case 0x73: return "HOME"; case 0x69: return "SNAPSHOT";
+        default: break;
+    }
+    return "";
 }
 
 static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordered_map<std::string, std::string>& bindings, bool override_mode) {
@@ -1792,6 +2149,32 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
 }
 @end
 
+static NSString* MacroSafeFileNameMac(const std::string& raw_name) {
+    std::string name = macro_trim(raw_name);
+    if (name.empty()) name = "Macro";
+    for (char& c : name) {
+        if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|' || (unsigned char)c < 32) {
+            c = '_';
+        }
+    }
+    while (!name.empty() && (name.back() == '.' || name.back() == ' ')) name.pop_back();
+    if (name.empty()) name = "Macro";
+    if (name.size() > 180) name.resize(180);
+    name += ".json";
+    return [NSString stringWithUTF8String:name.c_str()];
+}
+
+static bool MacroWriteURLMac(NSURL* url, const std::string& text) {
+    NSString* outText = [NSString stringWithUTF8String:text.c_str()];
+    NSError* writeErr = nil;
+    if (![outText writeToURL:url atomically:YES encoding:NSUTF8StringEncoding error:&writeErr]) {
+        ShowMacroErrorMac(writeErr ? std::string([[writeErr localizedDescription] UTF8String]) : "Could not export macro JSON.");
+        return false;
+    }
+    return true;
+}
+
 @implementation AppDelegate
 
 - (void)loadBindings {
@@ -1990,97 +2373,330 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
 
 
 - (void)openMacros {
-    NSAlert* alert = [[NSAlert alloc] init];
-    [alert setMessageText:@"Macros"];
-    [alert setInformativeText:@"JSON/commands, or record live P1 buttons while connected."];
-    [alert addButtonWithTitle:@"Run"];
-    [alert addButtonWithTitle:@"Save/Add"];
-    [alert addButtonWithTitle:@"Delete"];
-    [alert addButtonWithTitle:@"Record"];
-    [alert addButtonWithTitle:@"Stop Recording"];
-    [alert addButtonWithTitle:@"Import JSON"];
-    [alert addButtonWithTitle:@"Export JSON"];
-    [alert addButtonWithTitle:@"Close"];
+    LoadMacroEntriesMac();
+    if (!macroRowControls) macroRowControls = [[NSMutableArray alloc] init];
+    macroListeningIndex = -1;
 
-    NSView* accessory = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 540, 250)];
-    NSTextField* note = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 228, 540, 18)];
-    [note setStringValue:@"Use JSON/commands. Macro hotkey is optional and must not duplicate keyboard bindings."];
-    [note setBezeled:NO]; [note setDrawsBackground:NO]; [note setEditable:NO]; [note setSelectable:NO];
-    [accessory addSubview:note];
-
-    NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 48, 540, 175)];
-    NSTextView* tv = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 540, 175)];
-    [scroll setDocumentView:tv]; [scroll setHasVerticalScroller:YES];
-    [accessory addSubview:scroll];
-
-    NSTextField* hkLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 20, 115, 22)];
-    [hkLabel setStringValue:@"Macro hotkey:"];
-    [hkLabel setBezeled:NO]; [hkLabel setDrawsBackground:NO]; [hkLabel setEditable:NO]; [hkLabel setSelectable:NO];
-    [accessory addSubview:hkLabel];
-
-    NSTextField* hkField = [[NSTextField alloc] initWithFrame:NSMakeRect(120, 18, 130, 24)];
-    [hkField setStringValue:[NSString stringWithUTF8String:LoadMacroHotkeyMac().c_str()]];
-    [accessory addSubview:hkField];
-
-    NSTextField* hkHint = [[NSTextField alloc] initWithFrame:NSMakeRect(260, 20, 280, 22)];
-    [hkHint setStringValue:@"Example: F8, SPACE, Q. Leave empty to disable."];
-    [hkHint setBezeled:NO]; [hkHint setDrawsBackground:NO]; [hkHint setEditable:NO]; [hkHint setSelectable:NO];
-    [accessory addSubview:hkHint];
-
-    std::string txt = LoadMacroTextMac();
-    if (txt.empty()) txt = "{\"name\":\"Macro\",\"commands\":\"WAIT 200; A 100; B 100\"}";
-    [tv setString:[NSString stringWithUTF8String:txt.c_str()]];
-    [alert setAccessoryView:accessory];
-
-    NSModalResponse r = [alert runModal];
-    std::string out([[tv string] UTF8String]);
-    std::string hotkeyOut([[hkField stringValue] UTF8String]);
-
-    if (r == NSAlertFirstButtonReturn) {
-        if (SaveMacroHotkeyMac(hotkeyOut, keyBindings)) StartMacroTextMac(out);
+    if (!macroWindow) {
+        macroWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 620, 280)
+                                                  styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                                                    backing:NSBackingStoreBuffered
+                                                      defer:NO];
+        [macroWindow setTitle:@"Macros"];
+        [macroWindow setDelegate:self];
+        [macroWindow center];
+        [macroWindow setReleasedWhenClosed:NO];
+        [macroWindow setContentView:[[NSView alloc] initWithFrame:NSMakeRect(0, 0, 620, 280)]];
     }
-    else if (r == NSAlertSecondButtonReturn) {
-        if (SaveMacroHotkeyMac(hotkeyOut, keyBindings)) SaveMacroTextMac(out);
-    }
-    else if (r == NSAlertThirdButtonReturn) {
-        SaveMacroTextMac("");
-        SaveMacroHotkeyMac("", keyBindings);
-    }
-    else if (r == NSAlertThirdButtonReturn + 1) StartMacroRecordingMac();
-    else if (r == NSAlertThirdButtonReturn + 2) {
-        std::string rec = StopMacroRecordingMac();
-        if (SaveMacroHotkeyMac(hotkeyOut, keyBindings)) SaveMacroTextMac(rec);
-    } else if (r == NSAlertThirdButtonReturn + 3) {
-        NSOpenPanel* panel = [NSOpenPanel openPanel];
-        if (@available(macOS 11.0, *)) {
-            Class UTTypeClass = NSClassFromString(@"UTType");
-            id jsonType = UTTypeClass ? [UTTypeClass valueForKey:@"JSON"] : nil;
-            if (jsonType) [panel setValue:@[jsonType] forKey:@"allowedContentTypes"];
-        }
-        if ([panel runModal] == NSModalResponseOK) {
-            std::string imported, err;
-            if (!ReadMacroURLLimitedMac([panel URL], imported, err)) {
-                ShowMacroErrorMac(err.empty() ? "Invalid or empty macro file." : err);
-            } else if (SaveMacroHotkeyMac(hotkeyOut, keyBindings)) {
-                SaveMacroTextMac(imported);
-            }
-        }
-    } else if (r == NSAlertThirdButtonReturn + 4) {
-        std::string prettyOut, err;
-        if (!macro_validate_to_pretty_json(out, prettyOut, err, "Macro")) {
-            ShowMacroErrorMac("Invalid macro: " + err);
-        } else {
-            NSSavePanel* panel = [NSSavePanel savePanel];
-            [panel setNameFieldStringValue:@"ns-macros.json"];
-            if ([panel runModal] == NSModalResponseOK) {
-                NSString* outText = [NSString stringWithUTF8String:prettyOut.c_str()];
-                NSError* writeErr = nil;
-                if (![outText writeToURL:[panel URL] atomically:YES encoding:NSUTF8StringEncoding error:&writeErr]) {
-                    ShowMacroErrorMac(writeErr ? std::string([[writeErr localizedDescription] UTF8String]) : "Could not export macro JSON.");
+
+    __weak AppDelegate* weakSelf = self;
+    if (!macroKeyMonitor) {
+        macroKeyMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent* (NSEvent* event) {
+            AppDelegate* strongSelf = weakSelf;
+            if (!strongSelf || strongSelf->macroListeningIndex < 0 || [event window] != strongSelf->macroWindow) return event;
+            int idx = (int)strongSelf->macroListeningIndex;
+            std::string key = MacEventKeyName(event);
+            bool save_needed = false;
+            {
+                std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+                if (idx >= 0 && idx < (int)g_macroEntriesMac.size()) {
+                    if (key == "ESC") {
+                        g_macroEntriesMac[idx].hotkey.clear();
+                        RebuildMacroHotkeyStateMac();
+                        save_needed = true;
+                    } else if (!key.empty()) {
+                        if (ValidateMacroHotkeyForEntryMac(key, idx, strongSelf->keyBindings)) {
+                            g_macroEntriesMac[idx].hotkey = key;
+                            RebuildMacroHotkeyStateMac();
+                            save_needed = true;
+                        }
+                    }
                 }
             }
+            if (save_needed) SaveMacroEntriesMac();
+            strongSelf->macroListeningIndex = -1;
+            [strongSelf refreshMacroRows];
+            return (NSEvent*)nil;
+        }];
+    }
+
+    [self refreshMacroRows];
+    [macroWindow makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
+- (void)refreshMacroRows {
+    if (!macroWindow) return;
+    for (NSView* v in macroRowControls) [v removeFromSuperview];
+    [macroRowControls removeAllObjects];
+
+    std::vector<MacroEntryMac> entries;
+    {
+        std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+        entries = g_macroEntriesMac;
+    }
+
+    constexpr CGFloat dialogW = 620;
+    constexpr CGFloat x = 14;
+    constexpr CGFloat rowH = 26;
+    constexpr CGFloat nameW = 250;
+    constexpr CGFloat keyW = 110;
+    constexpr CGFloat btnW = 68;
+    constexpr CGFloat exportW = 64;
+    constexpr CGFloat delW = 64;
+    constexpr CGFloat gap = 4;
+    CGFloat keyX = x + nameW + gap;
+    CGFloat renameX = keyX + keyW + gap;
+    CGFloat exportX = renameX + btnW + gap;
+    CGFloat deleteX = exportX + exportW + gap;
+    CGFloat rightBtnX = deleteX + delW - 88;
+    CGFloat rowsH = entries.empty() ? rowH : (CGFloat)entries.size() * rowH;
+    CGFloat contentH = std::max<CGFloat>(190, rowsH + 104);
+    [macroWindow setContentSize:NSMakeSize(dialogW, contentH)];
+    NSView* view = [macroWindow contentView];
+
+    CGFloat y = contentH - 38;
+    if (entries.empty()) {
+        NSTextField* empty = [[NSTextField alloc] initWithFrame:NSMakeRect(x, y + 2, nameW, 22)];
+        [empty setStringValue:@"No macros"];
+        [empty setAlignment:NSTextAlignmentCenter];
+        [empty setBezeled:NO]; [empty setDrawsBackground:NO]; [empty setEditable:NO]; [empty setSelectable:NO];
+        [view addSubview:empty]; [macroRowControls addObject:empty];
+        y -= rowH;
+    }
+
+    for (int i = 0; i < (int)entries.size(); ++i) {
+        const auto& e = entries[i];
+        NSButton* run = [[NSButton alloc] initWithFrame:NSMakeRect(x, y, nameW, 24)];
+        [run setTitle:[NSString stringWithUTF8String:(e.name.empty() ? "Macro" : e.name).c_str()]];
+        [run setBezelStyle:NSBezelStyleRounded]; [run setTarget:self]; [run setAction:@selector(macroRun:)]; [run setTag:i];
+        [view addSubview:run]; [macroRowControls addObject:run];
+
+        NSButton* key = [[NSButton alloc] initWithFrame:NSMakeRect(keyX, y, keyW, 24)];
+        std::string keyTitle = (macroListeningIndex == i) ? "..." : NormalizeMacroKeyMac(e.hotkey);
+        [key setTitle:[NSString stringWithUTF8String:keyTitle.c_str()]];
+        [key setBezelStyle:NSBezelStyleTexturedRounded]; [key setTarget:self]; [key setAction:@selector(macroKey:)]; [key setTag:i];
+        [view addSubview:key]; [macroRowControls addObject:key];
+
+        NSButton* rename = [[NSButton alloc] initWithFrame:NSMakeRect(renameX, y, btnW, 24)];
+        [rename setTitle:@"Rename"]; [rename setBezelStyle:NSBezelStyleRounded]; [rename setTarget:self]; [rename setAction:@selector(macroRename:)]; [rename setTag:i];
+        [view addSubview:rename]; [macroRowControls addObject:rename];
+
+        NSButton* exp = [[NSButton alloc] initWithFrame:NSMakeRect(exportX, y, exportW, 24)];
+        [exp setTitle:@"Export"]; [exp setBezelStyle:NSBezelStyleRounded]; [exp setTarget:self]; [exp setAction:@selector(macroExportOne:)]; [exp setTag:i];
+        [view addSubview:exp]; [macroRowControls addObject:exp];
+
+        NSButton* del = [[NSButton alloc] initWithFrame:NSMakeRect(deleteX, y, delW, 24)];
+        [del setTitle:@"Delete"]; [del setBezelStyle:NSBezelStyleRounded]; [del setTarget:self]; [del setAction:@selector(macroDelete:)]; [del setTag:i];
+        [view addSubview:del]; [macroRowControls addObject:del];
+        y -= rowH;
+    }
+
+    NSButton* importBtn = [[NSButton alloc] initWithFrame:NSMakeRect(x, 50, 88, 30)];
+    [importBtn setTitle:@"Import"]; [importBtn setBezelStyle:NSBezelStyleRounded]; [importBtn setTarget:self]; [importBtn setAction:@selector(macroImport:)];
+    [view addSubview:importBtn]; [macroRowControls addObject:importBtn];
+
+    macroRecordBtn = [[NSButton alloc] initWithFrame:NSMakeRect(rightBtnX, 50, 88, 30)];
+    [macroRecordBtn setTitle:IsMacroRecordingMac() ? @"Stop" : @"Record P1"]; [macroRecordBtn setBezelStyle:NSBezelStyleRounded]; [macroRecordBtn setTarget:self]; [macroRecordBtn setAction:@selector(macroRecordToggle:)];
+    [view addSubview:macroRecordBtn]; [macroRowControls addObject:macroRecordBtn];
+
+    NSButton* exportBtn = [[NSButton alloc] initWithFrame:NSMakeRect(x, 12, 88, 30)];
+    [exportBtn setTitle:@"Export"]; [exportBtn setBezelStyle:NSBezelStyleRounded]; [exportBtn setTarget:self]; [exportBtn setAction:@selector(macroExportAll:)];
+    [view addSubview:exportBtn]; [macroRowControls addObject:exportBtn];
+
+    NSButton* closeBtn = [[NSButton alloc] initWithFrame:NSMakeRect(rightBtnX, 12, 88, 30)];
+    [closeBtn setTitle:@"Close"]; [closeBtn setBezelStyle:NSBezelStyleRounded]; [closeBtn setTarget:self]; [closeBtn setAction:@selector(macroClose:)];
+    [view addSubview:closeBtn]; [macroRowControls addObject:closeBtn];
+}
+
+- (void)macroRun:(id)sender {
+    int idx = (int)[(NSControl*)sender tag];
+    std::string json;
+    {
+        std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+        if (idx >= 0 && idx < (int)g_macroEntriesMac.size()) json = g_macroEntriesMac[idx].json;
+    }
+    if (!json.empty()) StartMacroTextMac(json);
+}
+
+- (void)macroKey:(id)sender {
+    macroListeningIndex = [(NSControl*)sender tag];
+    [self refreshMacroRows];
+    [macroWindow makeFirstResponder:macroWindow.contentView];
+}
+
+- (void)macroRename:(id)sender {
+    int idx = (int)[(NSControl*)sender tag];
+    std::string oldName;
+    {
+        std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+        if (idx < 0 || idx >= (int)g_macroEntriesMac.size()) return;
+        oldName = g_macroEntriesMac[idx].name.empty() ? "Macro" : g_macroEntriesMac[idx].name;
+    }
+
+    NSAlert* alert = [[NSAlert alloc] init];
+    [alert setMessageText:@"Rename Macro"];
+    NSTextField* field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 260, 24)];
+    [field setStringValue:[NSString stringWithUTF8String:oldName.c_str()]];
+    [alert setAccessoryView:field];
+    [alert addButtonWithTitle:@"OK"];
+    [alert addButtonWithTitle:@"Cancel"];
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+
+    std::string newName = macro_trim(std::string([[field stringValue] UTF8String]));
+    if (newName.empty()) {
+        ShowMacroErrorMac("Macro name cannot be empty.");
+        return;
+    }
+
+    bool save_needed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+        int duplicate = FindMacroEntryByNameMac(newName);
+        if (duplicate >= 0 && duplicate != idx) {
+            ShowMacroErrorMac("Another macro already uses that name.");
+            return;
+        }
+        if (idx >= 0 && idx < (int)g_macroEntriesMac.size()) {
+            g_macroEntriesMac[idx].name = newName;
+            g_macroEntriesMac[idx].json = MacroPrettyJsonWithForcedNameMac(g_macroEntriesMac[idx].json, newName);
+            save_needed = true;
         }
     }
+    if (save_needed) SaveMacroEntriesMac();
+    [self refreshMacroRows];
+}
+
+- (void)macroExportOne:(id)sender {
+    int idx = (int)[(NSControl*)sender tag];
+    std::vector<MacroEntryMac> one;
+    std::string name = "Macro";
+    {
+        std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+        if (idx < 0 || idx >= (int)g_macroEntriesMac.size()) return;
+        one.push_back(g_macroEntriesMac[idx]);
+        name = g_macroEntriesMac[idx].name.empty() ? "Macro" : g_macroEntriesMac[idx].name;
+    }
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    [panel setNameFieldStringValue:MacroSafeFileNameMac(name)];
+    if ([panel runModal] == NSModalResponseOK) {
+        MacroWriteURLMac([panel URL], MacroEntriesToJsonMac(one));
+    }
+}
+
+- (void)macroDelete:(id)sender {
+    int idx = (int)[(NSControl*)sender tag];
+    bool save_needed = false;
+    {
+        std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+        if (idx >= 0 && idx < (int)g_macroEntriesMac.size()) {
+            g_macroEntriesMac.erase(g_macroEntriesMac.begin() + idx);
+            RebuildMacroHotkeyStateMac();
+            macroListeningIndex = -1;
+            save_needed = true;
+        }
+    }
+    if (save_needed) SaveMacroEntriesMac();
+    [self refreshMacroRows];
+}
+
+- (void)macroImport:(id)sender {
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    if (@available(macOS 11.0, *)) {
+        Class UTTypeClass = NSClassFromString(@"UTType");
+        id jsonType = UTTypeClass ? [UTTypeClass valueForKey:@"JSON"] : nil;
+        if (jsonType) [panel setValue:@[jsonType] forKey:@"allowedContentTypes"];
+    }
+    if ([panel runModal] != NSModalResponseOK) return;
+
+    std::string raw, err;
+    if (!ReadMacroURLLimitedMac([panel URL], raw, err)) {
+        ShowMacroErrorMac(err.empty() ? "Invalid or empty macro file." : err);
+        return;
+    }
+    std::vector<MacroEntryMac> imported;
+    if (!ParseMacroEntriesTextMac(raw, imported, err) || imported.empty()) {
+        ShowMacroErrorMac("Invalid macro JSON: " + err);
+        return;
+    }
+
+    if (imported.size() > 1 || raw.find("\"macros\"") != std::string::npos) {
+        {
+            std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+            g_macroEntriesMac = std::move(imported);
+            RebuildMacroHotkeyStateMac();
+        }
+        SaveMacroEntriesMac();
+    } else {
+        UpsertMacroEntryMac(imported[0], false, keyBindings);
+    }
+    [self refreshMacroRows];
+}
+
+- (void)macroRecordTick:(id)sender {
+    ns::HIDReport report;
+    report.reset();
+    if (slotActive[0].load(std::memory_order_relaxed)) {
+        report = map_gc_to_switch(states[0]);
+    }
+    int km = keyboardMode.load();
+    if (km == KB_SINGLE) {
+        report.reset();
+        apply_keyboard_to_report_mac(report, keyBindings, false);
+    } else if (km == KB_OVERRIDE) {
+        apply_keyboard_to_report_mac(report, keyBindings, true);
+    }
+    SampleMacroRecordingMac(report);
+}
+
+- (void)macroRecordToggle:(id)sender {
+    if (!IsMacroRecordingMac()) {
+        StartMacroRecordingMac();
+        [self macroRecordTick:nil];
+        macroRecordTimer = [NSTimer scheduledTimerWithTimeInterval:0.016 target:self selector:@selector(macroRecordTick:) userInfo:nil repeats:YES];
+        [macroRecordBtn setTitle:@"Stop"];
+    } else {
+        [self macroRecordTick:nil];
+        if (macroRecordTimer) {
+            [macroRecordTimer invalidate];
+            macroRecordTimer = nil;
+        }
+        std::string recorded = StopMacroRecordingMac();
+        if (!recorded.empty()) {
+            MacroEntryMac e;
+            e.name = "Recorded Macro";
+            e.hotkey = "";
+            e.json = recorded;
+            UpsertMacroEntryMac(e, true, keyBindings);
+        }
+        [self refreshMacroRows];
+    }
+}
+
+- (void)macroExportAll:(id)sender {
+    SaveMacroEntriesMac();
+    std::vector<MacroEntryMac> entries;
+    {
+        std::lock_guard<std::mutex> lk(g_macroEntriesMutex);
+        entries = g_macroEntriesMac;
+    }
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    [panel setNameFieldStringValue:@"ns-macros.json"];
+    if ([panel runModal] == NSModalResponseOK) {
+        MacroWriteURLMac([panel URL], MacroEntriesToJsonMac(entries));
+    }
+}
+
+- (void)macroClose:(id)sender {
+    if (IsMacroRecordingMac()) {
+        if (macroRecordTimer) {
+            [macroRecordTimer invalidate];
+            macroRecordTimer = nil;
+        }
+        StopMacroRecordingMac();
+    }
+    macroListeningIndex = -1;
+    [macroWindow close];
 }
 
 
@@ -2329,6 +2945,21 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
 }
 
 - (BOOL)windowShouldClose:(NSWindow*)sender {
+    if (sender == macroWindow) {
+        if (IsMacroRecordingMac()) {
+            if (macroRecordTimer) {
+                [macroRecordTimer invalidate];
+                macroRecordTimer = nil;
+            }
+            StopMacroRecordingMac();
+        }
+        macroListeningIndex = -1;
+        return YES;
+    }
+    if (macroKeyMonitor) {
+        [NSEvent removeMonitor:macroKeyMonitor];
+        macroKeyMonitor = nil;
+    }
     [self disconnect];
     [NSApp terminate:self];
     return YES;

@@ -82,19 +82,19 @@ To compile on Linux, you need a C++ compiler and the GTK3 development headers fo
 **Prerequisites:**
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential libgtk-3-dev libsdl2-dev
+sudo apt-get install -y build-essential libgtk-3-dev libsdl3-dev
 ```
 
 Navigate to `client/linux/` and run the following depending on what you want to build:
 
 **Build the CLI:**
 ```bash
-g++ -O3 -std=c++17 ns-gamepad.cpp -o ns-gamepad -lpthread -lSDL2
+g++ -O3 -std=c++17 ns-gamepad.cpp -o ns-gamepad -lpthread -lSDL3
 ```
 
 **Build the GUI:**
 ```bash
-g++ -O3 -std=c++17 ns-gui.cpp -o ns-gui $(pkg-config --cflags --libs gtk+-3.0) -lpthread -lSDL2
+g++ -O3 -std=c++17 ns-gui.cpp -o ns-gui $(pkg-config --cflags --libs gtk+-3.0) -lpthread -lSDL3
 ```
 
 ---

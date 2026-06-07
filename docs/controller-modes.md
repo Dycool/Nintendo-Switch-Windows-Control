@@ -48,7 +48,7 @@ Gyro and rumble require **both** server and client support:
 
 Platform-specific gyro support:
 - **Windows:** Raw HID for DS4, DualSense, and Switch Pro Controller
-- **Linux:** SDL2 `SDL_GameControllerGetSensorData` (gyro-capable controllers)
+- **Linux:** SDL3 `SDL_GetGamepadSensorData` (gyro-capable controllers)
 - **macOS:** GameController.framework motion data
 - **Browser:** Gamepad API (`pose.angularVelocity`, `pose.linearAcceleration`)
 

@@ -56,6 +56,9 @@ static constexpr uint64_t CLIENT_STALE_NEUTRAL_US = 350'000ULL; // 350ms release
 // Debug helpers.
 static bool g_log_neutral_rumble = false;   // show the neutral carrier in -v logs
 static bool g_test_rumble_on_connect = false; // send one synthetic rumble to UDP clients
+static bool g_random_identity = false;      // randomize USB serial + controller MACs before gadget creation
+static bool g_no_user_imu_cal = false;      // leave 0x8026 magic unset so host falls back to factory IMU cal
+static std::string g_usb_serial = "000000000001";
 
 enum class ImuMapMode {
     Direct,
@@ -76,9 +79,39 @@ enum class ImuTestMode {
     Pitch,
     Yaw,
     Shake,
+    Gentle,
 };
 
 static ImuTestMode g_imu_test = ImuTestMode::Off;
+
+enum class ImuWireLayout {
+    AccelThenGyro, // bytes 13..24: ax ay az gx gy gz
+    GyroThenAccel, // bytes 13..24: gx gy gz ax ay az
+};
+
+static ImuWireLayout g_imu_layout = ImuWireLayout::AccelThenGyro;
+
+static const char* imu_layout_name(ImuWireLayout l) {
+    switch (l) {
+        case ImuWireLayout::AccelThenGyro: return "accel-gyro";
+        case ImuWireLayout::GyroThenAccel: return "gyro-accel";
+    }
+    return "accel-gyro";
+}
+
+static bool parse_imu_layout(const std::string& raw) {
+    std::string s = raw;
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    if (s == "accel-gyro" || s == "ag" || s == "default") {
+        g_imu_layout = ImuWireLayout::AccelThenGyro;
+        return true;
+    }
+    if (s == "gyro-accel" || s == "ga" || s == "gyro-first") {
+        g_imu_layout = ImuWireLayout::GyroThenAccel;
+        return true;
+    }
+    return false;
+}
 
 static const char* imu_test_name(ImuTestMode m) {
     switch (m) {
@@ -87,8 +120,18 @@ static const char* imu_test_name(ImuTestMode m) {
         case ImuTestMode::Pitch: return "pitch";
         case ImuTestMode::Yaw:   return "yaw";
         case ImuTestMode::Shake: return "shake";
+        case ImuTestMode::Gentle: return "gentle";
     }
     return "off";
+}
+
+static bool parse_u8_arg(const char* raw, uint8_t& out) {
+    if (!raw || !*raw) return false;
+    char* end = nullptr;
+    unsigned long v = std::strtoul(raw, &end, 0);
+    if (!end || *end != '\0' || v > 0xFFUL) return false;
+    out = (uint8_t)v;
+    return true;
 }
 
 static bool parse_imu_test(const std::string& raw) {
@@ -98,7 +141,8 @@ static bool parse_imu_test(const std::string& raw) {
     if (s == "roll")  { g_imu_test = ImuTestMode::Roll;  return true; }
     if (s == "pitch") { g_imu_test = ImuTestMode::Pitch; return true; }
     if (s == "yaw")   { g_imu_test = ImuTestMode::Yaw;   return true; }
-    if (s == "shake") { g_imu_test = ImuTestMode::Shake; return true; }
+    if (s == "shake")  { g_imu_test = ImuTestMode::Shake;  return true; }
+    if (s == "gentle") { g_imu_test = ImuTestMode::Gentle; return true; }
     return false;
 }
 
@@ -1075,6 +1119,16 @@ static MotionReport synthetic_imu_sample(uint64_t t_us, int sample_index) {
             m.ay = (int16_t)(4096 + s * 1500);
             m.az = (int16_t)(-s * 3500);
             break;
+        case ImuTestMode::Gentle:
+            // More physically plausible than shake: steady gravity plus
+            // a moderate angular velocity. Some consumers reject absurd IMU.
+            m.ax = 0;
+            m.ay = 4096;
+            m.az = 0;
+            m.gx = (int16_t)(s * 1800);
+            m.gy = (int16_t)(-s * 900);
+            m.gz = (int16_t)(s * 450);
+            break;
         case ImuTestMode::Off:
             break;
     }
@@ -1090,6 +1144,15 @@ static constexpr size_t PRO_REPORT_SIZE = 64;
 // with 3 IMU samples spaced roughly 5ms apart.  Keep this configurable for
 // testing, but default to the real cadence instead of 250Hz.
 static uint64_t g_pro_report_interval_us = 15'000ULL;
+// Standard input byte 2 is "battery + connection info". The old value 0x8E
+// reports a low connection nibble with LSB 0. SDL/hid-nintendo notes that this
+// byte carries connection/USB status, so keep it configurable while defaulting
+// to a more normal wired/full battery style 0x81.
+static uint8_t  g_pro_bat_con = 0x81;
+// Byte 12 of report 0x30/0x21 is the controller's vibrator input/status byte.
+// Usually 0 is fine, but keep it configurable for exact-protocol experiments.
+static uint8_t  g_pro_vibrator_report = 0x00;
+static bool     g_log_raw_30 = false;
 static constexpr int PRO_IDLE_REPORT_HZ = 30;
 static constexpr uint64_t PRO_IDLE_REPORT_INTERVAL_US = 1'000'000ULL / PRO_IDLE_REPORT_HZ;
 static constexpr uint64_t PRO_RELEASE_NEUTRAL_US = 250'000ULL;
@@ -1155,16 +1218,78 @@ static_assert(sizeof(ProInputReport21) == PRO_REPORT_SIZE, "ProInputReport21 mus
 // any cached calibration/association for the previous fake controllers.
 // 02 is a locally-administered unicast address, so these are intentionally
 // private/stable virtual MACs rather than pretending to be real hardware.
-static const uint8_t CTRL_MAC_BE[4][6] = {
+static uint8_t CTRL_MAC_BE[4][6] = {
     {0x02, 0x4E, 0x53, 0x26, 0x06, 0xA0},
     {0x02, 0x4E, 0x53, 0x26, 0x06, 0xA1},
     {0x02, 0x4E, 0x53, 0x26, 0x06, 0xA2},
     {0x02, 0x4E, 0x53, 0x26, 0x06, 0xA3},
 };
 
-[[maybe_unused]] static const char* CTRL_SERIAL[4] = {
+static std::string CTRL_SERIAL[4] = {
     "NSGP260606A0", "NSGP260606A1", "NSGP260606A2", "NSGP260606A3"
 };
+
+static bool read_random_bytes(uint8_t* dst, size_t len) {
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        size_t off = 0;
+        while (off < len) {
+            ssize_t r = read(fd, dst + off, len - off);
+            if (r <= 0) break;
+            off += (size_t)r;
+        }
+        close(fd);
+        if (off == len) return true;
+    }
+
+    uint64_t seed = (uint64_t)now_us() ^ ((uint64_t)getpid() << 32);
+    for (size_t i = 0; i < len; ++i) {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        dst[i] = (uint8_t)(seed & 0xFF);
+    }
+    return true;
+}
+
+static void randomize_controller_identity() {
+    uint8_t rnd[16]{};
+    read_random_bytes(rnd, sizeof(rnd));
+
+    // Locally administered unicast MACs. Keep 02:4E:53 ("NS") as a stable
+    // virtual vendor prefix and randomize the low bytes so HOS cannot reuse
+    // cached calibration/association for the previous fake controller.
+    for (int i = 0; i < 4; ++i) {
+        CTRL_MAC_BE[i][0] = 0x02;
+        CTRL_MAC_BE[i][1] = 0x4E;
+        CTRL_MAC_BE[i][2] = 0x53;
+        CTRL_MAC_BE[i][3] = rnd[(i * 3 + 0) % sizeof(rnd)];
+        CTRL_MAC_BE[i][4] = rnd[(i * 3 + 1) % sizeof(rnd)];
+        CTRL_MAC_BE[i][5] = (uint8_t)(rnd[(i * 3 + 2) % sizeof(rnd)] + i);
+        CTRL_SERIAL[i] = "NSGP";
+        char suffix[16];
+        std::snprintf(suffix, sizeof(suffix), "%02X%02X%02X%02X",
+                      CTRL_MAC_BE[i][2], CTRL_MAC_BE[i][3], CTRL_MAC_BE[i][4], CTRL_MAC_BE[i][5]);
+        CTRL_SERIAL[i] += suffix;
+    }
+
+    char usb_ser[32];
+    std::snprintf(usb_ser, sizeof(usb_ser), "%02X%02X%02X%02X%02X%02X",
+                  rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5]);
+    g_usb_serial = usb_ser;
+}
+
+static void print_controller_identity() {
+    if (!g_verbose) return;
+    std::printf("[identity] usb_serial=%s\n", g_usb_serial.c_str());
+    for (int i = 0; i < g_hid_port_count; ++i) {
+        std::printf("[identity] pad%d MAC=%02X:%02X:%02X:%02X:%02X:%02X serial=%s\n",
+                    i + 1,
+                    CTRL_MAC_BE[i][0], CTRL_MAC_BE[i][1], CTRL_MAC_BE[i][2],
+                    CTRL_MAC_BE[i][3], CTRL_MAC_BE[i][4], CTRL_MAC_BE[i][5],
+                    CTRL_SERIAL[i].c_str());
+    }
+}
 
 static constexpr size_t SPI_FLASH_SIZE = 0x10000;
 static uint8_t g_spi_flash[4][SPI_FLASH_SIZE];
@@ -1177,6 +1302,10 @@ struct ControllerRuntime {
     bool full_report_enabled = false;
     bool imu_enabled = false;
     bool vibration_enabled = false;
+    bool usb_seen_mac = false;
+    bool usb_handshake_done = false;
+    bool usb_baudrate_set = false;
+    bool usb_timeout_disabled = false;
     bool pending_subcmd_reply = false;
     uint64_t last_standard_report_us = 0;
     uint64_t last_idle_neutral_us = 0;
@@ -1279,11 +1408,25 @@ static void init_spi_flash(int ctrl) {
         flash[addr + 1] = (uint8_t)((val >> 8) & 0xFF);
     };
 
+    // hid-nintendo parses the 24-byte IMU calibration block as:
+    //   +0:  accel offsets XYZ
+    //   +6:  accel scales  XYZ
+    //   +12: gyro offsets  XYZ
+    //   +18: gyro scales   XYZ
+    //
+    // The previous build accidentally wrote gyro offsets where accel scales
+    // belong, making accel scale read as zero and gyro offset read as 0x1000.
+    // That is poison for any host that validates/calibrates IMU before using it.
+    static constexpr int16_t IMU_ACCEL_OFFSET = 0;
+    static constexpr int16_t IMU_ACCEL_SCALE  = 16384; // hid-nintendo default, 0x4000
+    static constexpr int16_t IMU_GYRO_OFFSET  = 0;
+    static constexpr int16_t IMU_GYRO_SCALE   = 13371; // hid-nintendo default
+
     const int16_t imu_vals[12] = {
-        0, 0, 0,
-        0, 0, 0,
-        0x1000, 0x1000, 0x1000,
-        0x33D0, 0x33D0, 0x33D0
+        IMU_ACCEL_OFFSET, IMU_ACCEL_OFFSET, IMU_ACCEL_OFFSET,
+        IMU_ACCEL_SCALE,  IMU_ACCEL_SCALE,  IMU_ACCEL_SCALE,
+        IMU_GYRO_OFFSET,  IMU_GYRO_OFFSET,  IMU_GYRO_OFFSET,
+        IMU_GYRO_SCALE,   IMU_GYRO_SCALE,   IMU_GYRO_SCALE
     };
     for (int i = 0; i < 12; ++i)
         put_i16_le((uint16_t)(0x6020 + i * 2), imu_vals[i]);
@@ -1304,25 +1447,54 @@ static void init_spi_flash(int ctrl) {
     flash[0x6059] = 0xFF;    flash[0x605A] = 0xFF;    flash[0x605B] = 0xFF;
     flash[0x605C] = 0x00;
 
-    for (int i = 0; i < 12; ++i)
-        put_i16_le((uint16_t)(0x6098 + i * 2), imu_vals[i]);
+    // Important: 0x6098 is NOT IMU calibration.  Joy-Con/Pro-controller
+    // tools read it as the second half of the 0x6086..0x60A9 stick-parameter
+    // model block.  The previous test build mirrored IMU calibration here,
+    // which made the console read nonsense stick-model parameters.  Keep it
+    // neutral/sane instead.
+    memset(flash + 0x6098, 0x00, 0x12);
 
     // User IMU calibration lives at 0x8026/0x8028 according to hid-nintendo.
-    // The Switch often reads around 0x8010 for user stick calibration; keeping
-    // this valid too prevents it from seeing 0xFF garbage if it later requests
-    // user IMU data or caches the block.
-    flash[0x8026] = 0xB2;
-    flash[0x8027] = 0xA1;
-    for (int i = 0; i < 12; ++i)
-        put_i16_le((uint16_t)(0x8028 + i * 2), imu_vals[i]);
+    // Make it optional: if disabled, the magic stays non-matching and the host
+    // should fall back to factory IMU calibration at 0x6020.
+    if (!g_no_user_imu_cal) {
+        flash[0x8026] = 0xB2;
+        flash[0x8027] = 0xA1;
+        for (int i = 0; i < 12; ++i)
+            put_i16_le((uint16_t)(0x8028 + i * 2), imu_vals[i]);
+    }
 
     g_spi_initialized[ctrl] = true;
 }
 
 static void set_identity_in_0x81(uint8_t* resp_81, int ctrl) {
     const uint8_t* mac = CTRL_MAC_BE[ctrl];
-    resp_81[4] = mac[0]; resp_81[5] = mac[1]; resp_81[6] = mac[2];
-    resp_81[7] = mac[3]; resp_81[8] = mac[4]; resp_81[9] = mac[5];
+    // USB 0x81 MAC reply stores MAC little-endian in bytes 4..9, matching
+    // Chromium's MacAddressReport/UnpackSwitchMacAddress handling.
+    resp_81[4] = mac[5]; resp_81[5] = mac[4]; resp_81[6] = mac[3];
+    resp_81[7] = mac[2]; resp_81[8] = mac[1]; resp_81[9] = mac[0];
+}
+
+static size_t build_usb_81_response(uint8_t* out, uint8_t subtype, int ctrl) {
+    memset(out, 0, PRO_REPORT_SIZE);
+    out[0] = 0x81;
+    out[1] = subtype;
+    switch (subtype) {
+    case 0x01: // request MAC/address/device type
+        out[2] = 0x00; // padding
+        out[3] = 0x03; // Pro Controller
+        set_identity_in_0x81(out, ctrl);
+        break;
+    case 0x02: // USB handshake
+    case 0x03: // set UART/baudrate
+    case 0x04: // disable USB timeout; real devices may not ACK, but an ACK is accepted
+    case 0x05: // enable USB timeout
+    default:
+        // Chromium and hid-nintendo only require report 0x81 subtype to advance
+        // these USB-init steps. Keep remaining bytes zero, like a minimal ACK.
+        break;
+    }
+    return PRO_REPORT_SIZE;
 }
 
 static void build_get_device_info_response(uint8_t* out, int ctrl) {
@@ -1341,17 +1513,17 @@ static void build_get_device_info_response(uint8_t* out, int ctrl) {
 }
 
 static void fill_neutral_controls(ProInputReport30& r) {
-    r.conn_info = 0x8E;
+    r.conn_info = g_pro_bat_con;
     r.left_stick[0]  = 0x00; r.left_stick[1]  = 0x08; r.left_stick[2]  = 0x80;
     r.right_stick[0] = 0x00; r.right_stick[1] = 0x08; r.right_stick[2] = 0x80;
-    r.vibrator = 0x00;
+    r.vibrator = g_pro_vibrator_report;
 }
 
 static void fill_neutral_controls(ProInputReport21& r) {
-    r.conn_info = 0x8E;
+    r.conn_info = g_pro_bat_con;
     r.left_stick[0]  = 0x00; r.left_stick[1]  = 0x08; r.left_stick[2]  = 0x80;
     r.right_stick[0] = 0x00; r.right_stick[1] = 0x08; r.right_stick[2] = 0x80;
-    r.vibrator = 0x00;
+    r.vibrator = g_pro_vibrator_report;
 }
 
 static uint16_t axis8_to_12(uint8_t v) {
@@ -1429,9 +1601,9 @@ static void apply_input_controls_to_pro21(const ExtendedHIDReport& src, ProInput
     // held web/UDP input; otherwise frequent Switch output/subcommand traffic
     // injects neutral frames between normal 0x30 reports, which makes held
     // buttons such as R/ZR flicker in-game.
-    out.conn_info = 0x8E;
+    out.conn_info = g_pro_bat_con;
     memset(out.buttons, 0, sizeof(out.buttons));
-    out.vibrator = 0x00;
+    out.vibrator = g_pro_vibrator_report;
 
     const HIDReport& in = src.input;
     if (in.buttons & BTN_Y)       out.buttons[0] |= 0x01;
@@ -1511,12 +1683,13 @@ static void build_standard_report(const ExtendedHIDReport& src,
         uint64_t t = now_us();
         if (t - last_log_us > 250000) {
             last_log_us = t;
-            std::printf("[input] lx=%3u ly=%3u rx=%3u ry=%3u | L=%02X %02X %02X R=%02X %02X %02X | imu=%s map=%s test=%s samples=%u ax=%6d ay=%6d az=%6d gx=%6d gy=%6d gz=%6d\n",
+            std::printf("[input] lx=%3u ly=%3u rx=%3u ry=%3u | L=%02X %02X %02X R=%02X %02X %02X | imu=%s map=%s layout=%s test=%s samples=%u ax=%6d ay=%6d az=%6d gx=%6d gy=%6d gz=%6d\n",
                         in.lx, in.ly, in.rx, in.ry,
                         out.left_stick[0], out.left_stick[1], out.left_stick[2],
                         out.right_stick[0], out.right_stick[1], out.right_stick[2],
                         has_imu ? "yes" : "no",
                         imu_map_name(g_imu_map),
+                        imu_layout_name(g_imu_layout),
                         imu_test_name(g_imu_test),
                         (unsigned)(has_imu ? (g_imu_test != ImuTestMode::Off ? 3 : motion_history_count) : 0),
                         (int)imu[0].ax, (int)imu[0].ay, (int)imu[0].az,
@@ -1524,12 +1697,33 @@ static void build_standard_report(const ExtendedHIDReport& src,
         }
     }
 
-    out.accel_x_0 = imu[0].ax; out.accel_y_0 = imu[0].ay; out.accel_z_0 = imu[0].az;
-    out.gyro_x_0  = imu[0].gx; out.gyro_y_0  = imu[0].gy; out.gyro_z_0  = imu[0].gz;
-    out.accel_x_1 = imu[1].ax; out.accel_y_1 = imu[1].ay; out.accel_z_1 = imu[1].az;
-    out.gyro_x_1  = imu[1].gx; out.gyro_y_1  = imu[1].gy; out.gyro_z_1  = imu[1].gz;
-    out.accel_x_2 = imu[2].ax; out.accel_y_2 = imu[2].ay; out.accel_z_2 = imu[2].az;
-    out.gyro_x_2  = imu[2].gx; out.gyro_y_2  = imu[2].gy; out.gyro_z_2  = imu[2].gz;
+    auto store_imu_sample = [](ProInputReport30& dst, int idx, const MotionReport& m) {
+        int16_t first0, first1, first2, second0, second1, second2;
+        if (g_imu_layout == ImuWireLayout::AccelThenGyro) {
+            first0 = m.ax; first1 = m.ay; first2 = m.az;
+            second0 = m.gx; second1 = m.gy; second2 = m.gz;
+        } else {
+            first0 = m.gx; first1 = m.gy; first2 = m.gz;
+            second0 = m.ax; second1 = m.ay; second2 = m.az;
+        }
+
+        // ProInputReport30 is packed, so GCC does not allow binding its fields
+        // to int16_t&.  Assign fields directly instead.
+        if (idx == 0) {
+            dst.accel_x_0 = first0;  dst.accel_y_0 = first1;  dst.accel_z_0 = first2;
+            dst.gyro_x_0  = second0; dst.gyro_y_0  = second1; dst.gyro_z_0  = second2;
+        } else if (idx == 1) {
+            dst.accel_x_1 = first0;  dst.accel_y_1 = first1;  dst.accel_z_1 = first2;
+            dst.gyro_x_1  = second0; dst.gyro_y_1  = second1; dst.gyro_z_1  = second2;
+        } else {
+            dst.accel_x_2 = first0;  dst.accel_y_2 = first1;  dst.accel_z_2 = first2;
+            dst.gyro_x_2  = second0; dst.gyro_y_2  = second1; dst.gyro_z_2  = second2;
+        }
+    };
+
+    store_imu_sample(out, 0, imu[0]);
+    store_imu_sample(out, 1, imu[1]);
+    store_imu_sample(out, 2, imu[2]);
 }
 
 static int handle_subcommand(ControllerRuntime& rt, uint8_t subcmd, const uint8_t* cmd_data, size_t cmd_len, ProInputReport21* reply) {
@@ -1592,7 +1786,15 @@ static int handle_subcommand(ControllerRuntime& rt, uint8_t subcmd, const uint8_
         } else {
             memset(reply->reply_data + 5, 0xFF, size);
         }
-        if (g_verbose) std::printf("[pro%d] SPI read addr=0x%04X size=%u\n", rt.ctrl + 1, addr, size);
+        if (g_verbose) {
+            std::printf("[pro%d] SPI read addr=0x%04X size=%u", rt.ctrl + 1, addr, size);
+            if (addr == 0x6020 || addr == 0x8026 || addr == 0x8028 || addr == 0x6080 || addr == 0x6086 || addr == 0x6098) {
+                std::printf(" data=");
+                for (uint8_t i = 0; i < size && i < 32 && addr + i < SPI_FLASH_SIZE; ++i)
+                    std::printf("%02X%s", flash[addr + i], (i + 1 < size && i + 1 < 32 && addr + i + 1 < SPI_FLASH_SIZE) ? " " : "");
+            }
+            std::printf("\n");
+        }
         return 5 + size;
     }
 
@@ -1610,6 +1812,13 @@ static int handle_subcommand(ControllerRuntime& rt, uint8_t subcmd, const uint8_
         reply->reply_data[0] = cmd_len > 0 ? cmd_data[0] : 0;
         return 1;
 
+    case 0x33:
+        // Chromium sends this as an acknowledged no-op immediately after
+        // disabling the USB timeout. Real hardware accepts it as a normal
+        // subcommand; treating it as failure can stall init sequences.
+        reply->ack = 0x80;
+        return 0;
+
     case CMD_ENABLE_IMU:
         rt.imu_enabled = (cmd_len == 0) || cmd_data[0] != 0;
         reply->ack = 0x80;
@@ -1623,7 +1832,10 @@ static int handle_subcommand(ControllerRuntime& rt, uint8_t subcmd, const uint8_
         return 1;
 
     default:
-        reply->ack = 0x00;
+        // Real controllers tend to ACK unknown-but-well-formed subcommands
+        // rather than poison the init state machine. Keep success ACK so the
+        // Switch can continue if it sends a harmless command we do not parse.
+        reply->ack = 0x80;
         return 0;
     }
 }
@@ -1922,8 +2134,8 @@ static bool setup_gadget_builtin(bool force, const char* reason) {
         return false;
     }
 
-    std::printf("[gadget] %s; creating built-in 4-Pro-Controller gadget\n",
-                reason ? reason : "HID gadget not ready");
+    std::printf("[gadget] %s; creating built-in %d-Pro-Controller gadget\n",
+                reason ? reason : "HID gadget not ready", g_hid_port_count);
 
     // Try to load and mount configfs.  Ignore failures here because both may
     // already be active on systems that previously used setup_gadget.sh.
@@ -1973,7 +2185,7 @@ static bool setup_gadget_builtin(bool force, const char* reason) {
     if (!write_text_file(join_path(GADGET_DIR, "bDeviceProtocol").c_str(), "0x00")) return false;
 
     // USB descriptor serial belongs here, not in the controller SPI area.
-    if (!write_text_file(join_path(strings_dir, "serialnumber").c_str(), "000000000001")) return false;
+    if (!write_text_file(join_path(strings_dir, "serialnumber").c_str(), g_usb_serial.c_str())) return false;
     if (!write_text_file(join_path(strings_dir, "manufacturer").c_str(), "Nintendo Co., Ltd.")) return false;
     if (!write_text_file(join_path(strings_dir, "product").c_str(), "Pro Controller")) return false;
 
@@ -2053,6 +2265,10 @@ static void writer_thread(int hz) {
                     rt[i].fd = fds[i];
                     rt[i].timer = 0;
                     rt[i].full_report_enabled = false;
+                    rt[i].usb_seen_mac = false;
+                    rt[i].usb_handshake_done = false;
+                    rt[i].usb_baudrate_set = false;
+                    rt[i].usb_timeout_disabled = false;
                     rt[i].pending_subcmd_reply = false;
                     rt[i].last_standard_report_us = 0;
                     rt[i].last_idle_neutral_us = 0;
@@ -2306,6 +2522,16 @@ static void writer_thread(int hz) {
                                               pro_timer_from_us(now_stamp),
                                               std_in);
                         memcpy(write_buf, &std_in, sizeof(ProInputReport30));
+                        if (g_verbose && g_log_raw_30) {
+                            static uint64_t last_raw30_log_us = 0;
+                            if (last_raw30_log_us == 0 || elapsed_us_saturated(now_stamp, last_raw30_log_us) > 250000ULL) {
+                                last_raw30_log_us = now_stamp;
+                                std::printf("[raw30] ");
+                                for (int bi = 0; bi < PRO_REPORT_SIZE; ++bi)
+                                    std::printf("%02X%s", write_buf[bi], bi + 1 < PRO_REPORT_SIZE ? " " : "");
+                                std::printf("\n");
+                            }
+                        }
                         have_report_to_write = true;
 
                         if (port_needed || release_burst)
@@ -2371,22 +2597,28 @@ static void writer_thread(int hz) {
                         if (hw_slots[h].client_idx != -1)
                             publish_rumble_event(hw_slots[h].client_idx, hw_slots[h].sub_idx, read_buf, r, true);
                     } else if (id == 0x80) {
+                        const uint8_t usb_cmd = read_buf[1];
                         uint8_t resp_81[PRO_REPORT_SIZE] = {};
-                        resp_81[0] = 0x81;
-                        resp_81[1] = read_buf[1];
-                        resp_81[2] = 0x00;
-                        resp_81[3] = 0x03;
-                        set_identity_in_0x81(resp_81, h);
-                        if (read_buf[1] == 0x04) rt[h].full_report_enabled = true;
-                        if (read_buf[1] == 0x05) {
-                            rt[h].full_report_enabled = false;
-                            rt[h].imu_enabled = false;
-                            rt[h].vibration_enabled = false;
+                        build_usb_81_response(resp_81, usb_cmd, h);
+
+                        switch (usb_cmd) {
+                        case 0x01: rt[h].usb_seen_mac = true; break;
+                        case 0x02: rt[h].usb_handshake_done = true; break;
+                        case 0x03: rt[h].usb_baudrate_set = true; break;
+                        case 0x04: rt[h].usb_timeout_disabled = true; break;
+                        case 0x05: rt[h].usb_timeout_disabled = false; break;
+                        default: break;
                         }
+
                         ssize_t w = write(fds[h], resp_81, PRO_REPORT_SIZE);
                         if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) ok = false;
-                        if (g_verbose)
-                            std::printf("[pro%d] init ACK cmd=0x%02X\n", h + 1, read_buf[1]);
+                        if (g_verbose) {
+                            std::printf("[pro%d] usb 0x80 cmd=0x%02X -> 0x81 subtype=0x%02X mac=%02X:%02X:%02X:%02X:%02X:%02X timeout=%s\n",
+                                        h + 1, usb_cmd, resp_81[1],
+                                        CTRL_MAC_BE[h][0], CTRL_MAC_BE[h][1], CTRL_MAC_BE[h][2],
+                                        CTRL_MAC_BE[h][3], CTRL_MAC_BE[h][4], CTRL_MAC_BE[h][5],
+                                        rt[h].usb_timeout_disabled ? "disabled" : "enabled");
+                        }
                     } else {
                         if (g_verbose && id != 0x00)
                             std::printf("[pro%d] unknown output report id=0x%02X len=%zd\n", h + 1, id, r);
@@ -2621,15 +2853,11 @@ static const char INDEX_HTML[] =
     "    <div id=\"macroOverlay\" style=\"display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); justify-content:center; align-items:center; z-index:10001;\">\n"
     "        <div style=\"background:white; color:#1A1A1A; padding:18px; border-radius:8px; width:90%; max-width:520px; box-shadow:0 4px 12px rgba(0,0,0,0.25);\">\n"
     "            <h3 style=\"margin-top:0; color:#CC0000;\">Macros</h3>\n"
-    "            <select id=\"macroSelect\" style=\"width:100%; margin-bottom:8px;\"></select>\n"
-    "            <textarea id=\"macroText\" rows=\"5\" style=\"width:100%; box-sizing:border-box; font-family:Consolas,monospace;\" placeholder='{\"name\":\"Boost\",\"commands\":\"WAIT 200; A 100; B 100\"}'></textarea>\n"
-    "            <div style=\"font-size:12px; margin-top:6px; color:#8a5a00;\">Macro hotkeys must not reuse keys already bound in Keyboard Bindings.</div>\n"
-    "            <div style=\"margin-top:6px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;\"><label style=\"font-size:12px;\">Hotkey:</label><input id=\"macroHotkey\" placeholder=\"Click and press key\" style=\"width:150px;\" readonly><button id=\"btnMacroClearHotkey\">Clear Hotkey</button></div>\n"
+    "            <div id=\"macroRows\" style=\"min-height:28px; margin-bottom:12px;\"></div>\n"
     "            <input id=\"macroImportFile\" type=\"file\" accept=\"application/json,.json\" style=\"display:none\">\n"
-    "            <div style=\"display:flex; flex-wrap:wrap; gap:8px; margin-top:10px;\">\n"
-    "                <button id=\"btnMacroRun\">Run</button><button id=\"btnMacroSave\">Save/Add JSON</button><button id=\"btnMacroDelete\">Delete</button>\n"
-    "                <button id=\"btnMacroImport\">Import JSON</button><button id=\"btnMacroExport\">Export JSON</button>\n"
-    "                <button id=\"btnMacroRecord\">Record</button><button id=\"btnMacroClose\">Close</button>\n"
+    "            <div style=\"display:grid; grid-template-columns:88px 1fr 88px; gap:8px; margin-top:10px;\">\n"
+    "                <button id=\"btnMacroImport\">Import</button><button id=\"btnMacroRecord\" style=\"grid-column:3;\">Record P1</button>\n"
+    "                <button id=\"btnMacroExport\">Export</button><button id=\"btnMacroClose\" style=\"grid-column:3;\">Close</button>\n"
     "            </div>\n"
     "        </div>\n"
     "    </div>\n"
@@ -2689,6 +2917,8 @@ static const char INDEX_HTML[] =
     "document.getElementById('kbMode').onchange = (e) => localStorage.setItem('nswc_mode', e.target.value);\n"
     "window.addEventListener('keydown', (e) => {\n"
     "    if (activeBindKey) { e.preventDefault(); remapKey(e.code); return; }\n"
+    "    const m = savedMacros.find(x => normalizeMacroKey(x.hotkey) && normalizeMacroKey(x.hotkey) === normalizeMacroKey(e.code));\n"
+    "    if (m && !macroHotkeyConflicts(e.code, savedMacros.indexOf(m))) { e.preventDefault(); runMacroServerSide(m); return; }\n"
     "    if (!['INPUT','TEXTAREA','SELECT','BUTTON'].includes((e.target && e.target.tagName) || '')) e.preventDefault();\n"
     "    keysDown.add(e.code);\n"
     "});\n"
@@ -2946,6 +3176,7 @@ static const char INDEX_HTML[] =
     "    return `${proto}//${window.location.host}/`;\n"
     "}\n"
     "let savedMacros = JSON.parse(localStorage.getItem('nswc_macros') || '[]');\n"
+    "if (savedMacros && Array.isArray(savedMacros.macros)) savedMacros = savedMacros.macros; if (!Array.isArray(savedMacros)) savedMacros = [];\n"
     "let macroRunning = false, macroSteps = [], macroStepIndex = 0, macroStepUntil = 0, macroState = null;\n"
     "let macroRecording = false, macroRecordLast = null, macroRecordSince = 0, macroRecorded = [];\n"
     "function macroBtnBit(name) {\n"
@@ -2958,6 +3189,9 @@ static const char INDEX_HTML[] =
     "    const names = [['Y',BTN_Y],['B',BTN_B],['A',BTN_A],['X',BTN_X],['L',BTN_L],['R',BTN_R],['ZL',BTN_ZL],['ZR',BTN_ZR],['MINUS',BTN_MINUS],['PLUS',BTN_PLUS],['LSTICK',BTN_LSTICK],['RSTICK',BTN_RSTICK],['HOME',BTN_HOME],['CAPTURE',BTN_CAPTURE]];\n"
     "    return names.filter(x => buttons & x[1]).map(x => x[0]).join('+') || 'WAIT';\n"
     "}\n"
+    "function macroFrameFromState(s) { const axis=v=>v<80?-1:(v>176?1:0); s=s||getNeutralState(); return {buttons:s.buttons||0, hat:s.hat, lx:axis(s.lx), ly:axis(s.ly), rx:axis(s.rx), ry:axis(s.ry)}; }\n"
+    "function macroFrameEqual(a,b) { return !!a && !!b && a.buttons===b.buttons && a.hat===b.hat && a.lx===b.lx && a.ly===b.ly && a.rx===b.rx && a.ry===b.ry; }\n"
+    "function macroFrameToText(f) { const parts=[]; const btn=macroButtonsToText(f.buttons); if(btn!=='WAIT') parts.push(btn); if(f.hat===HAT_N) parts.push('DPAD_UP'); else if(f.hat===HAT_NE) parts.push('DPAD_UP','DPAD_RIGHT'); else if(f.hat===HAT_E) parts.push('DPAD_RIGHT'); else if(f.hat===HAT_SE) parts.push('DPAD_DOWN','DPAD_RIGHT'); else if(f.hat===HAT_S) parts.push('DPAD_DOWN'); else if(f.hat===HAT_SW) parts.push('DPAD_DOWN','DPAD_LEFT'); else if(f.hat===HAT_W) parts.push('DPAD_LEFT'); else if(f.hat===HAT_NW) parts.push('DPAD_UP','DPAD_LEFT'); if(f.lx<0) parts.push('LSTICK_LEFT'); else if(f.lx>0) parts.push('LSTICK_RIGHT'); if(f.ly<0) parts.push('LSTICK_UP'); else if(f.ly>0) parts.push('LSTICK_DOWN'); if(f.rx<0) parts.push('RSTICK_LEFT'); else if(f.rx>0) parts.push('RSTICK_RIGHT'); if(f.ry<0) parts.push('RSTICK_UP'); else if(f.ry>0) parts.push('RSTICK_DOWN'); return parts.join('+') || 'WAIT'; }\n"
     "function macroCommandString(objOrText) {\n"
     "    if (!objOrText) return '';\n"
     "    if (typeof objOrText === 'string') { try { return macroCommandString(JSON.parse(objOrText)); } catch(e) { return objOrText; } }\n"
@@ -2968,30 +3202,33 @@ static const char INDEX_HTML[] =
     "const MACRO_JSON_MAX_BYTES = 50 * 1024 * 1024;\n"
     "const MACRO_VALID_INPUTS = new Set(['A','B','X','Y','L','R','ZL','ZR','MINUS','-','PLUS','+','LSTICK','LS','RSTICK','RS','HOME','CAPTURE','DPAD_UP','DPAD_DOWN','DPAD_LEFT','DPAD_RIGHT','UP','DOWN','LEFT','RIGHT','LSTICK_UP','LSTICK_DOWN','LSTICK_LEFT','LSTICK_RIGHT','LS_UP','LS_DOWN','LS_LEFT','LS_RIGHT','RSTICK_UP','RSTICK_DOWN','RSTICK_LEFT','RSTICK_RIGHT','RS_UP','RS_DOWN','RS_LEFT','RS_RIGHT']);\n"
     "function macroCommandsArray(objOrText) { const obj = (typeof objOrText === 'string') ? (()=>{ try { return JSON.parse(objOrText); } catch(_) { return {commands:objOrText}; } })() : objOrText; const c = obj && obj.commands !== undefined ? obj.commands : objOrText; if (Array.isArray(c)) return c.map(String); if (typeof c === 'string') return c.split(/[;\\n\\r]+/).map(x=>x.trim()).filter(Boolean); throw new Error('commands must be a string or array of strings'); }\n"
-    "function validateMacro(objOrText) { const lines = macroCommandsArray(objOrText); if (!lines.length) throw new Error('no macro commands found'); for (const line of lines) { const m = line.trim().match(/^(.*?)\\s+(\\d+)$/); if (!m) throw new Error('missing duration: '+line); const cmd=m[1].trim(), ms=Number(m[2]); if (!Number.isSafeInteger(ms) || ms <= 0 || ms > 4294967295) throw new Error('invalid duration: '+line); if (cmd.toUpperCase()==='WAIT') continue; const toks=cmd.split(/[+,|\\s]+/).filter(Boolean); if (!toks.length) throw new Error('missing input: '+line); const seen=new Set(); for (const t0 of toks) { const t=t0.toUpperCase(); if (!MACRO_VALID_INPUTS.has(t)) throw new Error('unknown input '+t0+' in '+line); seen.add(t); } const has=(...xs)=>xs.some(x=>seen.has(x)); if (has('DPAD_UP','UP')&&has('DPAD_DOWN','DOWN')) throw new Error('DPAD up/down conflict: '+line); if (has('DPAD_LEFT','LEFT')&&has('DPAD_RIGHT','RIGHT')) throw new Error('DPAD left/right conflict: '+line); if (has('LSTICK_UP','LS_UP')&&has('LSTICK_DOWN','LS_DOWN')) throw new Error('left stick up/down conflict: '+line); if (has('LSTICK_LEFT','LS_LEFT')&&has('LSTICK_RIGHT','LS_RIGHT')) throw new Error('left stick left/right conflict: '+line); if (has('RSTICK_UP','RS_UP')&&has('RSTICK_DOWN','RS_DOWN')) throw new Error('right stick up/down conflict: '+line); if (has('RSTICK_LEFT','RS_LEFT')&&has('RSTICK_RIGHT','RS_RIGHT')) throw new Error('right stick left/right conflict: '+line); } return lines; }\n"
+    "function validateMacro(objOrText) { const lines = macroCommandsArray(objOrText); if (!lines.length) throw new Error('no macro commands found'); for (const line of lines) { const m = line.trim().match(/^(.*?)\\s+(\\d+)$/); if (!m) throw new Error('missing duration: '+line); const cmd=m[1].trim(), ms=Number(m[2]); if (!Number.isSafeInteger(ms) || ms <= 0 || ms > 4294967295) throw new Error('invalid duration: '+line); if (cmd.toUpperCase()==='WAIT' || cmd.toUpperCase()==='LOOP') continue; const toks=cmd.split(/[+,|\\s]+/).filter(Boolean); if (!toks.length) throw new Error('missing input: '+line); const seen=new Set(); for (const t0 of toks) { const t=t0.toUpperCase(); if (!MACRO_VALID_INPUTS.has(t)) throw new Error('unknown input '+t0+' in '+line); seen.add(t); } const has=(...xs)=>xs.some(x=>seen.has(x)); if (has('DPAD_UP','UP')&&has('DPAD_DOWN','DOWN')) throw new Error('DPAD up/down conflict: '+line); if (has('DPAD_LEFT','LEFT')&&has('DPAD_RIGHT','RIGHT')) throw new Error('DPAD left/right conflict: '+line); if (has('LSTICK_UP','LS_UP')&&has('LSTICK_DOWN','LS_DOWN')) throw new Error('left stick up/down conflict: '+line); if (has('LSTICK_LEFT','LS_LEFT')&&has('LSTICK_RIGHT','LS_RIGHT')) throw new Error('left stick left/right conflict: '+line); if (has('RSTICK_UP','RS_UP')&&has('RSTICK_DOWN','RS_DOWN')) throw new Error('right stick up/down conflict: '+line); if (has('RSTICK_LEFT','RS_LEFT')&&has('RSTICK_RIGHT','RS_RIGHT')) throw new Error('right stick left/right conflict: '+line); } return lines; }\n"
+    "function macroPrettyObject(objOrText) { const lines=validateMacro(objOrText); const obj=(typeof objOrText==='string')?(()=>{try{return JSON.parse(objOrText);}catch(_){return {commands:objOrText};}})():objOrText; return {name:(obj&&obj.name)||'Macro', commands:lines}; }\n"
     "function parseMacro(objOrText) {\n"
     "    const text = macroCommandString(objOrText).replace(/[\\r\\n]+/g, ';');\n"
     "    const steps = [];\n"
-    "    for (const raw of text.split(';')) { const p = raw.trim(); if (!p) continue; const m = p.match(/^([^\\s]+)\\s+(\\d+)/); if (!m) continue; const cmd = m[1].toUpperCase(), ms = Math.max(1, parseInt(m[2], 10)); steps.push({buttons: cmd === 'WAIT' ? 0 : macroButtonsFromText(cmd), ms}); }\n"
+    "    let segmentStart = 0; const addStep = p => { const m = p.match(/^(.*?)\\s+(\\d+)$/); if (!m) return; const cmd = m[1].trim().toUpperCase(), ms = Math.max(1, parseInt(m[2], 10)); if (cmd === 'LOOP') { const block = steps.slice(segmentStart); for (let i=1; i<ms && steps.length<1000000; ++i) steps.push(...block.map(x=>({...x}))); segmentStart = steps.length; return; } const st = {...getNeutralState(), ms}; if (cmd !== 'WAIT') for (const t0 of cmd.split(/[+,|\\s]+/).filter(Boolean)) { const t=t0.toUpperCase(); st.buttons |= macroBtnBit(t); if (t==='DPAD_UP'||t==='UP') st.hat=HAT_N; else if (t==='DPAD_DOWN'||t==='DOWN') st.hat=HAT_S; else if (t==='DPAD_LEFT'||t==='LEFT') st.hat=HAT_W; else if (t==='DPAD_RIGHT'||t==='RIGHT') st.hat=HAT_E; else if (t==='LSTICK_UP'||t==='LS_UP') st.ly=0; else if (t==='LSTICK_DOWN'||t==='LS_DOWN') st.ly=255; else if (t==='LSTICK_LEFT'||t==='LS_LEFT') st.lx=0; else if (t==='LSTICK_RIGHT'||t==='LS_RIGHT') st.lx=255; else if (t==='RSTICK_UP'||t==='RS_UP') st.ry=0; else if (t==='RSTICK_DOWN'||t==='RS_DOWN') st.ry=255; else if (t==='RSTICK_LEFT'||t==='RS_LEFT') st.rx=0; else if (t==='RSTICK_RIGHT'||t==='RS_RIGHT') st.rx=255; } steps.push(st); };\n"
+    "    for (const raw of text.split(';')) { const p = raw.trim(); if (p) addStep(p); }\n"
     "    return steps;\n"
     "}\n"
-    "function currentMacroObjFromBox() { const raw = document.getElementById('macroText').value.trim(); try { return JSON.parse(raw); } catch(e) { return {name:'Custom', commands: raw}; } }\n"
-    "function persistMacros() { savedMacros = savedMacros.map(macroPrettyObject); localStorage.setItem('nswc_macros', JSON.stringify(savedMacros)); }\n"
-    "function refreshMacroList() {\n"
-    "    const sel = document.getElementById('macroSelect'); if (!sel) return; sel.innerHTML = '';\n"
-    "    savedMacros.forEach((m,i) => { const o=document.createElement('option'); o.value=i; o.textContent=m.name || `Macro ${i+1}`; sel.appendChild(o); });\n"
-    "    if (savedMacros.length) document.getElementById('macroText').value = macroPrettyJson(savedMacros[sel.value || 0]);\n"
-    "}\n"
+    "function normalizeMacroKey(k) { return String(k || '').trim().toUpperCase(); }\n"
+    "function macroEntryName(m,i) { return (m && m.name) || `Macro ${i+1}`; }\n"
+    "function uniqueMacroName(base) { base=String(base||'Recorded Macro').trim()||'Recorded Macro'; let n=base, s=2; while(savedMacros.some(m=>String(m.name||'').toUpperCase()===n.toUpperCase())) n=`${base} ${s++}`; return n; }\n"
+    "function macroPrettyEntry(obj) { const m=macroPrettyObject(obj); if (!m.name) m.name='Macro'; m.hotkey=normalizeMacroKey(obj && obj.hotkey); return m; }\n"
+    "function persistMacros() { savedMacros = savedMacros.map(macroPrettyEntry); localStorage.setItem('nswc_macros', JSON.stringify(savedMacros)); }\n"
+    "function macroEntriesExport(entries=savedMacros) { return JSON.stringify({macros:entries.map(macroPrettyEntry)}, null, 2); }\n"
+    "function macroHotkeyConflicts(code, skip=-1) { code=normalizeMacroKey(code); if (!code) return false; if (Object.values(currentBindings).includes(code)) return 'keyboard binding'; const dup=savedMacros.find((m,i)=>i!==skip && normalizeMacroKey(m.hotkey)===code); return dup ? (dup.name || 'another macro') : false; }\n"
+    "function refreshMacroList() { const rows=document.getElementById('macroRows'); if(!rows) return; rows.innerHTML=''; if(!savedMacros.length){ const e=document.createElement('div'); e.textContent='No macros'; e.style.cssText='text-align:center; width:250px; padding:4px;'; rows.appendChild(e); } savedMacros.forEach((m,i)=>{ const r=document.createElement('div'); r.style.cssText='display:grid; grid-template-columns:minmax(0,250px) 110px 68px 64px 64px; gap:4px; margin-bottom:4px;'; const add=(txt,fn)=>{const b=document.createElement('button'); b.textContent=txt; b.onclick=fn; r.appendChild(b);}; add(macroEntryName(m,i),()=>runMacroServerSide(m)); add(normalizeMacroKey(m.hotkey),()=>beginMacroHotkeyListen(i)); add('Rename',()=>renameMacro(i)); add('Export',()=>exportOneMacro(i)); add('Delete',()=>{savedMacros.splice(i,1); persistMacros(); refreshMacroList();}); rows.appendChild(r); }); }\n"
     "function startMacro(objOrText) { macroSteps = parseMacro(objOrText); if (!macroSteps.length) { alert('No usable macro commands. Example: WAIT 200; A 100; B 100'); return; } macroRunning = true; macroStepIndex = 0; macroState = getNeutralState(); macroStepUntil = performance.now(); }\n"
     "function updateMacroState() {\n"
     "    if (!macroRunning) return null; const now = performance.now();\n"
-    "    while (macroRunning && now >= macroStepUntil) { const st = macroSteps[macroStepIndex++]; if (!st) { macroRunning = false; macroState = getNeutralState(); return null; } macroState = {...getNeutralState(), buttons: st.buttons}; macroStepUntil = now + st.ms; }\n"
+    "    while (macroRunning && now >= macroStepUntil) { const st = macroSteps[macroStepIndex++]; if (!st) { macroRunning = false; macroState = getNeutralState(); return null; } macroState = {...getNeutralState(), ...st}; macroStepUntil = now + st.ms; }\n"
     "    return macroState;\n"
     "}\n"
     "function sampleMacroRecording(p1) {\n"
-    "    if (!macroRecording) return; const now = performance.now(); const buttons = p1 ? p1.buttons : 0;\n"
-    "    if (macroRecordLast === null) { macroRecordLast = buttons; macroRecordSince = now; return; }\n"
-    "    if (buttons !== macroRecordLast) { const dur = Math.max(1, Math.round(now - macroRecordSince)); macroRecorded.push(`${macroButtonsToText(macroRecordLast)} ${dur}`); macroRecordLast = buttons; macroRecordSince = now; }\n"
+    "    if (!macroRecording) return; const now = performance.now(); const frame = macroFrameFromState(p1);\n"
+    "    if (macroRecordLast === null) { macroRecordLast = frame; macroRecordSince = now; return; }\n"
+    "    if (!macroFrameEqual(frame, macroRecordLast)) { const dur = Math.max(1, Math.round(now - macroRecordSince)); macroRecorded.push(`${macroFrameToText(macroRecordLast)} ${dur}`); macroRecordLast = frame; macroRecordSince = now; }\n"
     "}\n"
 
     "function sendServerMacroChunks(payload, subpad=0) {\n"
@@ -3012,36 +3249,28 @@ static const char INDEX_HTML[] =
     "    if (ws && ws.readyState === WebSocket.OPEN) { try { sendServerMacroChunks(JSON.stringify(macroPrettyObject(obj))); return; } catch(err) { alert('Macro upload failed: '+err.message); return; } }\n"
     "    startMacro(obj); // fallback for old/offline servers\n"
     "}\n"
-    "function macroHotkeyConflicts(code) { return Object.values(currentBindings).includes(code); }\n"
-    "function currentSelectedMacro() { const i=parseInt(document.getElementById('macroSelect').value,10); return savedMacros[i] || currentMacroObjFromBox(); }\n"
-    "function saveMacroHotkey(code) {\n"
-    "    if (code && macroHotkeyConflicts(code)) { alert('That key is already used by Keyboard Bindings. Pick a different macro hotkey.'); return; }\n"
-    "    localStorage.setItem('nswc_macro_hotkey', code || ''); document.getElementById('macroHotkey').value = code || '';\n"
-    "}\n"
     "function exportMacrosJson() {\n"
-    "    const blob = new Blob([JSON.stringify(savedMacros.map(macroPrettyObject), null, 2)], {type:'application/json'});\n"
+    "    const blob = new Blob([macroEntriesExport()], {type:'application/json'});\n"
     "    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'ns-macros.json'; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href), 1000);\n"
     "}\n"
+    "function exportOneMacro(i) { const blob=new Blob([macroEntriesExport([savedMacros[i]])],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=`${macroEntryName(savedMacros[i],i).replace(/[\\\\/:*?\"<>|]/g,'_')}.json`; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }\n"
     "function importMacrosJsonText(txt) {\n"
-    "    let data = JSON.parse(txt); if (!Array.isArray(data)) data = [data];\n"
-    "    for (const m of data) if (m && (m.commands || typeof m === 'string')) { const obj = macroPrettyObject(typeof m === 'string' ? {name:`Macro ${savedMacros.length+1}`, commands:m} : m); validateMacro(obj); savedMacros.push(obj); }\n"
+    "    let data = JSON.parse(txt); let replace=false; if (data && Array.isArray(data.macros)) { data=data.macros; replace=true; } else if (!Array.isArray(data)) data=[data];\n"
+    "    const imported=[]; for (const m of data) if (m && (m.commands || typeof m === 'string')) { const obj=macroPrettyEntry(typeof m === 'string' ? {name:`Macro ${savedMacros.length+1}`, commands:m} : m); validateMacro(obj); imported.push(obj); }\n"
+    "    if (replace || imported.length > 1) savedMacros=imported; else if (imported.length) { const idx=savedMacros.findIndex(m=>String(m.name||'').toUpperCase()===String(imported[0].name||'').toUpperCase()); if(idx>=0) savedMacros[idx]=imported[0]; else savedMacros.push(imported[0]); }\n"
     "    persistMacros(); refreshMacroList();\n"
     "}\n"
+    "function beginMacroHotkeyListen(i) { const once=(ev)=>{ ev.preventDefault(); let code=ev.code==='Escape'?'':ev.code; const conflict=macroHotkeyConflicts(code,i); if(conflict){ alert('Macro keybind is already used by: '+conflict); } else { savedMacros[i].hotkey=code; persistMacros(); refreshMacroList(); } window.removeEventListener('keydown', once, true); }; window.addEventListener('keydown', once, true); }\n"
+    "function renameMacro(i) { const old=macroEntryName(savedMacros[i],i); const name=prompt('Macro name:', old); if(name===null) return; const n=name.trim(); if(!n){ alert('Macro name cannot be empty.'); return; } const dup=savedMacros.findIndex((m,j)=>j!==i && String(m.name||'').toUpperCase()===n.toUpperCase()); if(dup>=0){ alert('Another macro already uses that name.'); return; } savedMacros[i].name=n; savedMacros[i]=macroPrettyEntry(savedMacros[i]); persistMacros(); refreshMacroList(); }\n"
     "function wireMacroMenu() {\n"    "    const btn = document.getElementById('btnMacros'); if (!btn) return;\n"
-    "    btn.onclick = () => { refreshMacroList(); document.getElementById('macroHotkey').value = localStorage.getItem('nswc_macro_hotkey') || ''; document.getElementById('macroOverlay').style.display='flex'; };\n"
-    "    document.getElementById('macroSelect').onchange = e => { const m=savedMacros[parseInt(e.target.value,10)]; if (m) document.getElementById('macroText').value = JSON.stringify(m,null,2); };\n"
+    "    btn.onclick = () => { refreshMacroList(); document.getElementById('macroOverlay').style.display='flex'; };\n"
     "    document.getElementById('btnMacroClose').onclick = () => document.getElementById('macroOverlay').style.display='none';\n"
-    "    document.getElementById('btnMacroRun').onclick = () => runMacroServerSide(currentMacroObjFromBox());\n"
-    "    document.getElementById('btnMacroSave').onclick = () => { const m=currentMacroObjFromBox(); if (!m.name) m.name=`Macro ${savedMacros.length+1}`; try { validateMacro(m); savedMacros.push(m); persistMacros(); refreshMacroList(); } catch(err) { alert('Invalid macro: '+err.message); } };\n"
-    "    document.getElementById('btnMacroDelete').onclick = () => { const i=parseInt(document.getElementById('macroSelect').value,10); if (!isNaN(i)) { savedMacros.splice(i,1); persistMacros(); refreshMacroList(); } };\n"
     "    document.getElementById('btnMacroExport').onclick = exportMacrosJson;\n"
     "    document.getElementById('btnMacroImport').onclick = () => document.getElementById('macroImportFile').click();\n"
     "    document.getElementById('macroImportFile').onchange = e => { const f=e.target.files[0]; if(!f) return; if (f.size > MACRO_JSON_MAX_BYTES) { alert('Macro JSON exceeds the 50MB limit.'); e.target.value=''; return; } const r=new FileReader(); r.onload=()=>{ try{ importMacrosJsonText(String(r.result)); } catch(err){ alert('Invalid macro JSON: '+err.message); } }; r.readAsText(f); e.target.value=''; };\n"
-    "    document.getElementById('macroHotkey').onclick = () => { const input=document.getElementById('macroHotkey'); input.value='Press any key...'; const once=(ev)=>{ ev.preventDefault(); saveMacroHotkey(ev.code); window.removeEventListener('keydown', once, true); }; window.addEventListener('keydown', once, true); };\n"
-    "    document.getElementById('btnMacroClearHotkey').onclick = () => saveMacroHotkey('');\n"
     "    document.getElementById('btnMacroRecord').onclick = () => {\n"
-    "        if (!macroRecording) { macroRecording=true; macroRecordLast=null; macroRecorded=[]; document.getElementById('btnMacroRecord').innerText='Stop Recording'; }\n"
-    "        else { macroRecording=false; if (macroRecordLast !== null) macroRecorded.push(`${macroButtonsToText(macroRecordLast)} ${Math.max(1, Math.round(performance.now()-macroRecordSince))}`); document.getElementById('macroText').value=macroPrettyJson({name:`Recorded ${new Date().toLocaleTimeString()}`, commands:macroRecorded}); document.getElementById('btnMacroRecord').innerText='Record'; }\n"
+    "        if (!macroRecording) { macroRecording=true; macroRecordLast=null; macroRecorded=[]; document.getElementById('btnMacroRecord').innerText='Stop'; }\n"
+    "        else { macroRecording=false; if (macroRecordLast !== null) macroRecorded.push(`${macroFrameToText(macroRecordLast)} ${Math.max(1, Math.round(performance.now()-macroRecordSince))}`); if(macroRecorded.some(x=>!x.startsWith('WAIT '))) savedMacros.push(macroPrettyEntry({name:uniqueMacroName('Recorded Macro'), commands:macroRecorded})); persistMacros(); refreshMacroList(); document.getElementById('btnMacroRecord').innerText='Record P1'; }\n"
     "    };\n"
     "}\n"
     "function buildAndSendPacket() {\n"
@@ -4783,12 +5012,33 @@ int main(int argc, char** argv) {
         }
         else if (a == "--test-imu" && i+1 < argc) {
             if (!parse_imu_test(argv[++i])) {
-                std::fprintf(stderr, "Unknown --test-imu. Use: off, roll, pitch, yaw, shake\n");
+                std::fprintf(stderr, "Unknown --test-imu. Use: off, roll, pitch, yaw, shake, gentle\n");
                 return 1;
             }
         }
+        else if (a == "--imu-layout" && i+1 < argc) {
+            if (!parse_imu_layout(argv[++i])) {
+                std::fprintf(stderr, "Unknown --imu-layout. Use: accel-gyro or gyro-accel\n");
+                return 1;
+            }
+        }
+        else if (a == "--bat-con" && i+1 < argc) {
+            if (!parse_u8_arg(argv[++i], g_pro_bat_con)) {
+                std::fprintf(stderr, "Invalid --bat-con byte. Examples: 0x81, 0x91, 0x8E\n");
+                return 1;
+            }
+        }
+        else if ((a == "--vibrator-report" || a == "--vibrator-byte") && i+1 < argc) {
+            if (!parse_u8_arg(argv[++i], g_pro_vibrator_report)) {
+                std::fprintf(stderr, "Invalid --vibrator-report byte. Examples: 0x00, 0x80\n");
+                return 1;
+            }
+        }
+        else if (a == "--log-raw-30") g_log_raw_30 = true;
         else if (a == "--log-neutral-rumble") g_log_neutral_rumble = true;
         else if (a == "--test-rumble") g_test_rumble_on_connect = true;
+        else if (a == "--random-identity") g_random_identity = true;
+        else if (a == "--no-user-imu-cal") g_no_user_imu_cal = true;
         else if (a == "--gadget-pads" && i+1 < argc) {
             int n = std::atoi(argv[++i]);
             if (n < 1) n = 1;
@@ -4804,12 +5054,17 @@ int main(int argc, char** argv) {
         else if (a == "-h") {
             puts("ns-backend  [-p PORT] [-b ADDR] [--upnp] [-w [WEB_PORT]] [-v]");
             puts("            [--force-gadget-setup] [--no-auto-gadget] [--keep-gadget-on-exit] [--gadget-pads 1..4]");
+            puts("            [--random-identity]");
             puts("            [--client-timeout-ms MS] [--imu-map direct|invert-x|invert-y|invert-z|swap-yz|switch1|switch2|switch3]");
             puts("            [--pro-report-us US] [--test-imu off|roll|pitch|yaw|shake]");
-            puts("            [--log-neutral-rumble] [--test-rumble]");
+            puts("            [--log-neutral-rumble] [--test-rumble] [--no-user-imu-cal]");
             return 0;
         }
     }
+
+    if (g_random_identity)
+        randomize_controller_identity();
+    print_controller_identity();
 
     // Always recreate the built-in gadget at process startup when auto-gadget
     // mode is enabled.  This makes every launch self-healing: stale configfs
@@ -4822,10 +5077,13 @@ int main(int argc, char** argv) {
 
     derive_key(DEFAULT_SECRET, g_hmac_key);
     if (g_verbose)
-        std::printf("[pro] report interval=%llu us, imu-map=%s, imu-test=%s\n",
+        std::printf("[pro] report interval=%llu us, imu-map=%s, imu-layout=%s, imu-test=%s, bat_con=0x%02X, vibrator=0x%02X\n",
                     (unsigned long long)g_pro_report_interval_us,
                     imu_map_name(g_imu_map),
-                    imu_test_name(g_imu_test));
+                    imu_layout_name(g_imu_layout),
+                    imu_test_name(g_imu_test),
+                    g_pro_bat_con,
+                    g_pro_vibrator_report);
     signal(SIGINT,  on_signal); signal(SIGTERM, on_signal); signal(SIGPIPE, SIG_IGN);
 
     if (do_upnp) upnp_add_mapping(port);
@@ -4851,13 +5109,15 @@ int main(int argc, char** argv) {
     std::printf("UDP %s:%u writer=%d Hz\n",
                 bind_addr.c_str(), port, WRITER_HZ);
     if (g_verbose) {
-        std::printf("[config] client_timeout=%.1fs stale_neutral=%.0fms imu_map=%s gadget_pads=%d neutral_rumble_log=%s test_rumble=%s\n",
+        std::printf("[config] client_timeout=%.1fs stale_neutral=%.0fms imu_map=%s gadget_pads=%d random_identity=%s neutral_rumble_log=%s test_rumble=%s no_user_imu_cal=%s\n",
                     (double)g_client_timeout_us / 1000000.0,
                     (double)CLIENT_STALE_NEUTRAL_US / 1000.0,
                     imu_map_name(g_imu_map),
                     g_hid_port_count,
+                    g_random_identity ? "yes" : "no",
                     g_log_neutral_rumble ? "yes" : "no",
-                    g_test_rumble_on_connect ? "yes" : "no");
+                    g_test_rumble_on_connect ? "yes" : "no",
+                    g_no_user_imu_cal ? "yes" : "no");
     }
 
     std::thread wt(writer_thread, WRITER_HZ);

@@ -90,7 +90,7 @@ Detailed guides and technical information are in our `docs/` folder:
 
 | Component | Technology |
 |---|---|
-| **Linux client** | [SDL2 GameController API](https://wiki.libsdl.org/SDL2) / [GTK3](https://docs.gtk.org/gtk3/) |
+| **Linux client** | [SDL3 Gamepad API](https://wiki.libsdl.org/SDL3) / [GTK3](https://docs.gtk.org/gtk3/) |
 | **Windows client** | [XInput](https://learn.microsoft.com/en-us/windows/win32/xinput/xinput-input-structures) / [Winsock2](https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-reference) / [MSVC](https://visualstudio.microsoft.com/) / [MinGW](https://www.mingw-w64.org/) |
 | **macOS client** | [GameController.framework](https://developer.apple.com/documentation/gamecontroller) / [Foundation](https://developer.apple.com/documentation/foundation) |
 | **Raspberry Pi server** | [Linux USB Gadget (configfs / libcomposite)](https://www.kernel.org/doc/html/latest/usb/gadget_configfs.html) / UDP sockets |

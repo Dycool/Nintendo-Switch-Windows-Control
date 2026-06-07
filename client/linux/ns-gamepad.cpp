@@ -1,11 +1,11 @@
 /// ns-gamepad.cpp  —  Linux frontend for the Switch wireless gamepad bridge
 ///
-/// Uses SDL2 GameController API for cross-platform controller support.
+/// Uses SDL3 Gamepad API for cross-platform controller support.
 /// Automatically detects Xbox, PlayStation, and generic controllers
 /// via USB or Bluetooth — no raw joystick API needed.
 ///
 /// Build:
-///   g++ -O3 -std=c++17 ns-gamepad.cpp -o ns-gamepad -lpthread -lSDL2
+///   g++ -O3 -std=c++17 ns-gamepad.cpp -o ns-gamepad -lpthread -lSDL3
 ///
 /// Usage:
 ///   ./ns-gamepad <RASPBERRY_PI_IP[:PORT]>
@@ -29,7 +29,89 @@
 #include <fstream>
 #include <sstream>
 #include <cctype>
-#include <SDL2/SDL.h>
+#include <SDL3/SDL.h>
+
+#define SDL_INIT_GAMECONTROLLER SDL_INIT_GAMEPAD
+#define SDL_CONTROLLER_BUTTON_A SDL_GAMEPAD_BUTTON_SOUTH
+#define SDL_CONTROLLER_BUTTON_B SDL_GAMEPAD_BUTTON_EAST
+#define SDL_CONTROLLER_BUTTON_X SDL_GAMEPAD_BUTTON_WEST
+#define SDL_CONTROLLER_BUTTON_Y SDL_GAMEPAD_BUTTON_NORTH
+#define SDL_CONTROLLER_BUTTON_LEFTSHOULDER SDL_GAMEPAD_BUTTON_LEFT_SHOULDER
+#define SDL_CONTROLLER_BUTTON_RIGHTSHOULDER SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER
+#define SDL_CONTROLLER_BUTTON_BACK SDL_GAMEPAD_BUTTON_BACK
+#define SDL_CONTROLLER_BUTTON_START SDL_GAMEPAD_BUTTON_START
+#define SDL_CONTROLLER_BUTTON_LEFTSTICK SDL_GAMEPAD_BUTTON_LEFT_STICK
+#define SDL_CONTROLLER_BUTTON_RIGHTSTICK SDL_GAMEPAD_BUTTON_RIGHT_STICK
+#define SDL_CONTROLLER_BUTTON_GUIDE SDL_GAMEPAD_BUTTON_GUIDE
+#define SDL_CONTROLLER_BUTTON_MISC1 SDL_GAMEPAD_BUTTON_MISC1
+#define SDL_CONTROLLER_BUTTON_DPAD_UP SDL_GAMEPAD_BUTTON_DPAD_UP
+#define SDL_CONTROLLER_BUTTON_DPAD_DOWN SDL_GAMEPAD_BUTTON_DPAD_DOWN
+#define SDL_CONTROLLER_BUTTON_DPAD_LEFT SDL_GAMEPAD_BUTTON_DPAD_LEFT
+#define SDL_CONTROLLER_BUTTON_DPAD_RIGHT SDL_GAMEPAD_BUTTON_DPAD_RIGHT
+#define SDL_CONTROLLER_AXIS_TRIGGERLEFT SDL_GAMEPAD_AXIS_LEFT_TRIGGER
+#define SDL_CONTROLLER_AXIS_TRIGGERRIGHT SDL_GAMEPAD_AXIS_RIGHT_TRIGGER
+#define SDL_CONTROLLER_AXIS_LEFTX SDL_GAMEPAD_AXIS_LEFTX
+#define SDL_CONTROLLER_AXIS_LEFTY SDL_GAMEPAD_AXIS_LEFTY
+#define SDL_CONTROLLER_AXIS_RIGHTX SDL_GAMEPAD_AXIS_RIGHTX
+#define SDL_CONTROLLER_AXIS_RIGHTY SDL_GAMEPAD_AXIS_RIGHTY
+#define SDL_TRUE true
+
+using SDL_GameController = SDL_Gamepad;
+
+static int SDL_NumJoysticks() {
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    SDL_free(ids);
+    return count;
+}
+
+static bool SDL_IsGameController(int index) {
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    SDL_free(ids);
+    return index >= 0 && index < count;
+}
+
+static SDL_JoystickID SDL_JoystickGetDeviceInstanceID(int index) {
+    int count = 0;
+    SDL_JoystickID* ids = SDL_GetGamepads(&count);
+    SDL_JoystickID id = (ids && index >= 0 && index < count) ? ids[index] : 0;
+    SDL_free(ids);
+    return id;
+}
+
+static SDL_GameController* SDL_GameControllerOpen(int index) {
+    SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(index);
+    return id ? SDL_OpenGamepad(id) : nullptr;
+}
+
+static SDL_Joystick* SDL_GameControllerGetJoystick(SDL_GameController* pad) { return SDL_GetGamepadJoystick(pad); }
+static SDL_JoystickID SDL_JoystickInstanceID(SDL_Joystick* js) { return SDL_GetJoystickID(js); }
+static const char* SDL_GameControllerName(SDL_GameController* pad) { return SDL_GetGamepadName(pad); }
+static bool SDL_GameControllerGetAttached(SDL_GameController* pad) { return SDL_GamepadConnected(pad); }
+static void SDL_GameControllerClose(SDL_GameController* pad) { SDL_CloseGamepad(pad); }
+static bool SDL_GameControllerGetButton(SDL_GameController* pad, SDL_GamepadButton b) { return SDL_GetGamepadButton(pad, b); }
+static Sint16 SDL_GameControllerGetAxis(SDL_GameController* pad, SDL_GamepadAxis a) { return SDL_GetGamepadAxis(pad, a); }
+static bool SDL_GameControllerHasSensor(SDL_GameController* pad, SDL_SensorType sensor) { return SDL_GamepadHasSensor(pad, sensor); }
+static int SDL_GameControllerSetSensorEnabled(SDL_GameController* pad, SDL_SensorType sensor, bool enabled) { return SDL_SetGamepadSensorEnabled(pad, sensor, enabled) ? 0 : -1; }
+static int SDL_GameControllerGetSensorData(SDL_GameController* pad, SDL_SensorType sensor, float* data, int count) { return SDL_GetGamepadSensorData(pad, sensor, data, count) ? 0 : -1; }
+static bool SDL_GameControllerHasRumble(SDL_GameController* pad) {
+    SDL_PropertiesID props = SDL_GetGamepadProperties(pad);
+    return props && (SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false) ||
+                     SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false));
+}
+static int SDL_GameControllerRumble(SDL_GameController* pad, uint16_t low, uint16_t high, uint32_t ms) {
+    const bool stop = (low == 0 && high == 0) || ms == 0;
+    bool ok_main = SDL_RumbleGamepad(pad, stop ? 0 : low, stop ? 0 : high, ms);
+    SDL_PropertiesID props = SDL_GetGamepadProperties(pad);
+    bool trigger_capable = props && SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
+    bool ok_trigger = true;
+    if (trigger_capable || !ok_main || stop) {
+        ok_trigger = SDL_RumbleGamepadTriggers(pad, stop ? 0 : low, stop ? 0 : high, ms);
+    }
+    return (ok_main || ok_trigger) ? 0 : -1;
+}
+static void SDL_GameControllerUpdate() { SDL_UpdateGamepads(); }
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -699,10 +781,10 @@ static bool send_macro_udp_packet(SockT sock, const sockaddr_in& dest, const uin
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Shared gamepad state (SDL2)
+//  Shared gamepad state (SDL3)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static SDL_GameController* g_pads[4] = {nullptr, nullptr, nullptr, nullptr};
+static SDL_Gamepad* g_pads[4] = {nullptr, nullptr, nullptr, nullptr};
 static bool g_pad_accel_enabled[4] = {false, false, false, false};
 static bool g_pad_gyro_enabled[4]  = {false, false, false, false};
 static bool g_legacy_udp = false;
@@ -767,14 +849,13 @@ uint8_t apply_deadzone(int16_t val, bool invert = false, int deadzone = 8000) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SDL2 Discovery, Input, Sensors, Rumble
+//  SDL3 Discovery, Input, Sensors, Rumble
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void enable_pad_sensors(int slot, SDL_GameController* pad) {
     g_pad_accel_enabled[slot] = false;
     g_pad_gyro_enabled[slot] = false;
 
-#if SDL_VERSION_ATLEAST(2, 0, 14)
     if (SDL_GameControllerHasSensor(pad, SDL_SENSOR_ACCEL)) {
         if (SDL_GameControllerSetSensorEnabled(pad, SDL_SENSOR_ACCEL, SDL_TRUE) == 0)
             g_pad_accel_enabled[slot] = true;
@@ -790,10 +871,6 @@ static void enable_pad_sensors(int slot, SDL_GameController* pad) {
                   << (g_pad_gyro_enabled[slot] ? " gyro" : "")
                   << "\n";
     }
-#else
-    (void)slot;
-    (void)pad;
-#endif
 }
 
 void scan_for_gamepads() {
@@ -845,6 +922,29 @@ void scan_for_gamepads() {
     }
 }
 
+static bool sdl_name_contains(SDL_GameController* pad, const char* needle) {
+    const char* raw = SDL_GameControllerName(pad);
+    std::string name = raw ? raw : "";
+    for (char& c : name) c = (char)std::toupper((unsigned char)c);
+    return name.find(needle) != std::string::npos;
+}
+
+static bool sdl_is_nintendo_like(SDL_GameController* pad) {
+    if (SDL_GetGamepadVendor(pad) == 0x057E) return true;
+    return sdl_name_contains(pad, "NINTENDO") ||
+           sdl_name_contains(pad, "SWITCH") ||
+           sdl_name_contains(pad, "JOY-CON") ||
+           sdl_name_contains(pad, "PRO CONTROLLER");
+}
+
+static bool sdl_should_use_combo_shortcuts(SDL_GameController* pad) {
+    if (sdl_is_nintendo_like(pad)) return false;
+    if (SDL_GetGamepadVendor(pad) == 0x045E) return true;
+    return sdl_name_contains(pad, "XBOX") ||
+           sdl_name_contains(pad, "XINPUT") ||
+           sdl_name_contains(pad, "MICROSOFT");
+}
+
 void read_pad(int index, ns::HIDReport& rep, bool& conn) {
     rep.reset();
     SDL_GameController* pad = g_pads[index];
@@ -878,11 +978,12 @@ void read_pad(int index, ns::HIDReport& rep, bool& conn) {
     if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSTICK))  rep.buttons |= ns::BTN_LSTICK;
     if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) rep.buttons |= ns::BTN_RSTICK;
     if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_GUIDE))   rep.buttons |= ns::BTN_HOME;
+    if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_MISC1))   rep.buttons |= ns::BTN_CAPTURE;
 
-    if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSTICK) && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) {
+    if (sdl_should_use_combo_shortcuts(pad) && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSTICK) && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSTICK)) {
         rep.buttons |= ns::BTN_HOME; rep.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK);
     }
-    if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START)) {
+    if (sdl_should_use_combo_shortcuts(pad) && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START)) {
         rep.buttons |= ns::BTN_CAPTURE; rep.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS);
     }
 
@@ -915,7 +1016,6 @@ static bool read_pad_motion(int index, ns::MotionReport& motion) {
     SDL_GameController* pad = g_pads[index];
     if (!pad) return false;
 
-#if SDL_VERSION_ATLEAST(2, 0, 14)
     bool any = false;
 
     if (g_pad_accel_enabled[index]) {
@@ -933,19 +1033,16 @@ static bool read_pad_motion(int index, ns::MotionReport& motion) {
     if (g_pad_gyro_enabled[index]) {
         float gyro[3] = {0, 0, 0};
         if (SDL_GameControllerGetSensorData(pad, SDL_SENSOR_GYRO, gyro, 3) == 0) {
-            // SDL gyro is rad/s.  Keep the scale conservative, matching the macOS client.
-            motion.gx = clamp_i16_from_float(gyro[0] * 1000.0f);
-            motion.gy = clamp_i16_from_float(gyro[1] * 1000.0f);
-            motion.gz = clamp_i16_from_float(gyro[2] * 1000.0f);
+            constexpr float RAD_TO_DEG = 57.29577951308232f;
+            constexpr float SWITCH_GYRO_SCALE = RAD_TO_DEG * 16.0f;
+            motion.gx = clamp_i16_from_float(gyro[0] * SWITCH_GYRO_SCALE);
+            motion.gy = clamp_i16_from_float(gyro[1] * SWITCH_GYRO_SCALE);
+            motion.gz = clamp_i16_from_float(gyro[2] * SWITCH_GYRO_SCALE);
             any = true;
         }
     }
 
     return any;
-#else
-    (void)index;
-    return false;
-#endif
 }
 
 static void set_pad_rumble(int index, uint8_t low, uint8_t high, uint32_t duration_ms) {
@@ -953,7 +1050,6 @@ static void set_pad_rumble(int index, uint8_t low, uint8_t high, uint32_t durati
     SDL_GameController* pad = g_pads[index];
     if (!pad) return;
 
-#if SDL_VERSION_ATLEAST(2, 0, 9)
     if (!SDL_GameControllerGetAttached(pad)) return;
     if (!SDL_GameControllerHasRumble(pad)) return;
 
@@ -966,11 +1062,6 @@ static void set_pad_rumble(int index, uint8_t low, uint8_t high, uint32_t durati
             warned = true;
         }
     }
-#else
-    (void)low;
-    (void)high;
-    (void)duration_ms;
-#endif
 }
 
 class RumbleManager {
@@ -1122,8 +1213,15 @@ int main(int argc, char** argv) {
     std::memcpy(&dest, res->ai_addr, sizeof(dest));
     freeaddrinfo(res);
 
-    // Initialise SDL2 GameController subsystem
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // Initialise SDL3 Gamepad subsystem.
+    SDL_SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI", "1");
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_SWITCH", "1");
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_JOY_CONS", "1");
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_PS4", "1");
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_PS5", "1");
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_XBOX", "1");
+    SDL_SetHint("SDL_JOYSTICK_ENHANCED_REPORTS", "1");
     Uint32 sdl_flags = SDL_INIT_GAMECONTROLLER;
 #ifdef SDL_INIT_SENSOR
     sdl_flags |= SDL_INIT_SENSOR;
@@ -1131,15 +1229,15 @@ int main(int argc, char** argv) {
 #ifdef SDL_INIT_HAPTIC
     sdl_flags |= SDL_INIT_HAPTIC;
 #endif
-    if (SDL_Init(sdl_flags) < 0) {
-        std::cerr << "Failed to initialise SDL2: " << SDL_GetError() << "\n";
+    if (!SDL_Init(sdl_flags)) {
+        std::cerr << "Failed to initialise SDL3: " << SDL_GetError() << "\n";
         close(sock); return 1;
     }
 
     if (g_legacy_udp)
         std::cout << "Legacy UDP mode: input only. UDP rumble and gyro are disabled.\n";
     else
-        std::cout << "Extended UDP mode: SDL rumble replies + SDL sensor gyro enabled where supported.\n";
+        std::cout << "Extended UDP mode: SDL3 rumble replies + SDL sensor gyro enabled where supported.\n";
 
     if (macro_mode) {
         std::string macro_raw = macro_read_file(macro_path);
