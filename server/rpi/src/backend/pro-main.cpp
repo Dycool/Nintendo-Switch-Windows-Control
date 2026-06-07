@@ -482,7 +482,7 @@ static std::string macro_read_file(const std::string& path) {
     return s;
 }
 
-static std::vector<ServerMacroStep> server_macro_load_file(const std::string& path) {
+[[maybe_unused]] static std::vector<ServerMacroStep> server_macro_load_file(const std::string& path) {
     std::string txt = macro_read_file(path);
     if (txt.empty()) return {};
     return server_macro_parse_text(txt);
@@ -545,7 +545,7 @@ static std::string macro_pretty_json(const std::string& raw_text, const std::str
     return out;
 }
 
-static bool macro_validate_to_pretty_json(const std::string& raw_text, std::string& pretty, std::string& err, const std::string& fallback_name = "Macro") {
+[[maybe_unused]] static bool macro_validate_to_pretty_json(const std::string& raw_text, std::string& pretty, std::string& err, const std::string& fallback_name = "Macro") {
     std::vector<ServerMacroStep> steps;
     if (!server_macro_validate_text(raw_text, steps, nullptr)) { err = macro_last_error(); return false; }
     pretty = macro_pretty_json(raw_text, fallback_name);
@@ -562,7 +562,7 @@ static uint64_t server_macro_total_ms(const std::vector<ServerMacroStep>& steps)
     return total;
 }
 
-static bool server_macro_report_at(const std::vector<ServerMacroStep>& steps, uint64_t elapsed_ms, HIDReport& out) {
+[[maybe_unused]] static bool server_macro_report_at(const std::vector<ServerMacroStep>& steps, uint64_t elapsed_ms, HIDReport& out) {
     out.reset();
     uint64_t t = 0;
     for (const auto& s : steps) {
@@ -835,7 +835,7 @@ static bool server_macro_start(int client_idx, int subpad, const std::string& js
     return true;
 }
 
-static void server_macro_stop_all_for_client(int client_idx) {
+[[maybe_unused]] static void server_macro_stop_all_for_client(int client_idx) {
     if (client_idx < 0 || client_idx >= MAX_CLIENTS) return;
     std::lock_guard<std::mutex> lk(g_server_macro_mtx);
     for (int s = 0; s < 4; ++s) g_server_macros[client_idx][s].running = false;
@@ -921,7 +921,7 @@ static const uint8_t CTRL_MAC_BE[4][6] = {
     {0x02, 0x4E, 0x53, 0x26, 0x06, 0xA3},
 };
 
-static const char* CTRL_SERIAL[4] = {
+[[maybe_unused]] static const char* CTRL_SERIAL[4] = {
     "NSGP260606A0", "NSGP260606A1", "NSGP260606A2", "NSGP260606A3"
 };
 
@@ -940,13 +940,13 @@ struct ControllerRuntime {
     ProInputReport21 pending_reply{};
 };
 
-static int16_t clamp_i16(int v) {
+[[maybe_unused]] static int16_t clamp_i16(int v) {
     if (v < -32768) return -32768;
     if (v >  32767) return  32767;
     return (int16_t)v;
 }
 
-static void pack12(uint16_t val, uint8_t& b0, uint8_t& b1) {
+[[maybe_unused]] static void pack12(uint16_t val, uint8_t& b0, uint8_t& b1) {
     b0 = val & 0xFF;
     b1 = (b1 & 0xF0) | ((val >> 8) & 0x0F);
 }
@@ -1541,6 +1541,11 @@ static void teardown_gadget() {
     std::puts("[gadget] USB gadget closed");
 }
 
+static int run_shell_best_effort(const char* cmd) {
+    int rc = std::system(cmd);
+    return rc;
+}
+
 static bool setup_gadget_builtin(bool force, const char* reason) {
     if (!g_auto_gadget_setup && !force)
         return hidg_nodes_ready();
@@ -1568,8 +1573,8 @@ static bool setup_gadget_builtin(bool force, const char* reason) {
 
     // Try to load and mount configfs.  Ignore failures here because both may
     // already be active on systems that previously used setup_gadget.sh.
-    std::system("modprobe libcomposite >/dev/null 2>&1 || true");
-    std::system("mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config >/dev/null 2>&1 || true");
+    (void)run_shell_best_effort("modprobe libcomposite >/dev/null 2>&1 || true");
+    (void)run_shell_best_effort("mountpoint -q /sys/kernel/config || mount -t configfs none /sys/kernel/config >/dev/null 2>&1 || true");
 
     if (!dir_exists("/sys/kernel/config/usb_gadget")) {
         std::fprintf(stderr,
