@@ -57,6 +57,9 @@ static constexpr uint64_t CLIENT_STALE_NEUTRAL_US = 350'000ULL; // 350ms release
 // receive micro-rumble too.  all-zero per-motor frames are motor-off, not max.
 static constexpr uint8_t RUMBLE_MIN_NONZERO = 4;      // floor for a real non-neutral half-frame
 static constexpr int     RUMBLE_GAIN_PERCENT = 100;
+// Keep the integrated precision/HD rumble path intact. The Windows client can
+// consume the backend's precision rumble packets, so do not collapse everything
+// into generic SDL/Web weak/strong rumble here.
 static std::string g_usb_serial = "NSBRIDGE000001";
 
 // Built-in USB gadget lifecycle.  ns-backend can now create/bind the
@@ -147,11 +150,51 @@ static void clear_all_motion_history(ClientSession& c) {
     for (int s = 0; s < 4; ++s) clear_motion_history(c, s);
 }
 
+static int16_t motion_clamp_i16(int v) {
+    if (v < -32768) return -32768;
+    if (v >  32767) return  32767;
+    return (int16_t)v;
+}
+
+static int16_t gyro_deadzone_i16(int16_t v) {
+    // Real Pro Controller via the Windows client should be near zero at rest.
+    // Splatoon is very sensitive to tiny gyro noise, so kill only small angular
+    // velocity jitter. Do not deadzone accel: it carries gravity/orientation.
+    static constexpr int GYRO_DEADZONE = 80;
+    return std::abs((int)v) < GYRO_DEADZONE ? 0 : v;
+}
+
+static int16_t gyro_smooth_i16(int16_t prev, int16_t cur) {
+    // Light low-pass: enough to stop camera buzz, not enough to make aiming laggy.
+    // new = 65%, previous = 35%
+    return motion_clamp_i16(((int)prev * 35 + (int)cur * 65) / 100);
+}
+
+static MotionReport stabilize_real_pro_motion_sample(const ClientSession& c, int subpad, const MotionReport& raw) {
+    MotionReport m = raw;
+
+    // Keep accel raw. In the good captures and SDL logs, accel magnitude around
+    // 1g is already sane (~4096), so changing accel tends to hurt orientation.
+    m.gx = gyro_deadzone_i16(m.gx);
+    m.gy = gyro_deadzone_i16(m.gy);
+    m.gz = gyro_deadzone_i16(m.gz);
+
+    if (subpad >= 0 && subpad < 4 && c.motion_history_count[subpad] > 0) {
+        const MotionReport& prev = c.motion_history[subpad][0];
+        m.gx = gyro_smooth_i16(prev.gx, m.gx);
+        m.gy = gyro_smooth_i16(prev.gy, m.gy);
+        m.gz = gyro_smooth_i16(prev.gz, m.gz);
+    }
+
+    return m;
+}
+
 static void push_motion_history(ClientSession& c, int subpad, const MotionReport& motion) {
     if (subpad < 0 || subpad >= 4) return;
+    MotionReport stable = stabilize_real_pro_motion_sample(c, subpad, motion);
     c.motion_history[subpad][2] = c.motion_history[subpad][1];
     c.motion_history[subpad][1] = c.motion_history[subpad][0];
-    c.motion_history[subpad][0] = motion;
+    c.motion_history[subpad][0] = stable;
     if (c.motion_history_count[subpad] < 3) c.motion_history_count[subpad]++;
 }
 
