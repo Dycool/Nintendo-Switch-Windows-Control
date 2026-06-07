@@ -383,24 +383,112 @@ static bool macro_parse_one_command(const std::string& part, MacroStep& st, std:
 }
 
 static bool macro_validate_text(const std::string& raw_text, std::vector<MacroStep>& steps, std::vector<std::string>* normalized = nullptr) {
+    static constexpr size_t MACRO_EXPANDED_STEP_LIMIT = 1000000;
+
     g_macro_last_error.clear();
     steps.clear();
     if (normalized) normalized->clear();
+
     std::string text, err;
-    if (!macro_extract_commands_text(raw_text, text, err)) { macro_set_error(err); return false; }
-    for (char& c : text) if (c == '\n' || c == '\r') c = ';';
+    if (!macro_extract_commands_text(raw_text, text, err)) {
+        macro_set_error(err);
+        return false;
+    }
+
+    for (char& c : text) {
+        if (c == '\n' || c == '\r') c = ';';
+    }
+
+    std::vector<std::string> parts;
     size_t pos = 0;
     while (pos < text.size()) {
         size_t semi = text.find(';', pos);
-        std::string part = macro_trim(text.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos));
+        std::string part = macro_trim(text.substr(
+            pos,
+            semi == std::string::npos ? std::string::npos : semi - pos
+        ));
         pos = (semi == std::string::npos) ? text.size() : semi + 1;
-        if (part.empty()) continue;
-        MacroStep st;
-        if (!macro_parse_one_command(part, st, err)) { macro_set_error(err); return false; }
-        steps.push_back(st);
+
+        // Allow readable macro files:
+        //   # drift wiggle
+        //   R+LSTICK_LEFT 450
+        if (part.empty() || part[0] == '#') continue;
+
+        parts.push_back(part);
         if (normalized) normalized->push_back(part);
     }
-    if (steps.empty()) { macro_set_error("no valid macro commands found"); return false; }
+
+    if (parts.empty()) {
+        macro_set_error("no valid macro commands found");
+        return false;
+    }
+
+    auto append_segment = [&](const std::vector<MacroStep>& segment, uint32_t repeat_count) -> bool {
+        if (segment.empty()) {
+            macro_set_error("LOOP has no commands to repeat");
+            return false;
+        }
+        if (repeat_count == 0) {
+            macro_set_error("LOOP count must be greater than zero");
+            return false;
+        }
+        if (segment.size() > 0 && repeat_count > MACRO_EXPANDED_STEP_LIMIT / segment.size()) {
+            macro_set_error("macro expands to too many steps");
+            return false;
+        }
+        if (steps.size() + segment.size() * (size_t)repeat_count > MACRO_EXPANDED_STEP_LIMIT) {
+            macro_set_error("macro expands to too many steps");
+            return false;
+        }
+        for (uint32_t r = 0; r < repeat_count; ++r) {
+            steps.insert(steps.end(), segment.begin(), segment.end());
+        }
+        return true;
+    };
+
+    std::vector<MacroStep> segment;
+    for (const std::string& part : parts) {
+        size_t last_space = part.find_last_of(" \t");
+        if (last_space == std::string::npos) {
+            macro_set_error("missing duration in command: " + part);
+            return false;
+        }
+
+        std::string cmd = macro_upper(macro_trim(part.substr(0, last_space)));
+        if (cmd == "LOOP") {
+            uint32_t repeat_count = 0;
+            std::string count_s = macro_trim(part.substr(last_space + 1));
+            if (!macro_parse_uint32_strict(count_s, repeat_count)) {
+                macro_set_error("invalid LOOP count in command: " + part);
+                return false;
+            }
+
+            // LOOP n repeats the block since the start or previous LOOP, n total times.
+            if (!append_segment(segment, repeat_count)) return false;
+            segment.clear();
+            continue;
+        }
+
+        MacroStep st;
+        if (!macro_parse_one_command(part, st, err)) {
+            macro_set_error(err);
+            return false;
+        }
+        segment.push_back(st);
+    }
+
+    if (!segment.empty()) {
+        if (steps.size() + segment.size() > MACRO_EXPANDED_STEP_LIMIT) {
+            macro_set_error("macro expands to too many steps");
+            return false;
+        }
+        steps.insert(steps.end(), segment.begin(), segment.end());
+    }
+
+    if (steps.empty()) {
+        macro_set_error("no valid macro commands found");
+        return false;
+    }
     return true;
 }
 
@@ -1051,10 +1139,24 @@ static std::string g_macroRecordCommands;
 
 static NSString* const kMacroDefaultsKey = @"macrosJson";
 
+static NSString* const kMacroHotkeyDefaultsKey = @"macroHotkey";
+static std::mutex g_macroHotkeyMutex;
+static std::string g_macroHotkey;
+static bool g_macroHotkeyLastDown = false;
+
+static bool mac_key_down(const std::string& name);
+
+static std::string NormalizeMacroKeyMac(std::string s) {
+    return macro_upper(macro_trim(s));
+}
+
+
 static std::string LoadMacroTextMac() {
     NSString* saved = [[NSUserDefaults standardUserDefaults] stringForKey:kMacroDefaultsKey];
     if (!saved) return std::string();
-    return std::string([saved UTF8String]);
+    std::string out([saved UTF8String]);
+    if (out.size() > MACRO_JSON_MAX_BYTES) return std::string();
+    return out;
 }
 
 static void ShowMacroErrorMac(const std::string& msg) {
@@ -1066,6 +1168,100 @@ static void ShowMacroErrorMac(const std::string& msg) {
         [a runModal];
     });
 }
+
+static bool StartMacroTextMac(const std::string& txt);
+
+static bool ReadMacroURLLimitedMac(NSURL* url, std::string& out, std::string& err) {
+    out.clear();
+    err.clear();
+    if (!url) { err = "No file selected."; return false; }
+
+    NSNumber* fileSize = nil;
+    NSError* sizeErr = nil;
+    if ([url getResourceValue:&fileSize forKey:NSURLFileSizeKey error:&sizeErr] && fileSize) {
+        unsigned long long bytes = [fileSize unsignedLongLongValue];
+        if (bytes > MACRO_JSON_MAX_BYTES) {
+            err = "Macro JSON exceeds the 50MB limit.";
+            return false;
+        }
+    }
+
+    NSError* readErr = nil;
+    NSData* data = [NSData dataWithContentsOfURL:url options:0 error:&readErr];
+    if (!data) {
+        err = readErr ? std::string([[readErr localizedDescription] UTF8String]) : "Could not read macro file.";
+        return false;
+    }
+    if ([data length] > MACRO_JSON_MAX_BYTES) {
+        err = "Macro JSON exceeds the 50MB limit.";
+        return false;
+    }
+    out.assign((const char*)[data bytes], (size_t)[data length]);
+    return true;
+}
+
+static std::string LoadMacroHotkeyMac() {
+    std::lock_guard<std::mutex> lk(g_macroHotkeyMutex);
+    if (!g_macroHotkey.empty()) return g_macroHotkey;
+    NSString* saved = [[NSUserDefaults standardUserDefaults] stringForKey:kMacroHotkeyDefaultsKey];
+    if (!saved) return std::string();
+    g_macroHotkey = NormalizeMacroKeyMac(std::string([saved UTF8String]));
+    return g_macroHotkey;
+}
+
+static bool MacroHotkeyConflictsMac(const std::string& hotkey, const std::unordered_map<std::string, std::string>& bindings, std::string* conflict_name = nullptr) {
+    std::string hk = NormalizeMacroKeyMac(hotkey);
+    if (hk.empty()) return false;
+    for (const auto& kv : bindings) {
+        if (NormalizeMacroKeyMac(kv.second) == hk) {
+            if (conflict_name) *conflict_name = kv.first;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool SaveMacroHotkeyMac(const std::string& hotkey_raw, const std::unordered_map<std::string, std::string>& bindings) {
+    std::string hk = NormalizeMacroKeyMac(hotkey_raw);
+    std::string conflict;
+    if (MacroHotkeyConflictsMac(hk, bindings, &conflict)) {
+        ShowMacroErrorMac("Macro hotkey conflicts with keyboard binding: " + conflict);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_macroHotkeyMutex);
+        g_macroHotkey = hk;
+        g_macroHotkeyLastDown = false;
+    }
+    NSString* ns = [NSString stringWithUTF8String:hk.c_str()];
+    [[NSUserDefaults standardUserDefaults] setObject:ns forKey:kMacroHotkeyDefaultsKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    return true;
+}
+
+static void PollMacroHotkeyMac(const std::unordered_map<std::string, std::string>& bindings) {
+    std::string hk;
+    bool was_down = false;
+    {
+        std::lock_guard<std::mutex> lk(g_macroHotkeyMutex);
+        hk = g_macroHotkey;
+        was_down = g_macroHotkeyLastDown;
+    }
+    if (hk.empty()) return;
+    if (MacroHotkeyConflictsMac(hk, bindings, nullptr)) return;
+
+    bool down = mac_key_down(hk);
+    {
+        std::lock_guard<std::mutex> lk(g_macroHotkeyMutex);
+        g_macroHotkeyLastDown = down;
+    }
+    if (down && !was_down) {
+        std::string saved = LoadMacroTextMac();
+        if (!macro_trim(saved).empty()) StartMacroTextMac(saved);
+    }
+}
+
 
 static bool SaveMacroTextMac(const std::string& txt) {
     if (macro_trim(txt).empty()) {
@@ -1079,6 +1275,10 @@ static bool SaveMacroTextMac(const std::string& txt) {
         ShowMacroErrorMac("Invalid macro: " + err);
         return false;
     }
+    if (pretty.size() > MACRO_JSON_MAX_BYTES) {
+        ShowMacroErrorMac("Macro JSON exceeds the 50MB limit.");
+        return false;
+    }
     NSString* ns = [NSString stringWithUTF8String:pretty.c_str()];
     [[NSUserDefaults standardUserDefaults] setObject:ns forKey:kMacroDefaultsKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
@@ -1087,15 +1287,22 @@ static bool SaveMacroTextMac(const std::string& txt) {
 
 static bool StartMacroTextMac(const std::string& txt) {
     std::vector<MacroStep> parsed;
-    if (!macro_validate_text(txt, parsed, nullptr)) {
+    std::vector<std::string> normalized;
+    if (!macro_validate_text(txt, parsed, &normalized)) {
         ShowMacroErrorMac("Invalid macro: " + macro_last_error());
         return false;
     }
 
+    std::string pretty = macro_pretty_json(txt, "Macro");
+    if (pretty.size() > MACRO_JSON_MAX_BYTES) {
+        ShowMacroErrorMac("Macro JSON exceeds the 50MB limit.");
+        return false;
+    }
+
     // Modern servers execute macros server-side and merge them with live input.
-    // Queue the exact validated JSON/command text for the sender thread to upload.
+    // Queue compact validated JSON for the sender thread to upload.
     std::lock_guard<std::mutex> lk(g_macroUploadMutex);
-    g_macroUploadPending = txt;
+    g_macroUploadPending = pretty;
     return true;
 }
 
@@ -1794,39 +2001,84 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
     [alert addButtonWithTitle:@"Import JSON"];
     [alert addButtonWithTitle:@"Export JSON"];
     [alert addButtonWithTitle:@"Close"];
-    NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0,0,520,180)];
-    NSTextView* tv = [[NSTextView alloc] initWithFrame:NSMakeRect(0,0,520,180)];
+
+    NSView* accessory = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 540, 250)];
+    NSTextField* note = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 228, 540, 18)];
+    [note setStringValue:@"Use JSON/commands. Macro hotkey is optional and must not duplicate keyboard bindings."];
+    [note setBezeled:NO]; [note setDrawsBackground:NO]; [note setEditable:NO]; [note setSelectable:NO];
+    [accessory addSubview:note];
+
+    NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 48, 540, 175)];
+    NSTextView* tv = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 540, 175)];
     [scroll setDocumentView:tv]; [scroll setHasVerticalScroller:YES];
+    [accessory addSubview:scroll];
+
+    NSTextField* hkLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 20, 115, 22)];
+    [hkLabel setStringValue:@"Macro hotkey:"];
+    [hkLabel setBezeled:NO]; [hkLabel setDrawsBackground:NO]; [hkLabel setEditable:NO]; [hkLabel setSelectable:NO];
+    [accessory addSubview:hkLabel];
+
+    NSTextField* hkField = [[NSTextField alloc] initWithFrame:NSMakeRect(120, 18, 130, 24)];
+    [hkField setStringValue:[NSString stringWithUTF8String:LoadMacroHotkeyMac().c_str()]];
+    [accessory addSubview:hkField];
+
+    NSTextField* hkHint = [[NSTextField alloc] initWithFrame:NSMakeRect(260, 20, 280, 22)];
+    [hkHint setStringValue:@"Example: F8, SPACE, Q. Leave empty to disable."];
+    [hkHint setBezeled:NO]; [hkHint setDrawsBackground:NO]; [hkHint setEditable:NO]; [hkHint setSelectable:NO];
+    [accessory addSubview:hkHint];
+
     std::string txt = LoadMacroTextMac();
     if (txt.empty()) txt = "{\"name\":\"Macro\",\"commands\":\"WAIT 200; A 100; B 100\"}";
     [tv setString:[NSString stringWithUTF8String:txt.c_str()]];
-    [alert setAccessoryView:scroll];
+    [alert setAccessoryView:accessory];
+
     NSModalResponse r = [alert runModal];
     std::string out([[tv string] UTF8String]);
-    if (r == NSAlertFirstButtonReturn) StartMacroTextMac(out);
-    else if (r == NSAlertSecondButtonReturn) SaveMacroTextMac(out);
-    else if (r == NSAlertThirdButtonReturn) SaveMacroTextMac("");
+    std::string hotkeyOut([[hkField stringValue] UTF8String]);
+
+    if (r == NSAlertFirstButtonReturn) {
+        if (SaveMacroHotkeyMac(hotkeyOut, keyBindings)) StartMacroTextMac(out);
+    }
+    else if (r == NSAlertSecondButtonReturn) {
+        if (SaveMacroHotkeyMac(hotkeyOut, keyBindings)) SaveMacroTextMac(out);
+    }
+    else if (r == NSAlertThirdButtonReturn) {
+        SaveMacroTextMac("");
+        SaveMacroHotkeyMac("", keyBindings);
+    }
     else if (r == NSAlertThirdButtonReturn + 1) StartMacroRecordingMac();
     else if (r == NSAlertThirdButtonReturn + 2) {
         std::string rec = StopMacroRecordingMac();
-        SaveMacroTextMac(rec);
+        if (SaveMacroHotkeyMac(hotkeyOut, keyBindings)) SaveMacroTextMac(rec);
     } else if (r == NSAlertThirdButtonReturn + 3) {
         NSOpenPanel* panel = [NSOpenPanel openPanel];
         [panel setAllowedFileTypes:@[@"json"]];
         if ([panel runModal] == NSModalResponseOK) {
-            NSString* imported = [NSString stringWithContentsOfURL:[panel URL] encoding:NSUTF8StringEncoding error:nil];
-            if (imported) SaveMacroTextMac(std::string([imported UTF8String]));
+            std::string imported, err;
+            if (!ReadMacroURLLimitedMac([panel URL], imported, err)) {
+                ShowMacroErrorMac(err.empty() ? "Invalid or empty macro file." : err);
+            } else if (SaveMacroHotkeyMac(hotkeyOut, keyBindings)) {
+                SaveMacroTextMac(imported);
+            }
         }
     } else if (r == NSAlertThirdButtonReturn + 4) {
-        NSSavePanel* panel = [NSSavePanel savePanel];
-        [panel setNameFieldStringValue:@"ns-macros.json"];
-        if ([panel runModal] == NSModalResponseOK) {
-            std::string prettyOut = macro_pretty_json(out);
-            NSString* outText = [NSString stringWithUTF8String:prettyOut.c_str()];
-            [outText writeToURL:[panel URL] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        std::string prettyOut, err;
+        if (!macro_validate_to_pretty_json(out, prettyOut, err, "Macro")) {
+            ShowMacroErrorMac("Invalid macro: " + err);
+        } else {
+            NSSavePanel* panel = [NSSavePanel savePanel];
+            [panel setNameFieldStringValue:@"ns-macros.json"];
+            if ([panel runModal] == NSModalResponseOK) {
+                NSString* outText = [NSString stringWithUTF8String:prettyOut.c_str()];
+                NSError* writeErr = nil;
+                if (![outText writeToURL:[panel URL] atomically:YES encoding:NSUTF8StringEncoding error:&writeErr]) {
+                    ShowMacroErrorMac(writeErr ? std::string([[writeErr localizedDescription] UTF8String]) : "Could not export macro JSON.");
+                }
+            }
         }
     }
 }
+
 
 - (void)connectClicked {
     if (connected) [self disconnect];
@@ -1894,6 +2146,9 @@ static void apply_keyboard_to_report_mac(ns::HIDReport& rep, const std::unordere
                 { std::lock_guard<std::mutex> lk(g_macroUploadMutex); upload.swap(g_macroUploadPending); }
                 if (!upload.empty()) send_macro_udp_packet(self->sock, dest, self->hmacKey, upload, 0);
             }
+
+            PollMacroHotkeyMac(self->keyBindings);
+
             ns::HIDReport logical_reports[4];
             ns::MotionReport logical_motion[4];
             bool present[4] = {false, false, false, false};
