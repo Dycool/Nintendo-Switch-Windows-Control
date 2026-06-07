@@ -2389,10 +2389,10 @@ static bool MacroWriteURLMac(NSURL* url, const std::string& text) {
         [macroWindow setContentView:[[NSView alloc] initWithFrame:NSMakeRect(0, 0, 620, 280)]];
     }
 
-    __weak AppDelegate* weakSelf = self;
+    AppDelegate* capturedSelf = self;
     if (!macroKeyMonitor) {
         macroKeyMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent* (NSEvent* event) {
-            AppDelegate* strongSelf = weakSelf;
+            AppDelegate* strongSelf = capturedSelf;
             if (!strongSelf || strongSelf->macroListeningIndex < 0 || [event window] != strongSelf->macroWindow) return event;
             int idx = (int)strongSelf->macroListeningIndex;
             std::string key = MacEventKeyName(event);
