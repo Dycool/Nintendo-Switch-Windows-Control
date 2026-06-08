@@ -37,9 +37,7 @@ else()
     message(STATUS "UPnP support disabled by user")
 endif()
 
-set(BACKEND_SOURCE "src/backend/hori-main.cpp" CACHE STRING "Backend source file (hori-main.cpp or pro-main.cpp)")
-
-add_executable(ns-backend ${BACKEND_SOURCE})
+add_executable(ns-backend src/backend/main.cpp)
 target_link_libraries(ns-backend PRIVATE pthread)
 
 if(MINIUPNPC_FOUND)

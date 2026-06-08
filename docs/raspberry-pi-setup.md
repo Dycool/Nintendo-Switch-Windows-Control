@@ -35,6 +35,13 @@ sudo chrt -f 99 ./ns-backend
 
 > **Note:** `chrt -f 99` gives the process maximum real-time priority for lowest possible latency.
 
+To bind a custom UDP address or port, pass it through `-b`:
+
+```bash
+sudo chrt -f 99 ./ns-backend -b 0.0.0.0:7332
+sudo chrt -f 99 ./ns-backend -b :7332
+```
+
 ---
 
 ## Automate on Boot (Optional Systemd Service)

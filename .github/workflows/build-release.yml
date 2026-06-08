@@ -53,21 +53,13 @@ jobs:
           cd ../..
           rm -rf _zips/_mac
 
-          # Pi - HORI
-          mkdir -p _zips/_pi_hori
-          cp artifacts/hori-server/ns-backend _zips/_pi_hori/ns-backend
-          cd _zips/_pi_hori
-          zip -r ../ns-pc-control-raspberry-pi-hori.zip ns-backend
+          # Raspberry Pi unified server
+          mkdir -p _zips/_pi
+          cp artifacts/pi-server/ns-backend _zips/_pi/ns-backend
+          cd _zips/_pi
+          zip -r ../ns-pc-control-raspberry-pi.zip ns-backend
           cd ../..
-          rm -rf _zips/_pi_hori
-
-          # Pi - Pro
-          mkdir -p _zips/_pi_pro
-          cp artifacts/pro-server/ns-backend _zips/_pi_pro/ns-backend
-          cd _zips/_pi_pro
-          zip -r ../ns-pc-control-raspberry-pi-pro.zip ns-backend
-          cd ../..
-          rm -rf _zips/_pi_pro
+          rm -rf _zips/_pi
 
       - name: Create Draft Release
         uses: softprops/action-gh-release@v2
@@ -76,7 +68,6 @@ jobs:
             _zips/ns-pc-control-windows.zip
             _zips/ns-pc-control-linux.zip
             _zips/ns-pc-control-mac.zip
-            _zips/ns-pc-control-raspberry-pi-hori.zip
-            _zips/ns-pc-control-raspberry-pi-pro.zip
+            _zips/ns-pc-control-raspberry-pi.zip
           draft: true
           generate_release_notes: true

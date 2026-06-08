@@ -17,22 +17,25 @@ sudo apt-get install -y cmake g++ pkg-config
 # Optional: sudo apt-get install -y miniupnpc
 ```
 
-3. Choose a backend and compile:
+3. Compile the unified backend:
 
-**Legacy mode** (8-byte, fastest - no gyro/rumble):
 ```bash
 cd server/rpi
 mkdir build && cd build
-cmake .. -DBACKEND_SOURCE=src/backend/hori-main.cpp
+cmake ..
 make
 ```
 
-**Modern mode** (64-byte - gyro + rumble + macros):
+Default runtime mode is Pro Controller with gyro, rumble, and macros:
+
 ```bash
-cd server/rpi
-mkdir build && cd build
-cmake .. -DBACKEND_SOURCE=src/backend/pro-main.cpp
-make
+sudo ./ns-backend
+```
+
+Use legacy Hori/Pokken 8-byte mode when you only want buttons/sticks:
+
+```bash
+sudo ./ns-backend -hori
 ```
 
 > The server includes **built-in USB gadget setup** - no external `setup_gadget.sh` script needed. It automatically creates and binds the HID gadget on startup and cleans up on exit.

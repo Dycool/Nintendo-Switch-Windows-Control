@@ -42,8 +42,8 @@ Gyro and rumble require **both** server and client support:
 
 | Side | Requirements |
 |------|--------------|
-| **Server** | Must be compiled with the **modern 64-byte backend** |
-| **PC Client** | Must use the **extended UDP protocol** (default; disable with `--legacy`) |
+| **Server** | Run the default **modern 64-byte Pro mode** |
+| **PC Client** | Must use the extended UDP protocol |
 | **PC Controller** | Must support gyro (DS4, DualSense, compatible USB motion pads) or have rumble motors |
 
 Platform-specific gyro support:
@@ -52,7 +52,7 @@ Platform-specific gyro support:
 - **macOS:** GameController.framework motion data
 - **Browser:** Gamepad API (`pose.angularVelocity`, `pose.linearAcceleration`)
 
-> Gyro and rumble are **not available** in legacy mode or when the client uses the `--legacy` flag.
+> Gyro and rumble are **not available** in legacy Hori mode.
 
 ---
 
@@ -72,24 +72,23 @@ Platform-specific gyro support:
 
 ## Building
 
-The backend is selected at compile time in `server/rpi/CMakeLists.txt`:
-
-```cmake
-# Legacy mode (default):
-set(BACKEND_SOURCE "src/backend/hori-main.cpp" CACHE STRING "Backend source")
-
-# Modern mode:
-set(BACKEND_SOURCE "src/backend/pro-main.cpp" CACHE STRING "Backend source")
-```
-
-Or pass it on the CMake command line:
+There is now one backend binary:
 
 ```bash
-# Legacy mode:
-cmake -DBACKEND_SOURCE=src/backend/hori-main.cpp ..
-
-# Modern mode:
-cmake -DBACKEND_SOURCE=src/backend/pro-main.cpp ..
+cd server/rpi
+mkdir build && cd build
+cmake ..
+make
 ```
 
-Pre-built releases include both variants. Download the appropriate zip for your use case.
+Controller mode is selected at runtime:
+
+```bash
+# Modern Pro mode, default:
+sudo ./ns-backend
+
+# Legacy Hori mode:
+sudo ./ns-backend -hori
+```
+
+Pre-built releases use the same binary for both modes.

@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'server/rpi/**'
+      - '.github/workflows/build-pi.yml'
   workflow_dispatch:
   workflow_call:
 
@@ -35,40 +36,20 @@ jobs:
           make -j$(nproc)
           make install
 
-      - name: Build HORI Server
+      - name: Build Unified Pi Server
         run: |
           cd server/rpi
-          mkdir -p build-hori && cd build-hori
+          mkdir -p build && cd build
           cmake .. \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
             -DMINIUPNPC_INCLUDE_DIRS=/tmp/miniupnpc/include \
-            -DMINIUPNPC_LIBRARIES=/tmp/miniupnpc/lib/libminiupnpc.a \
-            -DBACKEND_SOURCE=src/backend/hori-main.cpp
+            -DMINIUPNPC_LIBRARIES=/tmp/miniupnpc/lib/libminiupnpc.a
           make -j$(nproc)
 
-          mkdir -p artifact/hori-server
-          cp ns-backend artifact/hori-server/ns-backend
-
-      - name: Build Pro Server
-        run: |
-          cd server/rpi
-          mkdir -p build-pro && cd build-pro
-          cmake .. \
-            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
-            -DMINIUPNPC_INCLUDE_DIRS=/tmp/miniupnpc/include \
-            -DMINIUPNPC_LIBRARIES=/tmp/miniupnpc/lib/libminiupnpc.a \
-            -DBACKEND_SOURCE=src/backend/pro-main.cpp
-          make -j$(nproc)
-
-          mkdir -p artifact/pro-server
-          cp ns-backend artifact/pro-server/ns-backend
+          mkdir -p artifact/pi-server
+          cp ns-backend artifact/pi-server/ns-backend
 
       - uses: actions/upload-artifact@v6
         with:
-          name: hori-server
-          path: server/rpi/build-hori/artifact/hori-server/
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: pro-server
-          path: server/rpi/build-pro/artifact/pro-server/
+          name: pi-server
+          path: server/rpi/build/artifact/pi-server/
