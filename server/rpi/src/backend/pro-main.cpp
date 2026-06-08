@@ -179,22 +179,12 @@ static int16_t gyro_smooth_i16(int16_t prev, int16_t cur) {
 }
 
 static MotionReport stabilize_real_pro_motion_sample(const ClientSession& c, int subpad, const MotionReport& raw) {
-    MotionReport m = raw;
-
-    // Keep accel raw. In the good captures and SDL logs, accel magnitude around
-    // 1g is already sane (~4096), so changing accel tends to hurt orientation.
-    m.gx = gyro_deadzone_i16(m.gx);
-    m.gy = gyro_deadzone_i16(m.gy);
-    m.gz = gyro_deadzone_i16(m.gz);
-
-    if (subpad >= 0 && subpad < 4 && c.motion_history_count[subpad] > 0) {
-        const MotionReport& prev = c.motion_history[subpad][0];
-        m.gx = gyro_smooth_i16(prev.gx, m.gx);
-        m.gy = gyro_smooth_i16(prev.gy, m.gy);
-        m.gz = gyro_smooth_i16(prev.gz, m.gz);
-    }
-
-    return m;
+    (void)c;
+    (void)subpad;
+    // The Windows client now performs source-side gyro bias correction and
+    // hard-zeroes the gyro while resting. Do not add a second backend filter,
+    // because it can preserve old non-zero samples and make the camera drift.
+    return raw;
 }
 
 static void push_motion_history(ClientSession& c, int subpad, const MotionReport& motion) {
@@ -1005,12 +995,15 @@ struct NS_LOCAL_PACKED ProInputReport30 {
     uint8_t left_stick[3];
     uint8_t right_stick[3];
     uint8_t vibrator;
-    int16_t accel_x_0, accel_y_0, accel_z_0;
-    int16_t gyro_x_0,  gyro_y_0,  gyro_z_0;
-    int16_t accel_x_1, accel_y_1, accel_z_1;
-    int16_t gyro_x_1,  gyro_y_1,  gyro_z_1;
-    int16_t accel_x_2, accel_y_2, accel_z_2;
-    int16_t gyro_x_2,  gyro_y_2,  gyro_z_2;
+    // Switch Pro IMU wire order is Y, X, Z for each sample.
+    // Keep field names matching the logical axis they contain so assignment
+    // remains readable while packed layout matches hardware.
+    int16_t accel_y_0, accel_x_0, accel_z_0;
+    int16_t gyro_y_0,  gyro_x_0,  gyro_z_0;
+    int16_t accel_y_1, accel_x_1, accel_z_1;
+    int16_t gyro_y_1,  gyro_x_1,  gyro_z_1;
+    int16_t accel_y_2, accel_x_2, accel_z_2;
+    int16_t gyro_y_2,  gyro_x_2,  gyro_z_2;
     uint8_t vendor_rest[15];
 };
 static_assert(sizeof(ProInputReport30) == PRO_REPORT_SIZE, "ProInputReport30 must be 64 bytes");
@@ -1595,14 +1588,14 @@ static void build_standard_report(const ExtendedHIDReport& src,
         // ProInputReport30 is packed, so GCC does not allow binding its fields
         // to int16_t&.  Assign fields directly instead.
         if (idx == 0) {
-            dst.accel_x_0 = m.ax; dst.accel_y_0 = m.ay; dst.accel_z_0 = m.az;
-            dst.gyro_x_0  = m.gx; dst.gyro_y_0  = m.gy; dst.gyro_z_0  = m.gz;
+            dst.accel_y_0 = m.ay; dst.accel_x_0 = m.ax; dst.accel_z_0 = m.az;
+            dst.gyro_y_0  = m.gy; dst.gyro_x_0  = m.gx; dst.gyro_z_0  = m.gz;
         } else if (idx == 1) {
-            dst.accel_x_1 = m.ax; dst.accel_y_1 = m.ay; dst.accel_z_1 = m.az;
-            dst.gyro_x_1  = m.gx; dst.gyro_y_1  = m.gy; dst.gyro_z_1  = m.gz;
+            dst.accel_y_1 = m.ay; dst.accel_x_1 = m.ax; dst.accel_z_1 = m.az;
+            dst.gyro_y_1  = m.gy; dst.gyro_x_1  = m.gx; dst.gyro_z_1  = m.gz;
         } else {
-            dst.accel_x_2 = m.ax; dst.accel_y_2 = m.ay; dst.accel_z_2 = m.az;
-            dst.gyro_x_2  = m.gx; dst.gyro_y_2  = m.gy; dst.gyro_z_2  = m.gz;
+            dst.accel_y_2 = m.ay; dst.accel_x_2 = m.ax; dst.accel_z_2 = m.az;
+            dst.gyro_y_2  = m.gy; dst.gyro_x_2  = m.gx; dst.gyro_z_2  = m.gz;
         }
     };
 
@@ -3075,9 +3068,9 @@ static const char INDEX_HTML[] =
     "        motion.ax = clamp16((a.x || 0) / 9.80665 * 4096);\n"
     "        motion.ay = clamp16((a.y || 0) / 9.80665 * 4096);\n"
     "        motion.az = clamp16((a.z || 0) / 9.80665 * 4096);\n"
-    "        motion.gx = clamp16((rr.beta  || 0) * 16);\n"
-    "        motion.gy = clamp16((rr.gamma || 0) * 16);\n"
-    "        motion.gz = clamp16((rr.alpha || 0) * 16);\n"
+    "        motion.gx = clamp16((rr.beta  || 0) * 16);  // pitch\n"
+    "        motion.gy = clamp16((rr.alpha || 0) * 16);  // yaw / Switch Y\n"
+    "        motion.gz = clamp16((rr.gamma || 0) * 16);  // roll / Switch Z\n"
     "    }, {passive:true});\n"
     "}\n"
     "function installDeviceOrientationFallback() {\n"
@@ -3627,9 +3620,9 @@ static const char MOBILE_HTML[] =
     "        motion.ax = clamp16((a.x || 0) / 9.80665 * 4096);\n"
     "        motion.ay = clamp16((a.y || 0) / 9.80665 * 4096);\n"
     "        motion.az = clamp16((a.z || 0) / 9.80665 * 4096);\n"
-    "        motion.gx = clamp16((rr.beta  || 0) * 16);\n"
-    "        motion.gy = clamp16((rr.gamma || 0) * 16);\n"
-    "        motion.gz = clamp16((rr.alpha || 0) * 16);\n"
+    "        motion.gx = clamp16((rr.beta  || 0) * 16);  // pitch\n"
+    "        motion.gy = clamp16((rr.alpha || 0) * 16);  // yaw / Switch Y\n"
+    "        motion.gz = clamp16((rr.gamma || 0) * 16);  // roll / Switch Z\n"
     "    }, {passive:true});\n"
     "}\n"
     "function installDeviceOrientationFallback() {\n"
