@@ -983,7 +983,7 @@ private:
         if (d.accel_enabled && SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, accel, 3)) {
             // Restore the older Switch-Pro-oriented accel mapping.
             // Resting flat should become roughly ax=0, ay=0, az=4096.
-            out.ax = clamp_motion_i16( accel[0] * ACCEL_SCALE);
+            out.ax = clamp_motion_i16(-accel[0] * ACCEL_SCALE);
             out.ay = clamp_motion_i16(-accel[2] * ACCEL_SCALE);
             out.az = clamp_motion_i16( accel[1] * ACCEL_SCALE);
             has_motion = true;
