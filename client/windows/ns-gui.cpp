@@ -866,12 +866,11 @@ private:
         bool trigger_rumble_capable = false;
         uint64_t precision_retry_after_us = 0;
 
-        // Gyro stabilizer state. SDL sensors can have a small bias and occasional
-        // one-frame jitter, which is very visible in Splatoon while the controller
-        // is resting on a table. Keep this per physical device, not global.
-        bool gyro_filter_initialized = false;
-        float gyro_bias[3] = {0.0f, 0.0f, 0.0f};      // backend units: deg/s * 16
-        float gyro_filtered[3] = {0.0f, 0.0f, 0.0f};  // backend units: deg/s * 16
+        // At 250Hz the PC loop can poll the same physical controller sensor
+        // frame multiple times. Remember the last raw gyro sample so motion is
+        // only marked as "new" when the device actually reported new values.
+        bool last_raw_gyro_valid = false;
+        float last_raw_gyro[3] = {0.0f, 0.0f, 0.0f};
 
         std::string name;
         uint16_t vid = 0;
@@ -1004,6 +1003,30 @@ private:
         return v > 0.0f ? (v - dz) : (v + dz);
     }
 
+    static bool raw_gyro_changed(Device& d, const float gyro[3]) {
+        if (!d.last_raw_gyro_valid) {
+            d.last_raw_gyro_valid = true;
+            d.last_raw_gyro[0] = gyro[0];
+            d.last_raw_gyro[1] = gyro[1];
+            d.last_raw_gyro[2] = gyro[2];
+            return true;
+        }
+
+        // SDL returns cached sensor frames between physical reports. Exact float
+        // equality is intentional here: duplicate cached frames compare equal,
+        // while a real new HID sensor report normally changes at least one axis.
+        if (gyro[0] == d.last_raw_gyro[0] &&
+            gyro[1] == d.last_raw_gyro[1] &&
+            gyro[2] == d.last_raw_gyro[2]) {
+            return false;
+        }
+
+        d.last_raw_gyro[0] = gyro[0];
+        d.last_raw_gyro[1] = gyro[1];
+        d.last_raw_gyro[2] = gyro[2];
+        return true;
+    }
+
     static void apply_motion(Device& d, ns::MotionReport& out, bool& has_motion) {
         SDL_Gamepad* pad = d.pad;
         out.reset();
@@ -1015,69 +1038,30 @@ private:
             out.ax = clamp_motion_i16((accel[0] / 9.80665f) * 4096.0f);
             out.ay = clamp_motion_i16((accel[1] / 9.80665f) * 4096.0f);
             out.az = clamp_motion_i16((accel[2] / 9.80665f) * 4096.0f);
-            has_motion = true;
             got_accel = true;
         }
 
         float gyro[3] = {};
         if (d.gyro_enabled && SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3)) {
+            // At 250Hz, avoid sending the same physical gyro frame repeatedly.
+            // Buttons/sticks still go out every 4ms through the normal report path,
+            // but IMU history only advances when the controller reports new gyro.
+            if (!raw_gyro_changed(d, gyro)) {
+                has_motion = false;
+                return;
+            }
+
             constexpr float RAD_TO_DEG = 57.29577951308232f;
-            constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.0f;
+            constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.384f;
 
-            float g[3] = {
-                gyro[0] * CONSOLE_GYRO_SCALE,
-                gyro[1] * CONSOLE_GYRO_SCALE,
-                gyro[2] * CONSOLE_GYRO_SCALE
-            };
+            // Competitive/low-latency mode: no bias correction, no smoothing,
+            // no deadzone. Pass SDL gyro straight through with strict clamping.
+            out.gx = clamp_motion_i16(gyro[0] * CONSOLE_GYRO_SCALE);
+            out.gy = clamp_motion_i16(gyro[1] * CONSOLE_GYRO_SCALE);
+            out.gz = clamp_motion_i16(gyro[2] * CONSOLE_GYRO_SCALE);
 
-            const float accel_mag = got_accel
-                ? std::sqrt(accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2])
-                : 9.80665f;
-
-            const float gyro_mag_rad =
-                std::sqrt(gyro[0] * gyro[0] + gyro[1] * gyro[1] + gyro[2] * gyro[2]);
-
-            // Rest detection: accel near gravity and very small angular velocity.
-            // While resting, learn the gyro bias quickly enough to remove drift,
-            // but slowly enough to not eat deliberate aiming motion.
-            const bool accel_is_gravity = got_accel && std::fabs(accel_mag - 9.80665f) < 1.75f;
-            const bool gyro_is_quiet = gyro_mag_rad < 0.08f; // ~4.6 deg/s
-            const bool resting = accel_is_gravity && gyro_is_quiet;
-
-            if (!d.gyro_filter_initialized) {
-                d.gyro_bias[0] = resting ? g[0] : 0.0f;
-                d.gyro_bias[1] = resting ? g[1] : 0.0f;
-                d.gyro_bias[2] = resting ? g[2] : 0.0f;
-                d.gyro_filtered[0] = d.gyro_filtered[1] = d.gyro_filtered[2] = 0.0f;
-                d.gyro_filter_initialized = true;
-            }
-
-            if (resting) {
-                constexpr float BIAS_ALPHA = 0.025f;
-                for (int i = 0; i < 3; ++i) {
-                    d.gyro_bias[i] = d.gyro_bias[i] * (1.0f - BIAS_ALPHA) + g[i] * BIAS_ALPHA;
-                }
-            }
-
-            for (int i = 0; i < 3; ++i) {
-                g[i] -= d.gyro_bias[i];
-
-                // Tiny post-bias deadzone kills lobby/table jitter. This is small:
-                // 24 backend units = 1.5 deg/s.
-                g[i] = motion_deadzone_float(g[i], 24.0f);
-
-                // Light low-pass only. More smoothing makes aim feel laggy.
-                constexpr float LP_NEW = 0.72f;
-                d.gyro_filtered[i] = d.gyro_filtered[i] * (1.0f - LP_NEW) + g[i] * LP_NEW;
-
-                // Clamp impossible one-frame spikes that SDL/HID can emit during
-                // reconnect/report changes. 4096 backend units = 256 deg/s.
-                d.gyro_filtered[i] = clampf_local(d.gyro_filtered[i], -4096.0f, 4096.0f);
-            }
-
-            out.gx = clamp_motion_i16(d.gyro_filtered[0]);
-            out.gy = clamp_motion_i16(d.gyro_filtered[1]);
-            out.gz = clamp_motion_i16(d.gyro_filtered[2]);
+            // Only now mark motion as present. This makes duplicate 250Hz polls
+            // keep buttons current without pushing repeated IMU samples.
             has_motion = true;
         }
     }
@@ -2882,7 +2866,9 @@ static void SenderThread() {
         pump_udp_rumble(sock, rumble, sdlForSlot);
         rumble.update_timeouts(sdlForSlot);
 
-        if (activeCount > 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // 4ms active sleep = 250Hz sender loop. This keeps input latency low
+        // without hammering UDP at 1000Hz.
+        if (activeCount > 0) std::this_thread::sleep_for(std::chrono::milliseconds(4));
         else std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 

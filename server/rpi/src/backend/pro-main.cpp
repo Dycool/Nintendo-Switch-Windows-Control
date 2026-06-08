@@ -1599,11 +1599,13 @@ static void build_standard_report(const ExtendedHIDReport& src,
         }
     };
 
-    // The report carries three IMU samples in chronological order.
-    // motion_history[0] is newest, [1] is middle, [2] is oldest.
-    // Send oldest -> newest so games integrate motion forward in time.
-    store_imu_sample(out, 0, imu[2]);
-    store_imu_sample(out, 1, imu[1]);
+    // SDL/PC input provides the current sensor state, not a native 3-sample
+    // 5ms-spaced IMU FIFO like a real Pro Controller. A sliding history
+    // (A,B,C -> B,C,D) makes games integrate the same time slices repeatedly.
+    // Fill all 3 IMU frames with the newest sample so the 15ms report carries
+    // the current angular velocity consistently without overlapping history.
+    store_imu_sample(out, 0, imu[0]);
+    store_imu_sample(out, 1, imu[0]);
     store_imu_sample(out, 2, imu[0]);
 }
 
