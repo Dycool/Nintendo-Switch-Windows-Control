@@ -851,8 +851,13 @@ private:
         SDL_JoystickID id = 0;
         int slot = -1;
         bool gyro_enabled = false;
+        bool accel_enabled = false;
         bool rumble_capable = false;
         bool trigger_rumble_capable = false;
+
+        float gyro_bias[3] = {0.0f, 0.0f, 0.0f};
+        uint32_t gyro_bias_samples = 0;
+        bool gyro_bias_ready = false;
 
         std::string name;
         uint16_t vid = 0;
@@ -969,15 +974,81 @@ private:
         out.reset();
         has_motion = false;
 
+        float accel[3] = {};
+        const bool got_accel = d.accel_enabled &&
+            SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, accel, 3);
+
+        if (got_accel) {
+            constexpr float STANDARD_GRAVITY = 9.80665f;
+            constexpr float CONSOLE_ACCEL_SCALE = 4096.0f / STANDARD_GRAVITY;
+
+            out.ax = clamp_motion_i16(accel[0] * CONSOLE_ACCEL_SCALE);
+            out.ay = clamp_motion_i16(accel[1] * CONSOLE_ACCEL_SCALE);
+            out.az = clamp_motion_i16(accel[2] * CONSOLE_ACCEL_SCALE);
+            has_motion = true;
+        }
+
         float gyro[3] = {};
         if (d.gyro_enabled && SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3)) {
             constexpr float RAD_TO_DEG = 57.29577951308232f;
             constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.384f;
 
-            out.ay = 4096;
-            out.gx = clamp_motion_i16(gyro[0] * CONSOLE_GYRO_SCALE);
-            out.gy = clamp_motion_i16(gyro[1] * CONSOLE_GYRO_SCALE);
-            out.gz = clamp_motion_i16(gyro[2] * CONSOLE_GYRO_SCALE);
+            const float mag = std::sqrt(
+                gyro[0] * gyro[0] +
+                gyro[1] * gyro[1] +
+                gyro[2] * gyro[2]
+            );
+
+            constexpr uint32_t INITIAL_BIAS_SAMPLES = 90;
+            constexpr uint32_t BIAS_READY_SAMPLES = 12;
+            constexpr float INITIAL_LEARN_LIMIT_RAD = 0.35f;
+            constexpr float RUNNING_LEARN_LIMIT_RAD = 0.035f;
+
+            const float learn_limit =
+                d.gyro_bias_samples < INITIAL_BIAS_SAMPLES
+                    ? INITIAL_LEARN_LIMIT_RAD
+                    : RUNNING_LEARN_LIMIT_RAD;
+
+            if (mag < learn_limit) {
+                float alpha;
+                if (d.gyro_bias_samples < INITIAL_BIAS_SAMPLES) {
+                    alpha = 1.0f / (float)(d.gyro_bias_samples + 1);
+                } else {
+                    alpha = 0.0015f;
+                }
+
+                for (int i = 0; i < 3; ++i) {
+                    d.gyro_bias[i] += (gyro[i] - d.gyro_bias[i]) * alpha;
+                }
+
+                if (d.gyro_bias_samples < 1000000u) {
+                    ++d.gyro_bias_samples;
+                }
+
+                if (d.gyro_bias_samples >= BIAS_READY_SAMPLES) {
+                    d.gyro_bias_ready = true;
+                }
+            }
+
+            float gx = gyro[0];
+            float gy = gyro[1];
+            float gz = gyro[2];
+
+            if (d.gyro_bias_ready) {
+                gx -= d.gyro_bias[0];
+                gy -= d.gyro_bias[1];
+                gz -= d.gyro_bias[2];
+            }
+
+            constexpr float GYRO_DEADZONE_RAD = 0.0045f;
+
+            if (std::fabs(gx) < GYRO_DEADZONE_RAD) gx = 0.0f;
+            if (std::fabs(gy) < GYRO_DEADZONE_RAD) gy = 0.0f;
+            if (std::fabs(gz) < GYRO_DEADZONE_RAD) gz = 0.0f;
+
+            out.gx = clamp_motion_i16(gx * CONSOLE_GYRO_SCALE);
+            out.gy = clamp_motion_i16(gy * CONSOLE_GYRO_SCALE);
+            out.gz = clamp_motion_i16(gz * CONSOLE_GYRO_SCALE);
             has_motion = true;
         }
     }
@@ -1072,7 +1143,7 @@ private:
             }
 
             if (SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) {
-                SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
+                d.accel_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
             }
             if (SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO)) {
                 d.gyro_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
