@@ -50,20 +50,12 @@ jobs:
             fi
           }
 
-          # New artifact names from build-clients.yml:
-          #   windows-static-exe/ns-client.exe
-          #   linux-appimage/ns-client-x86_64.AppImage
-          #   macos-app/ns-client-macos.app.zip
-          # New artifact names from build-mobile.yml:
-          #   ns-control-android-debug-apk/app-debug.apk
-          #   ns-control-ios-unsigned-app/NSControl-ios-unsigned.app.zip
-          # Server workflow can vary, so find ns-backend by filename.
-
           WINDOWS_EXE="$(find artifacts -type f -name 'ns-client.exe' -print -quit)"
           LINUX_APPIMAGE="$(find artifacts -type f -name 'ns-client*.AppImage' -print -quit)"
           MAC_ZIP="$(find artifacts -type f \( -name 'ns-client-macos.app.zip' -o -name '*macos*.zip' -o -name '*.app.zip' \) -print -quit)"
           PI_BACKEND="$(find artifacts -type f -name 'ns-backend' -print -quit)"
-          ANDROID_APK="$(find artifacts -type f -name 'app-debug.apk' -print -quit)"
+          ANDROID_APK="$(find artifacts -type f \( -name 'NS-mobile.apk' -o -name 'app-debug.apk' \) -print -quit)"
+          IOS_IPA="$(find artifacts -type f -name 'NS-mobile.ipa' -print -quit)"
           IOS_ZIP="$(find artifacts -type f \( -name 'NSControl-ios-unsigned.app.zip' -o -name '*ios*.zip' -o -name '*.app.zip' \) -print -quit)"
 
           require_file "$WINDOWS_EXE" "Windows ns-client.exe"
@@ -71,12 +63,12 @@ jobs:
           require_file "$MAC_ZIP" "macOS .app zip"
           require_file "$PI_BACKEND" "Raspberry Pi ns-backend"
           require_file "$ANDROID_APK" "Android APK"
-          require_file "$IOS_ZIP" "iOS .app zip"
-
-          # Avoid accidentally picking the macOS .app zip for iOS if both match *.app.zip.
-          if [ "$IOS_ZIP" = "$MAC_ZIP" ]; then
-            IOS_ZIP="$(find artifacts/ns-control-ios-unsigned-app -type f -name '*.zip' -print -quit 2>/dev/null || true)"
-            require_file "$IOS_ZIP" "iOS .app zip"
+          if [ -z "${IOS_IPA:-}" ]; then
+            require_file "$IOS_ZIP" "iOS artifact"
+            if [ "$IOS_ZIP" = "$MAC_ZIP" ]; then
+              IOS_ZIP="$(find artifacts/ns-control-ios-unsigned-app artifacts/ns-mobile-ios-ipa -type f \( -name '*.zip' -o -name '*.ipa' \) -print -quit 2>/dev/null || true)"
+              require_file "$IOS_ZIP" "iOS artifact"
+            fi
           fi
 
           # Windows: one real static .exe inside release zip.
@@ -102,14 +94,22 @@ jobs:
           (cd _zips/_pi && zip -r ../ns-pc-control-raspberry-pi.zip ns-backend)
           rm -rf _zips/_pi
 
-          # Android APK.
+          # Android APK, release-polished filename.
           mkdir -p _zips/_android
-          cp "$ANDROID_APK" _zips/_android/app-debug.apk
-          (cd _zips/_android && zip -r ../ns-pc-control-android.zip .)
+          cp "$ANDROID_APK" _zips/_android/NS-mobile.apk
+          (cd _zips/_android && zip -r ../ns-pc-control-android.zip NS-mobile.apk)
           rm -rf _zips/_android
 
-          # iOS unsigned .app bundle zip, already packaged by build-mobile.
-          cp "$IOS_ZIP" _zips/ns-pc-control-ios.zip
+          # iOS IPA, release-polished filename.
+          mkdir -p _zips/_ios
+          if [ -n "${IOS_IPA:-}" ] && [ -f "$IOS_IPA" ]; then
+            cp "$IOS_IPA" _zips/_ios/NS-mobile.ipa
+            (cd _zips/_ios && zip -r ../ns-pc-control-ios.zip NS-mobile.ipa)
+          else
+            cp "$IOS_ZIP" _zips/_ios/NS-mobile-ios-unsigned.app.zip
+            (cd _zips/_ios && zip -r ../ns-pc-control-ios.zip NS-mobile-ios-unsigned.app.zip)
+          fi
+          rm -rf _zips/_ios
 
           echo "Release zips:"
           ls -lh _zips

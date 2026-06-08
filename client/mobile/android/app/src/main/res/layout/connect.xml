@@ -7,10 +7,17 @@
     android:padding="32dp"
     android:background="#FFFFFF">
 
+    <ImageView
+        android:layout_width="96dp"
+        android:layout_height="96dp"
+        android:src="@drawable/app_logo"
+        android:contentDescription="NS-mobile"
+        android:layout_marginBottom="16dp" />
+
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="NS Control"
+        android:text="NS-mobile"
         android:textSize="34sp"
         android:textStyle="bold"
         android:textColor="#CC0000"

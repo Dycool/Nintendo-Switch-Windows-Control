@@ -20,6 +20,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nscontrol.app
+        PRODUCT_NAME: NS-mobile
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: NSControl/Info.plist
         DEVELOPMENT_TEAM: ""
         CODE_SIGN_STYLE: Manual

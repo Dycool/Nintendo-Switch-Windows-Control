@@ -23,6 +23,8 @@ jobs:
           distribution: zulu
           java-version: '17'
 
+      # The mobile project has a fake/incomplete Gradle wrapper
+      # (gradle-wrapper.jar is not committed), so install Gradle explicitly.
       - name: Set up Gradle 8.5
         uses: gradle/actions/setup-gradle@v6
         with:
@@ -32,11 +34,16 @@ jobs:
         working-directory: client/mobile/android
         run: gradle :app:assembleDebug --no-daemon
 
+      - name: Stage Android APK
+        run: |
+          mkdir -p _artifact
+          cp client/mobile/android/app/build/outputs/apk/debug/app-debug.apk _artifact/NS-mobile.apk
+
       - name: Upload Android APK
         uses: actions/upload-artifact@v6
         with:
-          name: ns-control-android-debug-apk
-          path: client/mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          name: ns-mobile-android-apk
+          path: _artifact/NS-mobile.apk
           if-no-files-found: error
 
   build-ios:
@@ -69,16 +76,25 @@ jobs:
             CODE_SIGN_IDENTITY='' \
             build
 
-      - name: Package iOS app bundle
+      - name: Package iOS IPA (unsigned)
         run: |
-          mkdir -p _artifact
-          ditto -c -k --keepParent \
-            client/mobile/ios/build/Release-iphoneos/NSControl.app \
-            _artifact/NSControl-ios-unsigned.app.zip
+          set -euo pipefail
+          mkdir -p _artifact Payload
+          APP="$(find client/mobile/ios/build/Release-iphoneos -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "Could not find built .app"
+            find client/mobile/ios/build -maxdepth 4 -print | sort
+            exit 1
+          fi
+          rm -rf Payload/NS-mobile.app
+          ditto "$APP" Payload/NS-mobile.app
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName NS-mobile" Payload/NS-mobile.app/Info.plist 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName NS-mobile" Payload/NS-mobile.app/Info.plist 2>/dev/null || true
+          ditto -c -k --sequesterRsrc --keepParent Payload _artifact/NS-mobile.ipa
 
-      - name: Upload iOS app bundle
+      - name: Upload iOS IPA
         uses: actions/upload-artifact@v6
         with:
-          name: ns-control-ios-unsigned-app
-          path: _artifact/NSControl-ios-unsigned.app.zip
+          name: ns-mobile-ios-ipa
+          path: _artifact/NS-mobile.ipa
           if-no-files-found: error

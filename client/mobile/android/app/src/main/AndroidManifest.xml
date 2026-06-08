@@ -6,7 +6,9 @@
 
     <application
         android:allowBackup="false"
-        android:label="NS Control"
+        android:label="NS-mobile"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.NSControl">
