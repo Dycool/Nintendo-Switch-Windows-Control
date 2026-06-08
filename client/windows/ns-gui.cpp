@@ -982,7 +982,7 @@ private:
             // Do NOT send real SDL accel yet.
             // Direct accel is what is probably causing the upward/diagonal correction.
             out.ax = 0;
-            out.ay = 4096;
+            out.ay = 0;
             out.az = 0;
 
             float gx = gyro[0];
