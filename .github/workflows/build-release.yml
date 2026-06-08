@@ -10,20 +10,14 @@ permissions:
   contents: write
 
 jobs:
-  build-windows:
-    uses: ./.github/workflows/build-windows.yml
+  build-clients:
+    uses: ./.github/workflows/build-clients.yml
 
-  build-linux:
-    uses: ./.github/workflows/build-linux.yml
-
-  build-mac:
-    uses: ./.github/workflows/build-mac.yml
-
-  build-pi-server:
-    uses: ./.github/workflows/build-pi.yml
+  build-server:
+    uses: ./.github/workflows/build-server.yml
 
   release:
-    needs: [build-windows, build-linux, build-mac, build-pi-server]
+    needs: [build-clients, build-server]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v7
@@ -35,21 +29,26 @@ jobs:
           mkdir -p _zips
 
           # Windows
-          zip -j _zips/ns-pc-control-windows.zip \
-            artifacts/windows-gamepad/ns-gamepad.exe \
-            artifacts/windows-gui/ns-gui.exe
+          mkdir -p _zips/_windows
+          cp -r artifacts/windows/* _zips/_windows/
+          cd _zips/_windows
+          zip -r ../ns-pc-control-windows.zip .
+          cd ../..
+          rm -rf _zips/_windows
 
           # Linux
-          zip -j _zips/ns-pc-control-linux.zip \
-            artifacts/linux-gamepad/ns-gamepad \
-            artifacts/linux-gui/ns-gui
+          mkdir -p _zips/_linux
+          cp -r artifacts/linux/* _zips/_linux/
+          cd _zips/_linux
+          zip -r ../ns-pc-control-linux.zip .
+          cd ../..
+          rm -rf _zips/_linux
 
-          # macOS CLI + GUI combined
+          # macOS
           mkdir -p _zips/_mac
-          cp artifacts/macos-gamepad/ns-gamepad _zips/_mac/
-          unzip -q artifacts/macos-gui/ns-pc-control-mac-gui.zip -d _zips/_mac/
+          cp -R artifacts/macos/ns-client.app _zips/_mac/
           cd _zips/_mac
-          zip -ry ../ns-pc-control-mac.zip ns-gamepad ns-gui.app
+          zip -ry ../ns-pc-control-mac.zip ns-client.app
           cd ../..
           rm -rf _zips/_mac
 

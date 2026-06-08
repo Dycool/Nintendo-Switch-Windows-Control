@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="client/windows/icon.png" alt="Icon" width="128" height="128">
+  <img src="client/icon.png" alt="Icon" width="128" height="128">
 </p>
 
 # NS PC Control
@@ -10,7 +10,7 @@ This project was built from scratch in **C++** and uses **UDP** for low latency.
 
 **Up to 4 players simultaneously** - Works with a single Raspberry Pi and a single PC.
 
-**Keyboard Support** - Windows and macOS support keyboard controls, either by overriding P1 or by using the keyboard as one player.
+**Keyboard Support** - Desktop clients support keyboard controls, either by overriding P1 or by using the keyboard as one player.
 
 **Web App & Mobile Touch Controls** - The server includes an embedded web interface with a desktop control panel and touch-optimized mobile gamepad, no client install needed.
 
@@ -68,7 +68,7 @@ sudo chrt -f 99 ./ns-backend -legacy
 
 ## Controls & Shortcuts
 
-Any **XInput-compatible controller** connected to your PC is supported, including Xbox controllers and most standard PC gamepads.
+Any **SDL-compatible controller** connected to your PC is supported, including Xbox, PlayStation, and most standard PC gamepads.
 
 | Action  | Shortcut |
 | ------- | -------- |
@@ -94,9 +94,7 @@ Detailed guides and technical information are in the `docs/` folder:
 
 | Component | Technology |
 |---|---|
-| **Linux client** | [SDL3 Gamepad API](https://wiki.libsdl.org/SDL3) / [GTK3](https://docs.gtk.org/gtk3/) |
-| **Windows client** | [XInput](https://learn.microsoft.com/en-us/windows/win32/xinput/xinput-input-structures) / [Winsock2](https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-reference) / [MSVC](https://visualstudio.microsoft.com/) / [MinGW](https://www.mingw-w64.org/) |
-| **macOS client** | [GameController.framework](https://developer.apple.com/documentation/gamecontroller) / [Foundation](https://developer.apple.com/documentation/foundation) |
+| **Desktop clients** | [Qt6 Widgets](https://doc.qt.io/qt-6/qtwidgets-index.html) / [SDL3 Gamepad API](https://wiki.libsdl.org/SDL3) / UDP sockets |
 | **Raspberry Pi server** | [Linux USB Gadget (configfs / libcomposite)](https://www.kernel.org/doc/html/latest/usb/gadget_configfs.html) / UDP sockets |
 | **Cryptography** | [HMAC-SHA256](https://datatracker.ietf.org/doc/html/rfc4868) (standalone C++ implementation) |
 | **Protocol** | Custom UDP-based protocol with magic/version/sequence number guards |

@@ -1,10 +1,10 @@
-name: Build Pi Backend
+name: Build Server
 
 on:
   push:
     paths:
-      - 'server/rpi/**'
-      - '.github/workflows/build-pi.yml'
+      - 'server/**'
+      - '.github/workflows/build-server.yml'
   workflow_dispatch:
   workflow_call:
 
@@ -38,7 +38,7 @@ jobs:
 
       - name: Build Unified Pi Server
         run: |
-          cd server/rpi
+          cd server
           mkdir -p build && cd build
           cmake .. \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
@@ -52,4 +52,4 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: pi-server
-          path: server/rpi/build/artifact/pi-server/
+          path: server/build/artifact/pi-server/

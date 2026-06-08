@@ -1,0 +1,207 @@
+name: Build Clients
+
+on:
+  push:
+    paths:
+      - 'client/**'
+      - 'server/include/**'
+      - '.github/workflows/build-clients.yml'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  SDL_REF: release-3.4.10
+  QT_VERSION: '6.8.3'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup MSVC
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+
+      - name: Restore SDL3 static cache
+        id: cache-sdl3
+        uses: actions/cache@v5
+        with:
+          path: _cache/sdl3-static
+          key: sdl3-${{ runner.os }}-x64-${{ env.SDL_REF }}-md-v2
+          restore-keys: |
+            sdl3-${{ runner.os }}-x64-${{ env.SDL_REF }}-md-
+
+      - name: Build and install SDL3 static
+        if: steps.cache-sdl3.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch $env:SDL_REF https://github.com/libsdl-org/SDL.git _deps/SDL
+
+          cmake -S _deps/SDL -B _deps/SDL/build-static -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX="$PWD/_cache/sdl3-static" `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL `
+            -DSDL_SHARED=OFF `
+            -DSDL_STATIC=ON `
+            -DSDL_TESTS=OFF `
+            -DSDL_TEST_LIBRARY=OFF `
+            -DSDL_EXAMPLES=OFF
+
+          cmake --build _deps/SDL/build-static --config Release --target install --parallel
+
+      - name: Build client
+        shell: pwsh
+        run: |
+          cmake -S client -B client/build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_PREFIX_PATH="$PWD/_cache/sdl3-static;$env:Qt6_DIR"
+
+          cmake --build client/build --config Release --target ns-client --parallel
+
+      - name: Stage artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force client/artifacts/windows | Out-Null
+
+          Copy-Item client/build/Release/ns-client.exe client/artifacts/windows/
+          Copy-Item client/icon.png client/artifacts/windows/
+
+          windeployqt --release --no-translations client/artifacts/windows/ns-client.exe
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows
+          path: client/artifacts/windows/
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config qt6-base-dev libgl1-mesa-dev libxkbcommon-dev
+
+      - name: Cache SDL3
+        id: cache-sdl3
+        uses: actions/cache@v5
+        with:
+          path: ~/.local/sdl3
+          key: sdl3-${{ runner.os }}-${{ env.SDL_REF }}-v2
+
+      - name: Build SDL3
+        if: steps.cache-sdl3.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$SDL_REF" https://github.com/libsdl-org/SDL.git /tmp/SDL3
+          cmake -S /tmp/SDL3 -B /tmp/SDL3-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOME/.local/sdl3" \
+            -DSDL_TEST_LIBRARY=OFF \
+            -DSDL_TESTS=OFF \
+            -DSDL_EXAMPLES=OFF
+          cmake --build /tmp/SDL3-build --parallel
+          cmake --install /tmp/SDL3-build
+
+      - name: Build client
+        run: |
+          cmake -S client -B client/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$HOME/.local/sdl3"
+          cmake --build client/build --parallel
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p client/artifacts/linux
+          cp client/build/ns-client client/artifacts/linux/
+          cp -P "$HOME/.local/sdl3/lib"/libSDL3.so* client/artifacts/linux/ || true
+          cp client/icon.png client/artifacts/linux/
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux
+          path: client/artifacts/linux/
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+
+      - name: Install build tools
+        run: brew install ninja
+
+      - name: Cache SDL3
+        id: cache-sdl3
+        uses: actions/cache@v5
+        with:
+          path: ~/.local/sdl3
+          key: sdl3-${{ runner.os }}-${{ env.SDL_REF }}-static-v2
+
+      - name: Build SDL3
+        if: steps.cache-sdl3.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$SDL_REF" https://github.com/libsdl-org/SDL.git /tmp/SDL3
+          cmake -S /tmp/SDL3 -B /tmp/SDL3-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOME/.local/sdl3" \
+            -DSDL_SHARED=OFF \
+            -DSDL_STATIC=ON \
+            -DSDL_TEST_LIBRARY=OFF \
+            -DSDL_TESTS=OFF \
+            -DSDL_EXAMPLES=OFF
+          cmake --build /tmp/SDL3-build --parallel
+          cmake --install /tmp/SDL3-build
+
+      - name: Build client
+        run: |
+          cmake -S client -B client/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$HOME/.local/sdl3;$Qt6_DIR"
+          cmake --build client/build --parallel
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p client/artifacts/macos
+          cp -R client/build/ns-client.app client/artifacts/macos/
+          mkdir -p client/artifacts/macos/ns-client.app/Contents/Resources
+          cp client/icon.png client/artifacts/macos/ns-client.app/Contents/Resources/icon.png
+          # Generate icon.icns for Finder icon
+          cd client/artifacts/macos/ns-client.app/Contents/Resources
+          mkdir -p icon.iconset
+          sips -z 16 16 icon.png --out icon.iconset/icon_16x16.png >/dev/null 2>&1
+          sips -z 32 32 icon.png --out icon.iconset/icon_16x16@2x.png >/dev/null 2>&1
+          sips -z 32 32 icon.png --out icon.iconset/icon_32x32.png >/dev/null 2>&1
+          sips -z 64 64 icon.png --out icon.iconset/icon_32x32@2x.png >/dev/null 2>&1
+          sips -z 128 128 icon.png --out icon.iconset/icon_128x128.png >/dev/null 2>&1
+          sips -z 256 256 icon.png --out icon.iconset/icon_128x128@2x.png >/dev/null 2>&1
+          sips -z 256 256 icon.png --out icon.iconset/icon_256x256.png >/dev/null 2>&1
+          sips -z 512 512 icon.png --out icon.iconset/icon_256x256@2x.png >/dev/null 2>&1
+          sips -z 512 512 icon.png --out icon.iconset/icon_512x512.png >/dev/null 2>&1
+          sips -z 1024 1024 icon.png --out icon.iconset/icon_512x512@2x.png >/dev/null 2>&1
+          iconutil -c icns icon.iconset -o ../icon.icns
+          rm -rf icon.iconset
+          cd ../../../../..
+          # Set CFBundleIconFile in Info.plist so Finder shows the icon
+          /usr/libexec/PlistBuddy -c "Add CFBundleIconFile string icon" \
+            client/artifacts/macos/ns-client.app/Contents/Info.plist 2>/dev/null || \
+          /usr/libexec/PlistBuddy -c "Set CFBundleIconFile icon" \
+            client/artifacts/macos/ns-client.app/Contents/Info.plist
+          macdeployqt client/artifacts/macos/ns-client.app -verbose=1
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: macos
+          path: client/artifacts/macos/

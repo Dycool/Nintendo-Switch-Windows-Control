@@ -177,14 +177,7 @@ The embedded web server also accepts chunked macro uploads via WebSocket.
 Load and upload a macro file:
 
 ```bash
-ns-gui --macro mymacro.json
-ns-gamepad --macro mymacro.json
-```
-
-Short form:
-
-```bash
-ns-gui -m mymacro.json
+ns-client --cli <pi-ip> --macro mymacro.json
 ```
 
 ### Web Interface

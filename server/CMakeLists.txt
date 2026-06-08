@@ -37,7 +37,7 @@ else()
     message(STATUS "UPnP support disabled by user")
 endif()
 
-add_executable(ns-backend src/backend/main.cpp)
+add_executable(ns-backend main.cpp)
 target_link_libraries(ns-backend PRIVATE pthread)
 
 if(MINIUPNPC_FOUND)

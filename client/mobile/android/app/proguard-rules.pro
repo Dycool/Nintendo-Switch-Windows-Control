@@ -1,0 +1,2 @@
+-keep class com.nscontrol.MainActivity$JSBridge { *; }
+-keepattributes JavascriptInterface

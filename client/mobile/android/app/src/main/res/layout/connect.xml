@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:padding="32dp"
+    android:background="#FFFFFF">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="NS Control"
+        android:textSize="34sp"
+        android:textStyle="bold"
+        android:textColor="#CC0000"
+        android:layout_marginBottom="8dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Connect to your Raspberry Pi server"
+        android:textSize="16sp"
+        android:textColor="#666666"
+        android:layout_marginBottom="40dp" />
+
+    <EditText
+        android:id="@+id/hostInput"
+        android:layout_width="match_parent"
+        android:layout_height="56dp"
+        android:hint="Server IP (e.g. 192.168.1.100)"
+        android:inputType="number|numberDecimal|numberSigned"
+        android:autofillHints=""
+        android:padding="16dp"
+        android:background="@drawable/input_bg"
+        android:textSize="16sp" />
+
+    <Button
+        android:id="@+id/connectBtn"
+        android:layout_width="match_parent"
+        android:layout_height="56dp"
+        android:text="Connect"
+        android:textSize="18sp"
+        android:textColor="#FFFFFF"
+        android:backgroundTint="#CC0000"
+        android:layout_marginTop="20dp" />
+
+    <TextView
+        android:id="@+id/statusText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Ready"
+        android:textSize="14sp"
+        android:textColor="#999999"
+        android:layout_marginTop="16dp" />
+
+</LinearLayout>
