@@ -221,12 +221,54 @@ jobs:
 
       - name: Create and deploy .app bundle
         run: |
-          APP="client/artifacts/macos/ns-client.app"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp client/build/ns-client "$APP/Contents/MacOS/ns-client"
-          chmod +x "$APP/Contents/MacOS/ns-client"
+          set -euo pipefail
 
-          cat > "$APP/Contents/Info.plist" <<'EOF'
+          APP="client/artifacts/macos/ns-client.app"
+          mkdir -p client/artifacts/macos
+          rm -rf "$APP"
+
+          echo "Build output tree:"
+          find client/build -maxdepth 4 -print | sort
+
+          # Depending on CMakeLists.txt / Qt settings, macOS may produce either:
+          #   client/build/ns-client                         plain binary
+          #   client/build/ns-client.app/Contents/MacOS/...  app bundle
+          # Be robust and support both forms.
+          BUILD_APP="$(find client/build -type d -name 'ns-client.app' -print -quit)"
+          if [ -n "$BUILD_APP" ]; then
+            echo "Found CMake-generated app bundle: $BUILD_APP"
+            ditto "$BUILD_APP" "$APP"
+          else
+            BIN=""
+            for candidate in \
+              "client/build/ns-client" \
+              "client/build/Release/ns-client" \
+              "client/build/RelWithDebInfo/ns-client" \
+              "client/build/MinSizeRel/ns-client"; do
+              if [ -f "$candidate" ]; then
+                BIN="$candidate"
+                break
+              fi
+            done
+
+            if [ -z "$BIN" ]; then
+              BIN="$(find client/build -type f -name 'ns-client' -print -quit)"
+            fi
+
+            if [ -z "$BIN" ]; then
+              echo "Could not find ns-client binary or ns-client.app in client/build"
+              exit 1
+            fi
+
+            echo "Found plain binary: $BIN"
+            mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+            cp "$BIN" "$APP/Contents/MacOS/ns-client"
+            chmod +x "$APP/Contents/MacOS/ns-client"
+          fi
+
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          if [ ! -f "$APP/Contents/Info.plist" ]; then
+            cat > "$APP/Contents/Info.plist" <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -252,9 +294,16 @@ jobs:
           </dict>
           </plist>
           EOF
+          else
+            /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable ns-client" "$APP/Contents/Info.plist" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string ns-client" "$APP/Contents/Info.plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile icon" "$APP/Contents/Info.plist" 2>/dev/null || \
+              /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string icon" "$APP/Contents/Info.plist"
+          fi
 
           cp client/icon.png "$APP/Contents/Resources/icon.png"
           cd "$APP/Contents/Resources"
+          rm -rf icon.iconset
           mkdir -p icon.iconset
           sips -z 16 16 icon.png --out icon.iconset/icon_16x16.png >/dev/null 2>&1
           sips -z 32 32 icon.png --out icon.iconset/icon_16x16@2x.png >/dev/null 2>&1
