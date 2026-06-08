@@ -22,6 +22,7 @@ private let kHatN: UInt8 = 0; let kHatNE: UInt8 = 1; let kHatE: UInt8 = 2; let k
 private let kHatS: UInt8 = 4; let kHatSW: UInt8 = 5; let kHatW: UInt8 = 6; let kHatNW: UInt8 = 7
 private let kHatNeutral: UInt8 = 8
 
+private let kAccelScale: Float = 4096.0
 private let kGyroScale: Float = 938.732 // 57.2958 * 16.384 (rad/s → Switch IMU)
 
 final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
@@ -35,23 +36,29 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     private let motion = CMMotionManager()
     private var engine: CHHapticEngine?
     private var engineNeedsStart = true
+    private var controllerHapticEngines: [ObjectIdentifier: CHHapticEngine] = [:]
     private var seq: UInt32 = 0
     private var connected = false
+    private var activeHost: String? = nil
     private let queue = DispatchQueue(label: "bridge", qos: .userInitiated)
     // Pad 0 touch data bridged from WebView JS (24 raw bytes)
     private var touchPad = Data(count: kPadSize)
+    private var lastTouchPadAt = Date.distantPast
 
     private override init() {
         super.init()
         startHaptics()
         observeControllers()
+        scanExistingControllers()
     }
 
     // MARK: - Connection
 
     func connect(host: String, port: UInt16 = 8080) {
+        if activeHost == host && ws != nil { return }
         disconnect()
         guard let url = URL(string: "ws://\(host):\(port)/") else { return }
+        activeHost = host
         var req = URLRequest(url: url)
         req.timeoutInterval = 10
         ws = session.webSocketTask(with: req)
@@ -62,11 +69,24 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     }
 
     func disconnect() {
-        ws?.cancel()
+        let hadClient = ws != nil || connected || activeHost != nil
+        if ws != nil {
+            // Release all virtual pads before closing the control WebSocket.
+            for _ in 0..<3 { sendResetFrame() }
+        }
+        ws?.cancel(with: .normalClosure, reason: nil)
         ws = nil
+        activeHost = nil
         connected = false
+        objc_sync_enter(self)
+        touchPad = Data(count: kPadSize)
+        lastTouchPadAt = Date.distantPast
+        objc_sync_exit(self)
         stopGyro()
-        DispatchQueue.main.async { self.onStatus?("Disconnected") }
+        engine?.stop(completionHandler: nil)
+        engineNeedsStart = true
+        for e in controllerHapticEngines.values { e.stop(completionHandler: nil) }
+        if hadClient { DispatchQueue.main.async { self.onStatus?("Disconnected") } }
     }
 
     func urlSession(_ session: URLSession,
@@ -82,14 +102,19 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
                     reason: Data?) {
         connected = false
+        activeHost = nil
         stopGyro()
         DispatchQueue.main.async { self.onStatus?("Disconnected") }
     }
 
     /// Called from injected JS bridge with 24 raw bytes for pad 0
     func bridgeTouchPad(_ data: Data) {
+        guard connected else { return }
         objc_sync_enter(self)
-        if data.count >= kPadSize { touchPad = Data(data.prefix(kPadSize)) }
+        if data.count >= kPadSize {
+            touchPad = Data(data.prefix(kPadSize))
+            lastTouchPadAt = Date()
+        }
         objc_sync_exit(self)
     }
 
@@ -105,52 +130,52 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    private func sendResetFrame() {
+        var frame = Data(capacity: 116)
+        withUnsafeBytes(of: kProtoMagic.littleEndian) { frame.append(contentsOf: $0) }
+        frame.append(kWebProtoVer)
+        frame.append(0x01) // FLAG_RESET
+        frame.append(contentsOf: [0, 0])
+        withUnsafeBytes(of: seq.littleEndian) { frame.append(contentsOf: $0) }
+        seq &+= 1
+        let ts = UInt64(Date().timeIntervalSince1970 * 1_000_000).littleEndian
+        withUnsafeBytes(of: ts) { frame.append(contentsOf: $0) }
+        frame.append(Data(count: 96))
+        ws?.send(.data(frame)) { _ in }
+    }
+
     private func sendFrame() {
         var frame = Data(capacity: 116)
         // Header (all little-endian)
         withUnsafeBytes(of: kProtoMagic.littleEndian) { frame.append(contentsOf: $0) }
         frame.append(kWebProtoVer)
-        frame.append(kSinglePad)
+        let hasController = controllers.contains { $0 != nil }
+        let touchActive = touchModeActive()
+        frame.append((!hasController && touchActive) ? kSinglePad : UInt8(0)) // touch mode is single-pad only while the touch page is active
         frame.append(contentsOf: [0, 0]) // reserved
         withUnsafeBytes(of: seq.littleEndian) { frame.append(contentsOf: $0) }
         let ts = UInt64(Date().timeIntervalSince1970 * 1_000_000).littleEndian
         withUnsafeBytes(of: ts) { frame.append(contentsOf: $0) }
 
         for p in 0..<4 {
-            var pad = Data(count: kPadSize)
-            if p == 0 {
+            var pad = self.neutralPad()
+            if p < self.controllers.count, let gc = self.controllers[p] {
+                self.mergeGCController(gc, into: &pad)
+                _ = self.mergeGCControllerMotion(gc, into: &pad)
+            } else if p == 0 && touchActive {
                 objc_sync_enter(self)
                 pad = self.touchPad
                 objc_sync_exit(self)
-                // Overwrite motion bytes (offset 8-19) with gyro
-                if let g = self.currentGyro {
-                    // Match protocol.hpp layout and the desktop SDL mapping:
-                    // MotionReport = ax, ay, az, gx, gy, gz.
-                    let ax = clampMotion(Float(-g.gravity.x) * 4096)
-                    let ay = clampMotion(Float(-g.gravity.z) * 4096)
-                    let az = clampMotion(Float( g.gravity.y) * 4096)
-                    let gx = clampMotion(Float(-g.rotationRate.x) * kGyroScale)
-                    let gy = clampMotion(Float(-g.rotationRate.z) * kGyroScale)
-                    let gz = clampMotion(Float( g.rotationRate.y) * kGyroScale)
-                    pad[8..<10] = withUnsafeBytes(of: ax.littleEndian) { Data($0) }
-                    pad[10..<12] = withUnsafeBytes(of: ay.littleEndian) { Data($0) }
-                    pad[12..<14] = withUnsafeBytes(of: az.littleEndian) { Data($0) }
-                    pad[14..<16] = withUnsafeBytes(of: gx.littleEndian) { Data($0) }
-                    pad[16..<18] = withUnsafeBytes(of: gy.littleEndian) { Data($0) }
-                    pad[18..<20] = withUnsafeBytes(of: gz.littleEndian) { Data($0) }
-                    pad[20] = 1 // has_motion
-                }
-                if let gc = self.controllers[0] {
-                    self.mergeGCController(gc, into: &pad)
-                }
-            } else if p < self.controllers.count, let gc = self.controllers[p] {
-                self.mergeGCController(gc, into: &pad)
-                pad[7] |= kExtPresent
+                self.mergePhoneMotion(into: &pad)
             }
             frame.append(pad)
         }
         seq &+= 1
         ws?.send(.data(frame)) { _ in }
+    }
+
+    private func touchModeActive() -> Bool {
+        connected && Date().timeIntervalSince(lastTouchPadAt) < 0.75
     }
 
     // MARK: - Gyro
@@ -170,6 +195,49 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         currentGyro = nil
     }
 
+    private func neutralPad() -> Data {
+        var pad = Data(count: kPadSize)
+        pad[2] = kHatNeutral
+        pad[3] = 128; pad[4] = 128
+        pad[5] = 128; pad[6] = 128
+        return pad
+    }
+
+    private func writeMotion(into pad: inout Data, ax: Int16, ay: Int16, az: Int16,
+                             gx: Int16, gy: Int16, gz: Int16) {
+        pad[8..<10] = withUnsafeBytes(of: ax.littleEndian) { Data($0) }
+        pad[10..<12] = withUnsafeBytes(of: ay.littleEndian) { Data($0) }
+        pad[12..<14] = withUnsafeBytes(of: az.littleEndian) { Data($0) }
+        pad[14..<16] = withUnsafeBytes(of: gx.littleEndian) { Data($0) }
+        pad[16..<18] = withUnsafeBytes(of: gy.littleEndian) { Data($0) }
+        pad[18..<20] = withUnsafeBytes(of: gz.littleEndian) { Data($0) }
+        pad[20] = 1
+    }
+
+    private func mergePhoneMotion(into pad: inout Data) {
+        guard let g = currentGyro else { return }
+        let ax = clampMotion(Float(-g.gravity.x) * kAccelScale)
+        let ay = clampMotion(Float(-g.gravity.z) * kAccelScale)
+        let az = clampMotion(Float( g.gravity.y) * kAccelScale)
+        let gx = clampMotion(Float(-g.rotationRate.x) * kGyroScale)
+        let gy = clampMotion(Float(-g.rotationRate.z) * kGyroScale)
+        let gz = clampMotion(Float( g.rotationRate.y) * kGyroScale)
+        writeMotion(into: &pad, ax: ax, ay: ay, az: az, gx: gx, gy: gy, gz: gz)
+    }
+
+    private func mergeGCControllerMotion(_ gc: GCController, into pad: inout Data) -> Bool {
+        guard let m = gc.motion else { return false }
+        if m.sensorsRequireManualActivation && !m.sensorsActive { m.sensorsActive = true }
+        let ax = clampMotion(Float(-m.gravity.x) * kAccelScale)
+        let ay = clampMotion(Float(-m.gravity.z) * kAccelScale)
+        let az = clampMotion(Float( m.gravity.y) * kAccelScale)
+        let gx = clampMotion(Float(-m.rotationRate.x) * kGyroScale)
+        let gy = clampMotion(Float(-m.rotationRate.z) * kGyroScale)
+        let gz = clampMotion(Float( m.rotationRate.y) * kGyroScale)
+        writeMotion(into: &pad, ax: ax, ay: ay, az: az, gx: gx, gy: gy, gz: gz)
+        return true
+    }
+
     // MARK: - Rumble
 
     private func readRumble() {
@@ -183,7 +251,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
                     let high = d[d.startIndex + 6]
                     DispatchQueue.main.async {
                         self.onRumble?(Int(subpad), low, high)
-                        self.playHaptic(low: low, high: high)
+                        self.routeRumble(subpad: Int(subpad), low: low, high: high)
                     }
                 }
                 self.readRumble()
@@ -208,11 +276,25 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         } catch { engine = nil }
     }
 
-    private func playHaptic(low: UInt8, high: UInt8) {
+    private func routeRumble(subpad: Int, low: UInt8, high: UInt8) {
+        guard connected else { return }
+        if subpad >= 0 && subpad < controllers.count, let gc = controllers[subpad] {
+            _ = playControllerHaptic(gc, low: low, high: high)
+            return
+        }
+
+        // If any physical controller is active, never fake its rumble with phone
+        // haptics. And if we are in the main menu/editor, stay silent too.
+        if controllers.contains(where: { $0 != nil }) { return }
+        if touchModeActive() { playPhoneHaptic(low: low, high: high) }
+    }
+
+    private func playPhoneHaptic(low: UInt8, high: UInt8) {
+        guard low != 0 || high != 0 else { return }
         guard let engine = engine else { return }
         if engineNeedsStart { try? engine.start(); engineNeedsStart = false }
         do {
-            let intensity = Float(high) / 255.0
+            let intensity = max(Float(high), Float(low)) / 255.0
             let sharpness = Float(low) / 255.0
             let ev = CHHapticEvent(eventType: .hapticContinuous,
                                    parameters: [
@@ -225,20 +307,80 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         } catch {}
     }
 
+    private func playControllerHaptic(_ gc: GCController, low: UInt8, high: UInt8) -> Bool {
+        let id = ObjectIdentifier(gc)
+        if low == 0 && high == 0 {
+            controllerHapticEngines[id]?.stop(completionHandler: nil)
+            return true
+        }
+        guard let haptics = gc.haptics else { return false }
+        let engine: CHHapticEngine
+        if let existing = controllerHapticEngines[id] {
+            engine = existing
+        } else if let created = haptics.createEngine(withLocality: GCHapticsLocality.default) {
+            engine = created
+            controllerHapticEngines[id] = created
+        } else {
+            return false
+        }
+        do {
+            try engine.start()
+            let intensity = max(Float(high), Float(low)) / 255.0
+            let sharpness = Float(low) / 255.0
+            let ev = CHHapticEvent(eventType: .hapticContinuous,
+                                   parameters: [
+                                    CHHapticEventParameter(parameterID: .hapticIntensity, value: intensity),
+                                    CHHapticEventParameter(parameterID: .hapticSharpness, value: sharpness)],
+                                   relativeTime: 0, duration: 0.1)
+            let pattern = try CHHapticPattern(events: [ev], parameters: [])
+            let player = try engine.makePlayer(with: pattern)
+            try player.start(atTime: 0)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     // MARK: - Physical controllers (GCController)
 
     private var controllers: [GCController?] = [nil, nil, nil, nil]
 
     private func observeControllers() {
         NotificationCenter.default.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] n in
-            guard let gc = n.object as? GCController else { return }
-            for i in 0..<4 where self?.controllers[i] == nil { self?.controllers[i] = gc; break }
+            guard let self = self, let gc = n.object as? GCController else { return }
+            self.addController(gc)
         }
         NotificationCenter.default.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { [weak self] n in
-            guard let gc = n.object as? GCController else { return }
-            self?.controllers = self?.controllers.map { $0 === gc ? nil : $0 } ?? []
+            guard let self = self, let gc = n.object as? GCController else { return }
+            self.removeController(gc)
         }
         GCController.startWirelessControllerDiscovery {}
+    }
+
+    private func scanExistingControllers() {
+        for gc in GCController.controllers() { addController(gc) }
+    }
+
+    private func addController(_ gc: GCController) {
+        configureController(gc)
+        for i in 0..<4 where controllers[i] == nil {
+            controllers[i] = gc
+            DispatchQueue.main.async { self.onStatus?("Controller connected") }
+            return
+        }
+    }
+
+    private func removeController(_ gc: GCController) {
+        controllerHapticEngines[ObjectIdentifier(gc)]?.stop(completionHandler: nil)
+        controllerHapticEngines.removeValue(forKey: ObjectIdentifier(gc))
+        controllers = controllers.map { $0 === gc ? nil : $0 }
+        DispatchQueue.main.async { self.onStatus?("Controller disconnected") }
+    }
+
+    private func configureController(_ gc: GCController) {
+        if let m = gc.motion {
+            m.sensorsActive = true
+        }
     }
 
     private func clampMotion(_ v: Float) -> Int16 {

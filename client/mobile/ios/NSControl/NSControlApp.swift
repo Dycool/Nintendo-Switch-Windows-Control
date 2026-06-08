@@ -54,9 +54,10 @@ struct ContentView: View {
             Button("Connect") {
                 host = host.trimmingCharacters(in: .whitespaces)
                 guard !host.isEmpty else { return }
-                BridgeManager.shared.connect(host: host)
+                BridgeManager.shared.disconnect()
                 connected = true
                 page = .mainMenu
+                status = "Loaded"
             }
             .buttonStyle(.borderedProminent)
             .tint(.red)
@@ -101,6 +102,11 @@ struct WebViewContainer: UIViewRepresentable {
             case .editor:        return "http://\(host):8080/editor"
             }
         }()
+        if page == .touchControls {
+            BridgeManager.shared.connect(host: host)
+        } else {
+            BridgeManager.shared.disconnect()
+        }
         guard wv.url?.absoluteString != target else { return }
         wv.load(URLRequest(url: URL(string: target)!))
     }
@@ -151,7 +157,10 @@ struct WebViewContainer: UIViewRepresentable {
                   let type = dict["type"] as? String else { return }
             switch type {
             case "back":
+                BridgeManager.shared.disconnect()
                 DispatchQueue.main.async { self.parent.page = .mainMenu }
+            case "close":
+                BridgeManager.shared.disconnect()
             case "binary":
                 guard let arr = dict["data"] as? [Int], arr.count >= 44 else { return }
                 // Extract pad 0 bytes (24 bytes at offset 20 in the 116-byte frame)
@@ -172,6 +181,7 @@ struct WebViewContainer: UIViewRepresentable {
                     decisionHandler(.cancel); return
                 }
                 if url.path == "/editor" {
+                    BridgeManager.shared.disconnect()
                     DispatchQueue.main.async { self.parent.page = .editor }
                     decisionHandler(.cancel); return
                 }
