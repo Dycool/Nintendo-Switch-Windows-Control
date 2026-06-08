@@ -975,14 +975,12 @@ private:
         has_motion = false;
 
         float accel[3] = {};
-        bool got_accel = false;
         if (d.accel_enabled && SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, accel, 3)) {
-            // Cross SDL accel into the axes that pro-main packs as Nintendo Y, X, Z.
-            out.ay = clamp_motion_i16((accel[0] / 9.80665f) * 4096.0f);
-            out.ax = clamp_motion_i16((-accel[1] / 9.80665f) * 4096.0f);
-            out.az = clamp_motion_i16((-accel[2] / 9.80665f) * 4096.0f);
+            // SDL accel m/s^2 -> console units. pro-main handles Nintendo Y,X,Z packing.
+            out.ax = clamp_motion_i16((accel[0] / 9.80665f) * 4096.0f);
+            out.ay = clamp_motion_i16((accel[1] / 9.80665f) * 4096.0f);
+            out.az = clamp_motion_i16((accel[2] / 9.80665f) * 4096.0f);
             has_motion = true;
-            got_accel = true;
         }
 
         float gyro[3] = {};
@@ -990,10 +988,10 @@ private:
             constexpr float RAD_TO_DEG = 57.29577951308232f;
             constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.384f;
 
-            // No filters at the Pro-like 66Hz cadence; only align signs.
-            out.gx = clamp_motion_i16(-gyro[0] * CONSOLE_GYRO_SCALE);
-            out.gy = clamp_motion_i16(-gyro[1] * CONSOLE_GYRO_SCALE);
-            out.gz = clamp_motion_i16(-gyro[2] * CONSOLE_GYRO_SCALE);
+            // SDL gyro rad/s -> console units. No filters or sign flips.
+            out.gx = clamp_motion_i16(gyro[0] * CONSOLE_GYRO_SCALE);
+            out.gy = clamp_motion_i16(gyro[1] * CONSOLE_GYRO_SCALE);
+            out.gz = clamp_motion_i16(gyro[2] * CONSOLE_GYRO_SCALE);
 
             has_motion = true;
         }
@@ -1362,6 +1360,7 @@ static uint8_t g_hmacKey[32]{};
 static uint32_t g_packetCount = 0;
 static std::string g_targetHost;
 static uint16_t g_targetPort = ns::DEFAULT_PORT;
+static bool g_horiUdpRate = false;
 
 // ── Keyboard Mode ──
 enum { KB_OFF = 0, KB_SINGLE = 1, KB_OVERRIDE = 2 };
@@ -2799,8 +2798,10 @@ static void SenderThread() {
         pump_udp_rumble(sock, rumble, sdlForSlot);
         rumble.update_timeouts(sdlForSlot);
 
-        // Match a real USB Pro Controller's boring ~66Hz / 15ms input cadence.
-        if (activeCount > 0) std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        if (activeCount > 0) {
+            const int sendIntervalMs = g_horiUdpRate ? ns::HORI_UDP_INTERVAL_MS : ns::PRO_UDP_INTERVAL_MS;
+            std::this_thread::sleep_for(std::chrono::milliseconds(sendIntervalMs));
+        }
         else std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
@@ -3371,6 +3372,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     SDL_SetMainReady();
     g_sdlInput.start();
     g_hInst = hInst;
+    const char* horiEnv = std::getenv("NSPC_HORI_UDP");
+    g_horiUdpRate = horiEnv && horiEnv[0] && std::strcmp(horiEnv, "0") != 0;
 
     WSADATA wsa{};
     WSAStartup(MAKEWORD(2, 2), &wsa);

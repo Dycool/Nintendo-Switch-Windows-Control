@@ -1379,8 +1379,11 @@ int main(int argc, char** argv) {
             rumble.update_timeouts(controller_for_slot);
         }
 
-        // Dynamic throttling: 250Hz when active, light keepalive when idle.
-        if (active_count > 0) next_tick += std::chrono::milliseconds(4);
+        // Hori/legacy servers want 250Hz; Pro/modern servers want ~66Hz.
+        if (active_count > 0) {
+            const int send_interval_ms = g_legacy_udp ? ns::HORI_UDP_INTERVAL_MS : ns::PRO_UDP_INTERVAL_MS;
+            next_tick += std::chrono::milliseconds(send_interval_ms);
+        }
         else next_tick += std::chrono::milliseconds(50);
     }
 

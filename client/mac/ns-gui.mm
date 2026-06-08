@@ -2889,7 +2889,7 @@ static bool MacroWriteURLMac(NSURL* url, const std::string& text) {
             self->packetCount++;
 
             auto interval = (active_count > 0)
-                ? std::chrono::milliseconds(15)
+                ? std::chrono::milliseconds(g_legacyUdp ? ns::HORI_UDP_INTERVAL_MS : ns::PRO_UDP_INTERVAL_MS)
                 : std::chrono::milliseconds(50); // keep connection alive below watchdog timeout
             std::this_thread::sleep_for(interval);
         }

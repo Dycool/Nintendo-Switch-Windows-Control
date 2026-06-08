@@ -30,7 +30,11 @@ static constexpr uint8_t  PROTO_VERSION = 4;           // Legacy 4-player UDP pa
 static constexpr uint8_t  WEB_PROTO_VERSION = 5;       // Extended input + optional motion
 static constexpr uint16_t DEFAULT_PORT  = 7331;
 static constexpr int      WATCHDOG_MS   = 1200;
-static constexpr int      WRITER_HZ     = 250;
+static constexpr int      HORI_UDP_HZ   = 250;
+static constexpr int      PRO_UDP_HZ    = 66;
+static constexpr int      HORI_UDP_INTERVAL_MS = 4;
+static constexpr int      PRO_UDP_INTERVAL_MS  = 15;
+static constexpr int      WRITER_HZ     = HORI_UDP_HZ;
 static constexpr int      AUTOFIRE_HZ   = 12;
 
 static constexpr const char* DEFAULT_SECRET = "nsc-R2xvCy7Eyw2nfbZIOGyKZPnostpaRY";

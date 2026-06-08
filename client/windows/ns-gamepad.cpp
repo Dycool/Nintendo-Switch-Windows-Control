@@ -1747,7 +1747,8 @@ int main(int argc, char** argv) {
 
         if (active_count > 0) {
             no_controllers_printed = false;
-            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            const int send_interval_ms = legacy_udp ? ns::HORI_UDP_INTERVAL_MS : ns::PRO_UDP_INTERVAL_MS;
+            std::this_thread::sleep_for(std::chrono::milliseconds(send_interval_ms));
         } else {
             if (!no_controllers_printed) {
                 std::cout << "No controllers detected - waiting for connections...\n";

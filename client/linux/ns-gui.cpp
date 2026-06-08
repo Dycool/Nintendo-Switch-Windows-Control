@@ -1694,7 +1694,10 @@ static void SenderThread(std::string host, uint16_t port) {
             rumble.update_timeouts(controller_for_slot);
         }
 
-        if (active_count > 0) next_tick += std::chrono::milliseconds(15);
+        if (active_count > 0) {
+            const int send_interval_ms = g_legacy_udp ? ns::HORI_UDP_INTERVAL_MS : ns::PRO_UDP_INTERVAL_MS;
+            next_tick += std::chrono::milliseconds(send_interval_ms);
+        }
         else next_tick += std::chrono::milliseconds(50);
     }
 
