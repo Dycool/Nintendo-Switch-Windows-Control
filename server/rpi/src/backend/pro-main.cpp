@@ -4157,8 +4157,8 @@ static void flush_rumble_to_udp(int sock, int client_idx) {
         // fallback for the same frame. Older clients still receive something,
         // but not a second full-strength vibration on top of the HD path.
         RumblePacket fallback = pending[s];
-        fallback.strong = (uint8_t)((int)fallback.strong * 45 / 100);
-        fallback.weak   = (uint8_t)((int)fallback.weak   * 45 / 100);
+        fallback.high_freq = (uint8_t)((int)fallback.high_freq * 45 / 100);
+        fallback.low_freq  = (uint8_t)((int)fallback.low_freq  * 45 / 100);
 
         ssize_t sent = sendto(sock, &fallback, sizeof(RumblePacket), 0,
                               reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));

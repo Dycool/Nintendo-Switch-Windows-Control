@@ -840,7 +840,13 @@ public:
         if (!initialized || sdl_slot < 0 || sdl_slot >= 4) return false;
         Device* d = device_for_slot_locked(sdl_slot);
         if (!d || !d->pad || !SDL_GamepadConnected(d->pad)) return false;
-        return SDL_SendGamepadEffect(d->pad, precision, 8);
+
+        const bool ok = SDL_SendGamepadEffect(d->pad, precision, 8);
+        if (!ok) {
+            const char* e = SDL_GetError();
+            last_error = (e && *e) ? e : "SDL precision/HD rumble effect failed";
+        }
+        return ok;
     }
 
     void stop_all_rumble() {
@@ -1123,14 +1129,18 @@ public:
                          const int sdl_for_slot[4]) {
         if (rp.subpad >= 4) return;
         const int slot = rp.subpad;
-        const bool neutral = (rp.low_freq == 0 && rp.high_freq == 0) || rp.duration_10ms == 0;
         bool precision_payload_zero = true;
         for (uint8_t b : rp.precision) precision_payload_zero = precision_payload_zero && b == 0;
+        const bool neutral = precision_payload_zero &&
+                             ((rp.low_freq == 0 && rp.high_freq == 0) || rp.duration_10ms == 0);
         const bool ok_precision = (!precision_payload_zero || neutral) &&
                            sdl_for_slot[slot] >= 0 &&
                            g_sdlInput.set_precision_rumble(sdl_for_slot[slot], rp.precision);
         if (ok_precision) {
-            states[slot].suppress_classic_until_us = ns::now_us() + 50000ULL;
+            // Backend sends precision first and classic fallback immediately after.
+            // Suppress the fallback long enough to cover scheduling/UDP jitter so
+            // HD-capable clients do not play two vibrations for one console frame.
+            states[slot].suppress_classic_until_us = ns::now_us() + 150000ULL;
             if (neutral) {
                 states[slot].until_us = 0;
                 states[slot].low = states[slot].high = 0;
@@ -1157,7 +1167,10 @@ public:
         uint8_t high = rp.high_freq;
         bool neutral = (low == 0 && high == 0) || rp.duration_10ms == 0;
         uint64_t now = ns::now_us();
-        uint64_t dur_us = neutral ? 0ULL : std::max<uint64_t>(250000ULL, (uint64_t)rp.duration_10ms * 10000ULL);
+        // Classic rumble is fallback only. Keep a small floor so very short
+        // pulses are still felt, but do not stretch every fallback pulse to 250ms,
+        // because that makes HD+fallback setups feel massively overpowered.
+        uint64_t dur_us = neutral ? 0ULL : std::max<uint64_t>(80000ULL, (uint64_t)rp.duration_10ms * 10000ULL);
         uint32_t dur_ms = neutral ? 0U : (uint32_t)std::min<uint64_t>(dur_us / 1000ULL, 0xFFFFFFFFULL);
 
         // Keep the old anti-spam behavior: several Bluetooth stacks really do
