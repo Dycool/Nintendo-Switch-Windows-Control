@@ -931,7 +931,7 @@ static uint8_t pro_timer_from_us(uint64_t t_us) {
 static constexpr size_t PRO_REPORT_SIZE = 64;
 // Full input reports run at the common 15ms cadence, with 3 IMU samples spaced
 // roughly 5ms apart.
-static constexpr uint64_t PRO_REPORT_INTERVAL_US = 15'000ULL;
+static constexpr uint64_t PRO_REPORT_INTERVAL_US = 4'000ULL;
 static constexpr int PRO_WRITER_HZ = 1'000'000 / PRO_REPORT_INTERVAL_US;
 static constexpr uint8_t  PRO_BAT_CON = 0x91;
 static constexpr uint8_t  PRO_VIBRATOR_REPORT = 0x0B;
