@@ -12,6 +12,8 @@ import android.webkit.*
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import okhttp3.*
+import okio.ByteString
+import okio.ByteString.Companion.toByteString
 import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -34,7 +36,9 @@ class MainActivity : AppCompatActivity() {
     // Gyro (rad/s)
     private val sensorManager by lazy { getSystemService(SENSOR_SERVICE) as SensorManager }
     private var gyroListener: SensorEventListener? = null
-    private var gyroValues = FloatArray(3) // x, y, z angular velocity
+    private var accelListener: SensorEventListener? = null
+    private var gyroValues = FloatArray(3) // x, y, z angular velocity, rad/s
+    private var accelValues = floatArrayOf(0f, STANDARD_GRAVITY, 0f) // x, y, z acceleration, m/s^2
 
     // Haptics
     private val vibrator by lazy { getSystemService(VIBRATOR_SERVICE) as Vibrator }
@@ -119,7 +123,7 @@ class MainActivity : AppCompatActivity() {
     private fun sendFrame() {
         val buf = ByteBuffer.allocate(116).order(ByteOrder.LITTLE_ENDIAN)
         buf.putInt(0x4E535743)        // magic
-        buf.put(5)                     // version
+        buf.put(5)                     // WEB_PROTO_VERSION
         buf.put(0x04)                  // FLAG_SINGLE_PAD
         buf.putShort(0)                // reserved
         buf.putInt(seq++)
@@ -128,33 +132,47 @@ class MainActivity : AppCompatActivity() {
         for (p in 0 until 4) {
             if (p == 0) {
                 val touch = touchFrame
-                if (touch != null && touch.size >= 44) {
-                    buf.put(touch.sliceArray(20 until 28)) // HIDReport bytes
-                    val g = gyroValues
-                    buf.putShort(clampMotion(g[0] * GYRO_SCALE))
-                    buf.putShort(clampMotion(g[1] * GYRO_SCALE))
-                    buf.putShort(clampMotion(g[2] * GYRO_SCALE))
-                    buf.putShort(0); buf.putShort(0); buf.putShort(0) // accel
-                    buf.put(1) // has_motion
-                    buf.put(ByteArray(3))
+                if (touch != null && touch.size >= 28) {
+                    // The browser/mobile page sends a complete 116-byte web frame.
+                    // Pad 0's HIDReport starts at byte 20 and is 8 bytes long.
+                    buf.put(touch.sliceArray(20 until 28))
                 } else {
-                    buf.putShort(0); buf.put(8)
-                    buf.put(128); buf.put(128); buf.put(128); buf.put(128); buf.put(0)
-                    val g = gyroValues
-                    buf.putShort(clampMotion(g[0] * GYRO_SCALE))
-                    buf.putShort(clampMotion(g[1] * GYRO_SCALE))
-                    buf.putShort(clampMotion(g[2] * GYRO_SCALE))
-                    buf.putShort(0); buf.putShort(0); buf.putShort(0)
-                    buf.put(1)
-                    buf.put(ByteArray(3))
+                    putNeutralHid(buf)
                 }
+                putMotion(buf)
             } else {
-                buf.putShort(0); buf.put(8)
-                buf.put(128); buf.put(128); buf.put(128); buf.put(128); buf.put(0)
+                putNeutralHid(buf)
                 buf.put(ByteArray(16))
             }
         }
-        ws?.send(ByteString.of(buf.array()))
+        ws?.send(buf.array().toByteString())
+    }
+
+    private fun putNeutralHid(buf: ByteBuffer) {
+        buf.putShort(0)  // buttons
+        buf.put(8)       // neutral hat
+        buf.put(128.toByte()); buf.put(128.toByte()) // left stick
+        buf.put(128.toByte()); buf.put(128.toByte()) // right stick
+        buf.put(0)       // vendor/present byte; FLAG_SINGLE_PAD keeps pad 0 present server-side
+    }
+
+    private fun putMotion(buf: ByteBuffer) {
+        val a = accelValues
+        val g = gyroValues
+
+        // Match the desktop SDL path and protocol.hpp layout:
+        // MotionReport = ax, ay, az, gx, gy, gz.
+        val ax = clampMotion(-a[0] * ACCEL_SCALE)
+        val ay = clampMotion(-a[2] * ACCEL_SCALE)
+        val az = clampMotion( a[1] * ACCEL_SCALE)
+        val gx = clampMotion(-g[0] * GYRO_SCALE)
+        val gy = clampMotion(-g[2] * GYRO_SCALE)
+        val gz = clampMotion( g[1] * GYRO_SCALE)
+
+        buf.putShort(ax); buf.putShort(ay); buf.putShort(az)
+        buf.putShort(gx); buf.putShort(gy); buf.putShort(gz)
+        buf.put(1)          // has_motion
+        buf.put(ByteArray(3))
     }
 
     // ═══════════════════════════════
@@ -162,15 +180,27 @@ class MainActivity : AppCompatActivity() {
     // ═══════════════════════════════
 
     private fun startGyro() {
-        val sensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
-        if (sensor == null) return
-        gyroListener = object : SensorEventListener {
-            override fun onSensorChanged(e: SensorEvent) {
-                System.arraycopy(e.values, 0, gyroValues, 0, 3)
+        val gyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        if (gyro != null) {
+            gyroListener = object : SensorEventListener {
+                override fun onSensorChanged(e: SensorEvent) {
+                    System.arraycopy(e.values, 0, gyroValues, 0, 3)
+                }
+                override fun onAccuracyChanged(s: Sensor, a: Int) {}
             }
-            override fun onAccuracyChanged(s: Sensor, a: Int) {}
+            sensorManager.registerListener(gyroListener, gyro, SensorManager.SENSOR_DELAY_FASTEST)
         }
-        sensorManager.registerListener(gyroListener, sensor, SensorManager.SENSOR_DELAY_FASTEST)
+
+        val accel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        if (accel != null) {
+            accelListener = object : SensorEventListener {
+                override fun onSensorChanged(e: SensorEvent) {
+                    System.arraycopy(e.values, 0, accelValues, 0, 3)
+                }
+                override fun onAccuracyChanged(s: Sensor, a: Int) {}
+            }
+            sensorManager.registerListener(accelListener, accel, SensorManager.SENSOR_DELAY_GAME)
+        }
     }
 
     // ═══════════════════════════════
@@ -298,7 +328,9 @@ class MainActivity : AppCompatActivity() {
         sending = false; ws?.close(1000, null); ws = null
         connected = false
         gyroListener?.let { sensorManager.unregisterListener(it) }
+        accelListener?.let { sensorManager.unregisterListener(it) }
         gyroListener = null
+        accelListener = null
     }
 
     private fun clampMotion(v: Float): Short {
@@ -310,6 +342,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val STANDARD_GRAVITY = 9.80665f
+        private const val ACCEL_SCALE = 4096.0f / STANDARD_GRAVITY
         private const val GYRO_SCALE = 938.732f // 57.2958 * 16.384, rad/s → Switch IMU units
 
         // Injected at <head> — overrides WebSocket to bridge through native

@@ -18,8 +18,9 @@ private let kBtnMinus: UInt16  = 1<<8;  let kBtnPlus: UInt16   = 1<<9
 private let kBtnLStick: UInt16 = 1<<10; let kBtnRStick: UInt16 = 1<<11
 private let kBtnHome: UInt16   = 1<<12; let kBtnCapture: UInt16 = 1<<13
 
-private let kHatN: UInt8 = 0; let kHatE: UInt8 = 2
-private let kHatS: UInt8 = 4; let kHatW: UInt8 = 6
+private let kHatN: UInt8 = 0; let kHatNE: UInt8 = 1; let kHatE: UInt8 = 2; let kHatSE: UInt8 = 3
+private let kHatS: UInt8 = 4; let kHatSW: UInt8 = 5; let kHatW: UInt8 = 6; let kHatNW: UInt8 = 7
+private let kHatNeutral: UInt8 = 8
 
 private let kGyroScale: Float = 938.732 // 57.2958 * 16.384 (rad/s → Switch IMU)
 
@@ -30,7 +31,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     var onRumble: ((_ pad: Int, _ low: UInt8, _ high: UInt8) -> Void)?
 
     private var ws: URLSessionWebSocketTask?
-    private let session = URLSession(configuration: .ephemeral)
+    private lazy var session = URLSession(configuration: .ephemeral, delegate: self, delegateQueue: nil)
     private let motion = CMMotionManager()
     private var engine: CHHapticEngine?
     private var engineNeedsStart = true
@@ -40,7 +41,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     // Pad 0 touch data bridged from WebView JS (24 raw bytes)
     private var touchPad = Data(count: kPadSize)
 
-    override private init() {
+    private override init() {
         super.init()
         startHaptics()
         observeControllers()
@@ -54,7 +55,6 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         var req = URLRequest(url: url)
         req.timeoutInterval = 10
         ws = session.webSocketTask(with: req)
-        ws?.delegate = self
         ws?.resume()
         readRumble()
         startGyro()
@@ -69,14 +69,18 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         DispatchQueue.main.async { self.onStatus?("Disconnected") }
     }
 
-    func urlSession(_: URLSession, webSocketTask: URLSessionWebSocketTask, didOpen _: Protocol?) {
+    func urlSession(_ session: URLSession,
+                    webSocketTask: URLSessionWebSocketTask,
+                    didOpenWithProtocol protocol: String?) {
         connected = true
         DispatchQueue.main.async { self.onStatus?("Connected") }
         startSendLoop()
     }
 
-    func urlSession(_: URLSession, webSocketTask: URLSessionWebSocketTask,
-                    didCloseWith _: URLSessionWebSocket.CloseCode, reason _: Data?) {
+    func urlSession(_ session: URLSession,
+                    webSocketTask: URLSessionWebSocketTask,
+                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+                    reason: Data?) {
         connected = false
         stopGyro()
         DispatchQueue.main.async { self.onStatus?("Disconnected") }
@@ -120,18 +124,20 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
                 objc_sync_exit(self)
                 // Overwrite motion bytes (offset 8-19) with gyro
                 if let g = self.currentGyro {
-                    let gx = clampMotion(g.rotationRate.x * kGyroScale)
-                    let gy = clampMotion(g.rotationRate.y * kGyroScale)
-                    let gz = clampMotion(g.rotationRate.z * kGyroScale)
-                    let ax = clampMotion(g.userAcceleration.x * 4096)
-                    let ay = clampMotion(g.userAcceleration.y * 4096)
-                    let az = clampMotion(g.userAcceleration.z * 4096)
-                    pad[8..<10] = withUnsafeBytes(of: gx.littleEndian) { Data($0) } // motion.gx
-                    pad[10..<12] = withUnsafeBytes(of: gy.littleEndian) { Data($0) } // motion.gy
-                    pad[12..<14] = withUnsafeBytes(of: gz.littleEndian) { Data($0) } // motion.gz
-                    pad[14..<16] = withUnsafeBytes(of: ax.littleEndian) { Data($0) } // motion.ax
-                    pad[16..<18] = withUnsafeBytes(of: ay.littleEndian) { Data($0) } // motion.ay
-                    pad[18..<20] = withUnsafeBytes(of: az.littleEndian) { Data($0) } // motion.az
+                    // Match protocol.hpp layout and the desktop SDL mapping:
+                    // MotionReport = ax, ay, az, gx, gy, gz.
+                    let ax = clampMotion(Float(-g.gravity.x) * 4096)
+                    let ay = clampMotion(Float(-g.gravity.z) * 4096)
+                    let az = clampMotion(Float( g.gravity.y) * 4096)
+                    let gx = clampMotion(Float(-g.rotationRate.x) * kGyroScale)
+                    let gy = clampMotion(Float(-g.rotationRate.z) * kGyroScale)
+                    let gz = clampMotion(Float( g.rotationRate.y) * kGyroScale)
+                    pad[8..<10] = withUnsafeBytes(of: ax.littleEndian) { Data($0) }
+                    pad[10..<12] = withUnsafeBytes(of: ay.littleEndian) { Data($0) }
+                    pad[12..<14] = withUnsafeBytes(of: az.littleEndian) { Data($0) }
+                    pad[14..<16] = withUnsafeBytes(of: gx.littleEndian) { Data($0) }
+                    pad[16..<18] = withUnsafeBytes(of: gy.littleEndian) { Data($0) }
+                    pad[18..<20] = withUnsafeBytes(of: gz.littleEndian) { Data($0) }
                     pad[20] = 1 // has_motion
                 }
                 if let gc = self.controllers[0] {
@@ -259,18 +265,27 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         if gp.buttonOptions?.isPressed == true { buttons |= kBtnMinus }
         if gp.buttonHome?.isPressed == true { buttons |= kBtnHome }
         pad[0..<2] = withUnsafeBytes(of: buttons.littleEndian) { Data($0) }
-        // D‑pad → hat at offset 2
-        if gp.dpad.up.isPressed { pad[2] = kHatN }
-        if gp.dpad.right.isPressed { pad[2] = kHatE }
-        if gp.dpad.down.isPressed { pad[2] = kHatS }
-        if gp.dpad.left.isPressed { pad[2] = kHatW }
-        if !gp.dpad.up.isPressed && !gp.dpad.down.isPressed &&
-           !gp.dpad.left.isPressed && !gp.dpad.right.isPressed { pad[2] = 8 }
-        // Sticks at offsets 3-6
-        pad[3] = UInt8(clamping: Int((gp.leftThumbstick.xAxis.value + 1) * 127.5))
-        pad[4] = UInt8(clamping: Int((gp.leftThumbstick.yAxis.value + 1) * 127.5))
-        pad[5] = UInt8(clamping: Int((gp.rightThumbstick.xAxis.value + 1) * 127.5))
-        pad[6] = UInt8(clamping: Int((gp.rightThumbstick.yAxis.value + 1) * 127.5))
+        // D-pad → hat at offset 2, including diagonals.
+        let up = gp.dpad.up.isPressed
+        let down = gp.dpad.down.isPressed
+        let left = gp.dpad.left.isPressed
+        let right = gp.dpad.right.isPressed
+        if up && right { pad[2] = kHatNE }
+        else if up && left { pad[2] = kHatNW }
+        else if down && right { pad[2] = kHatSE }
+        else if down && left { pad[2] = kHatSW }
+        else if up { pad[2] = kHatN }
+        else if right { pad[2] = kHatE }
+        else if down { pad[2] = kHatS }
+        else if left { pad[2] = kHatW }
+        else { pad[2] = kHatNeutral }
+
+        // Protocol uses 0 = up/left and 255 = down/right. GameController Y is positive-up,
+        // so invert Y to match the desktop/SDL client semantics.
+        pad[3] = UInt8(clamping: Int(( gp.leftThumbstick.xAxis.value + 1) * 127.5))
+        pad[4] = UInt8(clamping: Int((-gp.leftThumbstick.yAxis.value + 1) * 127.5))
+        pad[5] = UInt8(clamping: Int(( gp.rightThumbstick.xAxis.value + 1) * 127.5))
+        pad[6] = UInt8(clamping: Int((-gp.rightThumbstick.yAxis.value + 1) * 127.5))
         pad[7] |= kExtPresent
     }
 }

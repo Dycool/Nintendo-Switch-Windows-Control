@@ -18,23 +18,26 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: zulu
-          java-version: 17
+          java-version: '17'
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
-
-      - name: Build Debug APK
-        run: |
-          cd client/mobile/android
-          gradle assembleDebug --no-daemon
-
-      - uses: actions/upload-artifact@v6
+      - name: Set up Gradle 8.5
+        uses: gradle/actions/setup-gradle@v6
         with:
-          name: ns-control-android
+          gradle-version: '8.5'
+
+      - name: Build debug APK
+        working-directory: client/mobile/android
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: ns-control-android-debug-apk
           path: client/mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
 
   build-ios:
     runs-on: macos-latest
@@ -44,34 +47,38 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 
-      - name: Install xcodegen
+      - name: Install XcodeGen
         run: brew install xcodegen
 
       - name: Generate Xcode project
-        run: |
-          cd client/mobile/ios
-          xcodegen generate
+        working-directory: client/mobile/ios
+        run: xcodegen generate
 
       - name: Build iOS app (unsigned)
+        working-directory: client/mobile/ios
         run: |
-          cd client/mobile/ios
           xcodebuild \
             -project NSControl.xcodeproj \
             -scheme NSControl \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             -configuration Release \
             SYMROOT=build \
-            CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
             build
 
-      - name: Prepare artifact
+      - name: Package iOS app bundle
         run: |
           mkdir -p _artifact
-          cp -r client/mobile/ios/build/Release-iphoneos/NSControl.app _artifact/
+          ditto -c -k --keepParent \
+            client/mobile/ios/build/Release-iphoneos/NSControl.app \
+            _artifact/NSControl-ios-unsigned.app.zip
 
-      - uses: actions/upload-artifact@v6
+      - name: Upload iOS app bundle
+        uses: actions/upload-artifact@v6
         with:
-          name: ns-control-ios
-          path: _artifact/NSControl.app
+          name: ns-control-ios-unsigned-app
+          path: _artifact/NSControl-ios-unsigned.app.zip
+          if-no-files-found: error
