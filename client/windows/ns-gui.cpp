@@ -974,41 +974,30 @@ private:
         out.reset();
         has_motion = false;
 
-        constexpr float STANDARD_GRAVITY = 9.80665f;
-        constexpr float ACCEL_SCALE = 4096.0f / STANDARD_GRAVITY;
-        constexpr float RAD_TO_DEG = 57.29577951308232f;
-        constexpr float GYRO_SCALE = RAD_TO_DEG * 16.384f;
-
-        float accel[3] = {};
-        if (d.accel_enabled && SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, accel, 3)) {
-            // Restore the older Switch-Pro-oriented accel mapping.
-            // Resting flat should become roughly ax=0, ay=0, az=4096.
-            out.ax = clamp_motion_i16(-accel[0] * ACCEL_SCALE);
-            out.ay = clamp_motion_i16(-accel[2] * ACCEL_SCALE);
-            out.az = clamp_motion_i16( accel[1] * ACCEL_SCALE);
-            has_motion = true;
-        }
-
         float gyro[3] = {};
         if (d.gyro_enabled && SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3)) {
+            constexpr float RAD_TO_DEG = 57.29577951308232f;
+            constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.384f;
+
+            // Do NOT send real SDL accel yet.
+            // Direct accel is what is probably causing the upward/diagonal correction.
+            out.ax = 0;
+            out.ay = 4096;
+            out.az = 0;
+
             float gx = gyro[0];
             float gy = gyro[1];
             float gz = gyro[2];
 
-            if (d.gyro_bias_ready) {
-                gx -= d.gyro_bias[0];
-                gy -= d.gyro_bias[1];
-                gz -= d.gyro_bias[2];
-            }
-
-            constexpr float GYRO_DEADZONE_RAD = 0.0045f;
+            constexpr float GYRO_DEADZONE_RAD = 0.0035f;
             if (std::fabs(gx) < GYRO_DEADZONE_RAD) gx = 0.0f;
             if (std::fabs(gy) < GYRO_DEADZONE_RAD) gy = 0.0f;
             if (std::fabs(gz) < GYRO_DEADZONE_RAD) gz = 0.0f;
 
-            out.gx = clamp_motion_i16( gx * GYRO_SCALE);
-            out.gy = clamp_motion_i16( gy * GYRO_SCALE);
-            out.gz = clamp_motion_i16(-gz * GYRO_SCALE);
+            out.gx = clamp_motion_i16(gx * CONSOLE_GYRO_SCALE);
+            out.gy = clamp_motion_i16(gy * CONSOLE_GYRO_SCALE);
+            out.gz = clamp_motion_i16(gz * CONSOLE_GYRO_SCALE);
+
             has_motion = true;
         }
     }
