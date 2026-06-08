@@ -897,6 +897,14 @@ static bool server_macro_start(int client_idx, int subpad, const std::string& js
     for (int s = 0; s < 4; ++s) g_server_macros[client_idx][s].running = false;
 }
 
+static void reset_udp_client_session_locked(ClientSession& c) {
+    c.active = false;
+    c.first_pkt = true;
+    c.expected_seq = 0;
+    c.last_rx_us = 0;
+    c.report.reset();
+}
+
 // ── Signal ────────────────────────────────────────────────────────────────────
 static void on_signal(int) { g_running.store(false, std::memory_order_relaxed); }
 
@@ -3199,6 +3207,18 @@ int main(int argc, char** argv) {
         }
         if (hmac_ok != 0) {
             if (g_verbose) puts("bad HMAC, dropped");
+            continue;
+        }
+
+        uint8_t packet_flags = is_extended_udp ? ext_pkt.flags : pkt.flags;
+        if (packet_flags & FLAG_DISCONNECT) {
+            server_macro_stop_all_for_client(client_idx);
+            {
+                std::lock_guard<std::mutex> lk(g_mtx[client_idx]);
+                reset_udp_client_session_locked(g_clients[client_idx]);
+            }
+            if (g_verbose) std::printf("PC %d sent disconnect and was released.\n", client_idx + 1);
+            ++g_pkts_rx;
             continue;
         }
 

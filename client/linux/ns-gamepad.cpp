@@ -829,6 +829,49 @@ static void fill_extended_pad(ns::ExtendedHIDReport& dst,
     }
 }
 
+static void send_udp_disconnect_packet(int sock, const sockaddr_in& dest, const uint8_t hmac_key[32], uint32_t seq, bool legacy_udp) {
+    if (sock < 0) return;
+
+    if (legacy_udp) {
+        ns::Packet pkt{};
+        pkt.magic = ns::PROTO_MAGIC;
+        pkt.version = ns::PROTO_VERSION;
+        pkt.flags = ns::FLAG_RESET | ns::FLAG_DISCONNECT;
+        pkt.seq = seq;
+        pkt.ts_us = ns::now_us();
+        pkt.report.reset();
+
+        uint8_t full_hmac[32];
+        hmac_sha256(hmac_key, 32, reinterpret_cast<const uint8_t*>(&pkt), ns::PACKET_AUTH_SIZE, full_hmac);
+        memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+
+        for (int i = 0; i < 3; ++i) {
+            sendto(sock, reinterpret_cast<const char*>(&pkt), ns::PACKET_SIZE, 0,
+                   reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return;
+    }
+
+    ExtendedUdpPacket pkt{};
+    pkt.magic = ns::PROTO_MAGIC;
+    pkt.version = ns::WEB_PROTO_VERSION;
+    pkt.flags = ns::FLAG_RESET | ns::FLAG_DISCONNECT;
+    pkt.seq = seq;
+    pkt.timestamp_us = ns::now_us();
+    pkt.report.reset();
+
+    uint8_t full_hmac[32];
+    hmac_sha256(hmac_key, 32, reinterpret_cast<const uint8_t*>(&pkt), EXT_UDP_PACKET_AUTH_SIZE, full_hmac);
+    memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+
+    for (int i = 0; i < 3; ++i) {
+        sendto(sock, reinterpret_cast<const char*>(&pkt), sizeof(pkt), 0,
+               reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Axis conversion
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1015,33 +1058,51 @@ static bool read_pad_motion(int index, ns::MotionReport& motion) {
     SDL_GameController* pad = g_pads[index];
     if (!pad) return false;
 
-    bool any = false;
+    constexpr float STANDARD_GRAVITY = 9.80665f;
+    constexpr float ACCEL_SCALE = 4096.0f / STANDARD_GRAVITY;
+    constexpr float RAD_TO_DEG = 57.29577951308232f;
+    constexpr float GYRO_SCALE = RAD_TO_DEG * 16.384f;
+
+    bool got_any_motion = false;
 
     if (g_pad_accel_enabled[index]) {
         float accel[3] = {0, 0, 0};
         if (SDL_GameControllerGetSensorData(pad, SDL_SENSOR_ACCEL, accel, 3) == 0) {
-            // SDL acceleration is m/s^2.  Backend calibration uses roughly 4096 units per 1g.
-            constexpr float ACCEL_SCALE = 4096.0f / 9.80665f;
-            motion.ax = clamp_i16_from_float(accel[0] * ACCEL_SCALE);
-            motion.ay = clamp_i16_from_float(accel[1] * ACCEL_SCALE);
-            motion.az = clamp_i16_from_float(accel[2] * ACCEL_SCALE);
-            any = true;
+            motion.ax = clamp_i16_from_float(-accel[0] * ACCEL_SCALE);
+            motion.ay = clamp_i16_from_float(-accel[2] * ACCEL_SCALE);
+            motion.az = clamp_i16_from_float( accel[1] * ACCEL_SCALE);
+            got_any_motion = true;
+        } else {
+            motion.ax = 0;
+            motion.ay = 0;
+            motion.az = 4096;
         }
+    } else {
+        motion.ax = 0;
+        motion.ay = 0;
+        motion.az = 4096;
     }
 
     if (g_pad_gyro_enabled[index]) {
         float gyro[3] = {0, 0, 0};
         if (SDL_GameControllerGetSensorData(pad, SDL_SENSOR_GYRO, gyro, 3) == 0) {
-            constexpr float RAD_TO_DEG = 57.29577951308232f;
-            constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.0f;
-            motion.gx = clamp_i16_from_float(gyro[0] * CONSOLE_GYRO_SCALE);
-            motion.gy = clamp_i16_from_float(gyro[1] * CONSOLE_GYRO_SCALE);
-            motion.gz = clamp_i16_from_float(gyro[2] * CONSOLE_GYRO_SCALE);
-            any = true;
+            float gx = -gyro[0];
+            float gy = -gyro[2];
+            float gz =  gyro[1];
+
+            constexpr float GYRO_DEADZONE_RAD = 0.0f;
+            if (std::fabs(gx) < GYRO_DEADZONE_RAD) gx = 0.0f;
+            if (std::fabs(gy) < GYRO_DEADZONE_RAD) gy = 0.0f;
+            if (std::fabs(gz) < GYRO_DEADZONE_RAD) gz = 0.0f;
+
+            motion.gx = clamp_i16_from_float(gx * GYRO_SCALE);
+            motion.gy = clamp_i16_from_float(gy * GYRO_SCALE);
+            motion.gz = clamp_i16_from_float(gz * GYRO_SCALE);
+            got_any_motion = true;
         }
     }
 
-    return any;
+    return got_any_motion;
 }
 
 static void set_pad_rumble(int index, uint8_t low, uint8_t high, uint32_t duration_ms) {
@@ -1175,7 +1236,7 @@ static int detect_server_udp_interval_ms(int sock, const sockaddr_in& dest, int 
             reply.version == ns::SERVER_INFO_VERSION &&
             reply.udp_interval_ms > 0) {
             if (out_is_hori) *out_is_hori = reply.backend == ns::SERVER_BACKEND_HORI;
-            return reply.udp_interval_ms;
+            return fallback_ms;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -1262,7 +1323,7 @@ int main(int argc, char** argv) {
 
     bool server_is_hori = false;
     const int active_send_interval_ms = detect_server_udp_interval_ms(
-        sock, dest, g_legacy_udp ? ns::HORI_UDP_INTERVAL_MS : ns::PRO_UDP_INTERVAL_MS, &server_is_hori);
+        sock, dest, ns::HORI_UDP_INTERVAL_MS, &server_is_hori);
     const bool send_motion = !server_is_hori;
 
     // Initialise SDL3 Gamepad subsystem.
@@ -1418,6 +1479,7 @@ int main(int argc, char** argv) {
 
     // ── Graceful shutdown ──────────────────────────────────────────────────────
     std::cout << "\nShutting down...\n";
+    send_udp_disconnect_packet(sock, dest, hmac_key, seq++, g_legacy_udp);
     for (int i = 0; i < 4; ++i) {
         if (g_pads[i]) {
             set_pad_rumble(i, 0, 0, 0);

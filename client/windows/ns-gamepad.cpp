@@ -53,6 +53,21 @@
 #endif
 
 static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
+static std::atomic<bool> g_running{true};
+
+static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
+    switch (ctrl_type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            g_running.store(false, std::memory_order_relaxed);
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
 
 // ── Macro support ───────────────────────────────────────────────────────────
 // Macro grammar is intentionally strict and shared by CLI/GUI clients:
@@ -732,6 +747,49 @@ static void fill_extended_pad(ns::ExtendedHIDReport& dst,
     }
 }
 
+static void send_udp_disconnect_packet(SOCKET sock, const sockaddr_in& dest, const uint8_t hmac_key[32], uint32_t seq, bool legacy_udp) {
+    if (sock == INVALID_SOCKET) return;
+
+    if (legacy_udp) {
+        ns::Packet pkt{};
+        pkt.magic = ns::PROTO_MAGIC;
+        pkt.version = ns::PROTO_VERSION;
+        pkt.flags = ns::FLAG_RESET | ns::FLAG_DISCONNECT;
+        pkt.seq = seq;
+        pkt.ts_us = ns::now_us();
+        pkt.report.reset();
+
+        uint8_t full_hmac[32];
+        hmac_sha256(hmac_key, 32, reinterpret_cast<const uint8_t*>(&pkt), ns::PACKET_AUTH_SIZE, full_hmac);
+        memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+
+        for (int i = 0; i < 3; ++i) {
+            sendto(sock, reinterpret_cast<const char*>(&pkt), (int)ns::PACKET_SIZE, 0,
+                   reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return;
+    }
+
+    ExtendedUdpPacket pkt{};
+    pkt.magic = ns::PROTO_MAGIC;
+    pkt.version = ns::WEB_PROTO_VERSION;
+    pkt.flags = ns::FLAG_RESET | ns::FLAG_DISCONNECT;
+    pkt.seq = seq;
+    pkt.timestamp_us = ns::now_us();
+    pkt.report.reset();
+
+    uint8_t full_hmac[32];
+    hmac_sha256(hmac_key, 32, reinterpret_cast<const uint8_t*>(&pkt), EXT_UDP_PACKET_AUTH_SIZE, full_hmac);
+    memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+
+    for (int i = 0; i < 3; ++i) {
+        sendto(sock, reinterpret_cast<const char*>(&pkt), (int)sizeof(pkt), 0,
+               reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 
 // SDL/Windows can occasionally report a held digital button as released for a
 // single frame, especially while HIDAPI is also handling rumble/sensor traffic.
@@ -1050,23 +1108,51 @@ private:
         out.reset();
         has_motion = false;
 
+        constexpr float STANDARD_GRAVITY = 9.80665f;
+        constexpr float ACCEL_SCALE = 4096.0f / STANDARD_GRAVITY;
+
+        constexpr float RAD_TO_DEG = 57.29577951308232f;
+        constexpr float GYRO_SCALE = RAD_TO_DEG * 16.384f;
+
+        bool got_any_motion = false;
+
+        // Switch X = -SDL X
+        // Switch Y = -SDL Z
+        // Switch Z = +SDL Y
         float accel[3] = {};
         if (accel_enabled && SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, accel, 3)) {
-            out.ax = clamp_motion_i16((accel[0] / 9.80665f) * 4096.0f);
-            out.ay = clamp_motion_i16((accel[1] / 9.80665f) * 4096.0f);
-            out.az = clamp_motion_i16((accel[2] / 9.80665f) * 4096.0f);
-            has_motion = true;
+            out.ax = clamp_motion_i16(-accel[0] * ACCEL_SCALE);
+            out.ay = clamp_motion_i16(-accel[2] * ACCEL_SCALE);
+            out.az = clamp_motion_i16( accel[1] * ACCEL_SCALE);
+            got_any_motion = true;
+        } else {
+            out.ax = 0;
+            out.ay = 0;
+            out.az = 4096;
         }
 
+        // Switch X = -SDL X
+        // Switch Y = -SDL Z
+        // Switch Z = +SDL Y
         float gyro[3] = {};
         if (gyro_enabled && SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3)) {
-            constexpr float RAD_TO_DEG = 57.29577951308232f;
-            constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.0f;
-            out.gx = clamp_motion_i16(gyro[0] * CONSOLE_GYRO_SCALE);
-            out.gy = clamp_motion_i16(gyro[1] * CONSOLE_GYRO_SCALE);
-            out.gz = clamp_motion_i16(gyro[2] * CONSOLE_GYRO_SCALE);
-            has_motion = true;
+            float gx = -gyro[0];
+            float gy = -gyro[2];
+            float gz =  gyro[1];
+
+            constexpr float GYRO_DEADZONE_RAD = 0.0f;
+            if (std::fabs(gx) < GYRO_DEADZONE_RAD) gx = 0.0f;
+            if (std::fabs(gy) < GYRO_DEADZONE_RAD) gy = 0.0f;
+            if (std::fabs(gz) < GYRO_DEADZONE_RAD) gz = 0.0f;
+
+            out.gx = clamp_motion_i16(gx * GYRO_SCALE);
+            out.gy = clamp_motion_i16(gy * GYRO_SCALE);
+            out.gz = clamp_motion_i16(gz * GYRO_SCALE);
+
+            got_any_motion = true;
         }
+
+        has_motion = got_any_motion;
     }
 
     Device* device_for_slot_locked(int slot) {
@@ -1507,7 +1593,7 @@ static int detect_server_udp_interval_ms(SOCKET sock, const sockaddr_in& dest, i
             reply.version == ns::SERVER_INFO_VERSION &&
             reply.udp_interval_ms > 0) {
             if (out_is_hori) *out_is_hori = reply.backend == ns::SERVER_BACKEND_HORI;
-            return reply.udp_interval_ms;
+            return fallback_ms;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -1646,7 +1732,7 @@ int main(int argc, char** argv) {
 
     bool server_is_hori = false;
     const int active_send_interval_ms = detect_server_udp_interval_ms(
-        sock, dest, legacy_udp ? ns::HORI_UDP_INTERVAL_MS : ns::PRO_UDP_INTERVAL_MS, &server_is_hori);
+        sock, dest, ns::HORI_UDP_INTERVAL_MS, &server_is_hori);
     const bool send_motion = !server_is_hori;
 
     if (macro_mode) {
@@ -1671,13 +1757,14 @@ int main(int argc, char** argv) {
         return cleanup_and_exit(1, sock);
     }
 
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
     std::cout << "Started... Press Ctrl+C to stop\n";
     uint32_t seq = 0;
     RumbleManager rumble;
     DigitalReleaseFilter sdl_filters[4];
     static bool no_controllers_printed = false;
 
-    while (true) {
+    while (g_running.load(std::memory_order_relaxed)) {
         g_sdlInput.poll();
 
         ns::HIDReport logical_reports[4];
@@ -1788,9 +1875,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Not reached during normal Ctrl+C termination, but useful if this loop is
-    // ever made stoppable.
+    // Ctrl+C/console close flips g_running, letting us release the backend slot.
     rumble.stop_all();
     std::cout << "\nShutting down...\n";
+    send_udp_disconnect_packet(sock, dest, hmac_key, seq++, legacy_udp);
     return cleanup_and_exit(0, sock);
 }

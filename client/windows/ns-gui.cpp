@@ -648,6 +648,27 @@ static void fill_extended_pad(ns::ExtendedHIDReport& dst,
     }
 }
 
+static void send_udp_disconnect_packet(SOCKET sock, const sockaddr_in& dest, const uint8_t hmac_key[32], uint32_t seq) {
+    if (sock == INVALID_SOCKET) return;
+    ExtendedUdpPacket pkt{};
+    pkt.magic = ns::PROTO_MAGIC;
+    pkt.version = ns::WEB_PROTO_VERSION;
+    pkt.flags = ns::FLAG_RESET | ns::FLAG_DISCONNECT;
+    pkt.seq = seq;
+    pkt.timestamp_us = ns::now_us();
+    pkt.report.reset();
+
+    uint8_t fullHmac[32];
+    hmac_sha256(hmac_key, 32, reinterpret_cast<const uint8_t*>(&pkt), EXT_UDP_PACKET_AUTH_SIZE, fullHmac);
+    memcpy(pkt.hmac, fullHmac, ns::HMAC_TAG_SIZE);
+
+    for (int i = 0; i < 3; ++i) {
+        sendto(sock, reinterpret_cast<const char*>(&pkt), (int)sizeof(pkt), 0,
+               reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 
 // SDL/Windows can occasionally report a held digital button as released for a
 // single frame, especially while HIDAPI is also handling rumble/sensor traffic.
@@ -2705,7 +2726,7 @@ static int detect_server_udp_interval_ms(SOCKET sock, const sockaddr_in& dest, i
             reply.version == ns::SERVER_INFO_VERSION &&
             reply.udp_interval_ms > 0) {
             if (out_is_hori) *out_is_hori = reply.backend == ns::SERVER_BACKEND_HORI;
-            return reply.udp_interval_ms;
+            return fallback_ms;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -2741,7 +2762,7 @@ static void SenderThread() {
     freeaddrinfo(res);
 
     bool serverIsHori = false;
-    const int activeSendIntervalMs = detect_server_udp_interval_ms(sock, dest, ns::PRO_UDP_INTERVAL_MS, &serverIsHori);
+    const int activeSendIntervalMs = detect_server_udp_interval_ms(sock, dest, ns::HORI_UDP_INTERVAL_MS, &serverIsHori);
     const bool sendMotion = !serverIsHori;
 
     g_sock = sock;
@@ -2854,6 +2875,7 @@ static void SenderThread() {
         else std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
+    send_udp_disconnect_packet(sock, dest, g_hmacKey, seq++);
     rumble.stop_all();
     closesocket(sock);
     g_sock = INVALID_SOCKET;

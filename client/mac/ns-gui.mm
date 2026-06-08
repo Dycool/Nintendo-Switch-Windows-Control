@@ -815,16 +815,27 @@ static ns::MotionReport map_gc_motion_to_console(const GamepadState& st) {
     ns::MotionReport m;
     m.reset();
 
-    // Match the backend's virtual IMU scale roughly: accel around 0x1000 per g,
-    // gyro kept conservative so real pads do not saturate the console sample.
-    m.ax = clamp_i16_from_float(st.ax.load(std::memory_order_relaxed) * 4096.0f);
-    m.ay = clamp_i16_from_float(st.ay.load(std::memory_order_relaxed) * 4096.0f);
-    m.az = clamp_i16_from_float(st.az.load(std::memory_order_relaxed) * 4096.0f);
+    const float ax = st.ax.load(std::memory_order_relaxed);
+    const float ay = st.ay.load(std::memory_order_relaxed);
+    const float az = st.az.load(std::memory_order_relaxed);
+    m.ax = clamp_i16_from_float(-ax * 4096.0f);
+    m.ay = clamp_i16_from_float(-az * 4096.0f);
+    m.az = clamp_i16_from_float( ay * 4096.0f);
+
     constexpr float RAD_TO_DEG = 57.29577951308232f;
-    constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.0f;
-    m.gx = clamp_i16_from_float(st.gx.load(std::memory_order_relaxed) * CONSOLE_GYRO_SCALE);
-    m.gy = clamp_i16_from_float(st.gy.load(std::memory_order_relaxed) * CONSOLE_GYRO_SCALE);
-    m.gz = clamp_i16_from_float(st.gz.load(std::memory_order_relaxed) * CONSOLE_GYRO_SCALE);
+    constexpr float GYRO_SCALE = RAD_TO_DEG * 16.384f;
+    float gx = -st.gx.load(std::memory_order_relaxed);
+    float gy = -st.gz.load(std::memory_order_relaxed);
+    float gz =  st.gy.load(std::memory_order_relaxed);
+
+    constexpr float GYRO_DEADZONE_RAD = 0.0f;
+    if (std::fabs(gx) < GYRO_DEADZONE_RAD) gx = 0.0f;
+    if (std::fabs(gy) < GYRO_DEADZONE_RAD) gy = 0.0f;
+    if (std::fabs(gz) < GYRO_DEADZONE_RAD) gz = 0.0f;
+
+    m.gx = clamp_i16_from_float(gx * GYRO_SCALE);
+    m.gy = clamp_i16_from_float(gy * GYRO_SCALE);
+    m.gz = clamp_i16_from_float(gz * GYRO_SCALE);
     return m;
 }
 
@@ -848,6 +859,47 @@ static void fill_extended_pad(ns::ExtendedHIDReport& dst,
         dst.has_motion = true;
     } else {
         dst.has_motion = false;
+    }
+}
+
+static void send_udp_disconnect_packet(int sock, const sockaddr_in& dest, const uint8_t hmac_key[32], uint32_t seq, bool legacy_udp) {
+    if (sock < 0) return;
+
+    if (legacy_udp) {
+        ns::Packet pkt{};
+        pkt.magic = ns::PROTO_MAGIC;
+        pkt.version = ns::PROTO_VERSION;
+        pkt.flags = ns::FLAG_RESET | ns::FLAG_DISCONNECT;
+        pkt.seq = seq;
+        pkt.ts_us = ns::now_us();
+        pkt.report.reset();
+
+        uint8_t full_hmac[32];
+        hmac_sha256(hmac_key, 32, reinterpret_cast<const uint8_t*>(&pkt), ns::PACKET_AUTH_SIZE, full_hmac);
+        memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+
+        for (int i = 0; i < 3; ++i) {
+            sendto(sock, &pkt, ns::PACKET_SIZE, 0, reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return;
+    }
+
+    ExtendedUdpPacket pkt{};
+    pkt.magic = ns::PROTO_MAGIC;
+    pkt.version = ns::WEB_PROTO_VERSION;
+    pkt.flags = ns::FLAG_RESET | ns::FLAG_DISCONNECT;
+    pkt.seq = seq;
+    pkt.timestamp_us = ns::now_us();
+    pkt.report.reset();
+
+    uint8_t full_hmac[32];
+    hmac_sha256(hmac_key, 32, reinterpret_cast<const uint8_t*>(&pkt), EXT_UDP_PACKET_AUTH_SIZE, full_hmac);
+    memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+
+    for (int i = 0; i < 3; ++i) {
+        sendto(sock, &pkt, sizeof(pkt), 0, reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
 
@@ -1737,7 +1789,7 @@ static int detect_server_udp_interval_ms(int sock, const sockaddr_in& dest, int 
             reply.version == ns::SERVER_INFO_VERSION &&
             reply.udp_interval_ms > 0) {
             if (out_is_hori) *out_is_hori = reply.backend == ns::SERVER_BACKEND_HORI;
-            return reply.udp_interval_ms;
+            return fallback_ms;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -2805,7 +2857,7 @@ static bool MacroWriteURLMac(NSURL* url, const std::string& text) {
 
         bool serverIsHori = false;
         const int activeSendIntervalMs = detect_server_udp_interval_ms(
-            self->sock, dest, g_legacyUdp ? ns::HORI_UDP_INTERVAL_MS : ns::PRO_UDP_INTERVAL_MS, &serverIsHori);
+            self->sock, dest, ns::HORI_UDP_INTERVAL_MS, &serverIsHori);
         const bool sendMotion = !serverIsHori;
 
         uint32_t seqCounter = 0;
@@ -2925,6 +2977,7 @@ static bool MacroWriteURLMac(NSURL* url, const std::string& text) {
             std::this_thread::sleep_for(interval);
         }
 
+        send_udp_disconnect_packet(self->sock, dest, self->hmacKey, seqCounter++, g_legacyUdp);
         rumble.stop_all();
         close(self->sock);
         self->sock = -1;

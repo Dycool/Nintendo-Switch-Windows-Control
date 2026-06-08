@@ -769,19 +769,27 @@ static int16_t clamp_i16_from_float(float v) {
 static ns::MotionReport map_gc_motion_to_console(const GamepadState& st) {
     ns::MotionReport m; m.reset();
 
-    // Backend calibration in the backend uses 0x1000-ish accel units, so convert
-    // GameController gravity/userAcceleration units to roughly the same scale.
-    m.ax = clamp_i16_from_float(st.ax.load(std::memory_order_relaxed) * 4096.0f);
-    m.ay = clamp_i16_from_float(st.ay.load(std::memory_order_relaxed) * 4096.0f);
-    m.az = clamp_i16_from_float(st.az.load(std::memory_order_relaxed) * 4096.0f);
+    const float ax = st.ax.load(std::memory_order_relaxed);
+    const float ay = st.ay.load(std::memory_order_relaxed);
+    const float az = st.az.load(std::memory_order_relaxed);
+    m.ax = clamp_i16_from_float(-ax * 4096.0f);
+    m.ay = clamp_i16_from_float(-az * 4096.0f);
+    m.az = clamp_i16_from_float( ay * 4096.0f);
 
-    // GameController rotationRate is rad/s.  The backend just forwards int16
-    // gyro samples, so this scale is intentionally conservative and tunable.
     constexpr float RAD_TO_DEG = 57.29577951308232f;
-    constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.0f;
-    m.gx = clamp_i16_from_float(st.gx.load(std::memory_order_relaxed) * CONSOLE_GYRO_SCALE);
-    m.gy = clamp_i16_from_float(st.gy.load(std::memory_order_relaxed) * CONSOLE_GYRO_SCALE);
-    m.gz = clamp_i16_from_float(st.gz.load(std::memory_order_relaxed) * CONSOLE_GYRO_SCALE);
+    constexpr float GYRO_SCALE = RAD_TO_DEG * 16.384f;
+    float gx = -st.gx.load(std::memory_order_relaxed);
+    float gy = -st.gz.load(std::memory_order_relaxed);
+    float gz =  st.gy.load(std::memory_order_relaxed);
+
+    constexpr float GYRO_DEADZONE_RAD = 0.0f;
+    if (std::fabs(gx) < GYRO_DEADZONE_RAD) gx = 0.0f;
+    if (std::fabs(gy) < GYRO_DEADZONE_RAD) gy = 0.0f;
+    if (std::fabs(gz) < GYRO_DEADZONE_RAD) gz = 0.0f;
+
+    m.gx = clamp_i16_from_float(gx * GYRO_SCALE);
+    m.gy = clamp_i16_from_float(gy * GYRO_SCALE);
+    m.gz = clamp_i16_from_float(gz * GYRO_SCALE);
     return m;
 }
 
@@ -806,6 +814,47 @@ static void fill_extended_pad(ns::ExtendedHIDReport& dst,
         dst.has_motion = true;
     } else {
         dst.has_motion = false;
+    }
+}
+
+static void send_udp_disconnect_packet(int sock, const sockaddr_in& dest, const uint8_t hmac_key[32], uint32_t seq, bool legacy_udp) {
+    if (sock < 0) return;
+
+    if (legacy_udp) {
+        ns::Packet pkt{};
+        pkt.magic = ns::PROTO_MAGIC;
+        pkt.version = ns::PROTO_VERSION;
+        pkt.flags = ns::FLAG_RESET | ns::FLAG_DISCONNECT;
+        pkt.seq = seq;
+        pkt.ts_us = ns::now_us();
+        pkt.report.reset();
+
+        uint8_t full_hmac[32];
+        hmac_sha256(hmac_key, 32, reinterpret_cast<const uint8_t*>(&pkt), ns::PACKET_AUTH_SIZE, full_hmac);
+        memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+
+        for (int i = 0; i < 3; ++i) {
+            sendto(sock, &pkt, ns::PACKET_SIZE, 0, reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return;
+    }
+
+    ExtendedUdpPacket pkt{};
+    pkt.magic = ns::PROTO_MAGIC;
+    pkt.version = ns::WEB_PROTO_VERSION;
+    pkt.flags = ns::FLAG_RESET | ns::FLAG_DISCONNECT;
+    pkt.seq = seq;
+    pkt.timestamp_us = ns::now_us();
+    pkt.report.reset();
+
+    uint8_t full_hmac[32];
+    hmac_sha256(hmac_key, 32, reinterpret_cast<const uint8_t*>(&pkt), EXT_UDP_PACKET_AUTH_SIZE, full_hmac);
+    memcpy(pkt.hmac, full_hmac, ns::HMAC_TAG_SIZE);
+
+    for (int i = 0; i < 3; ++i) {
+        sendto(sock, &pkt, sizeof(pkt), 0, reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
 
@@ -1340,7 +1389,7 @@ static int detect_server_udp_interval_ms(int sock, const sockaddr_in& dest, int 
             reply.version == ns::SERVER_INFO_VERSION &&
             reply.udp_interval_ms > 0) {
             if (out_is_hori) *out_is_hori = reply.backend == ns::SERVER_BACKEND_HORI;
-            return reply.udp_interval_ms;
+            return fallback_ms;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -1443,7 +1492,7 @@ int main(int argc, char** argv) {
 
     bool server_is_hori = false;
     const int active_send_interval_ms = detect_server_udp_interval_ms(
-        sock, dest, legacy_udp ? ns::HORI_UDP_INTERVAL_MS : ns::PRO_UDP_INTERVAL_MS, &server_is_hori);
+        sock, dest, ns::HORI_UDP_INTERVAL_MS, &server_is_hori);
     const bool send_motion = !server_is_hori;
 
     if (macro_mode) {
@@ -1705,6 +1754,7 @@ int main(int argc, char** argv) {
     std::cout << "\nShutting down...\n";
     g_running.store(false, std::memory_order_relaxed);
     if (sender.joinable()) sender.join();
+    send_udp_disconnect_packet(sock, dest, hmac_key, 0, legacy_udp);
     for (int i = 0; i < MAX_SLOTS; ++i)
         stop_haptics_for_controller_on_main(i, true);
     close(sock);

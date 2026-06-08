@@ -31,9 +31,9 @@ static constexpr uint8_t  WEB_PROTO_VERSION = 5;       // Extended input + optio
 static constexpr uint16_t DEFAULT_PORT  = 7331;
 static constexpr int      WATCHDOG_MS   = 1200;
 static constexpr int      HORI_UDP_HZ   = 250;
-static constexpr int      PRO_UDP_HZ    = 66;
+static constexpr int      PRO_UDP_HZ    = 250;
 static constexpr int      HORI_UDP_INTERVAL_MS = 4;
-static constexpr int      PRO_UDP_INTERVAL_MS  = 15;
+static constexpr int      PRO_UDP_INTERVAL_MS  = 4;
 static constexpr int      WRITER_HZ     = HORI_UDP_HZ;
 static constexpr int      AUTOFIRE_HZ   = 12;
 
@@ -86,6 +86,7 @@ enum Flags : uint8_t {
     FLAG_RESET      = 0x01, // Backend should zero inputs immediately.
     FLAG_AUTOFIRE   = 0x02, // Autofire mask is active.
     FLAG_SINGLE_PAD = 0x04, // Web/mobile packet should only claim pad 1.
+    FLAG_DISCONNECT = 0x08, // Authenticated UDP client is leaving; free its slot now.
 };
 
 // Extended clients set this in HIDReport::vendor inside ExtendedHIDReport.

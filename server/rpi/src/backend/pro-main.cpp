@@ -60,12 +60,6 @@ static constexpr int     RUMBLE_GAIN_PERCENT = 100;
 // Normal-rumble build: decode console rumble into classic low/high packets only.
 static std::string g_usb_serial = "NSBRIDGE000001";
 
-// Optional local/private controller SPI profile.
-// Public repository ships only the loader. Users provide their own dump/profile
-// locally; the file must stay out of git. The loader copies the user's first
-// 0x10000 SPI bytes and keeps generated per-controller MAC/serial IDs.
-static std::string g_spi_profile_path;
-
 // Built-in USB gadget lifecycle.  ns-backend can now create/bind the
 // USB gamepad gadget itself on startup and unbind/remove it
 // on shutdown, so setup_gadget.sh is no longer needed at runtime.
@@ -929,8 +923,7 @@ static uint8_t pro_timer_from_us(uint64_t t_us) {
 
 // ── Vendor USB gamepad USB protocol support ─────────────────────────────
 static constexpr size_t PRO_REPORT_SIZE = 64;
-// Full input reports run at the common 15ms cadence, with 3 IMU samples spaced
-// roughly 5ms apart.
+// Full input reports run at the shared 250Hz cadence.
 static constexpr uint64_t PRO_REPORT_INTERVAL_US = 4'000ULL;
 static constexpr int PRO_WRITER_HZ = 1'000'000 / PRO_REPORT_INTERVAL_US;
 static constexpr uint8_t  PRO_BAT_CON = 0x91;
@@ -1091,89 +1084,6 @@ struct ControllerRuntime {
     b1 = (b1 & 0xF0) | ((val >> 8) & 0x0F);
 }
 
-static bool read_file_bytes(const std::string& path, std::vector<uint8_t>& out) {
-    out.clear();
-
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) {
-        std::fprintf(stderr, "[spi-profile] failed to open: %s\n", path.c_str());
-        return false;
-    }
-
-    std::streamoff len = f.tellg();
-    if (len <= 0) {
-        std::fprintf(stderr, "[spi-profile] empty/invalid file: %s\n", path.c_str());
-        return false;
-    }
-
-    // Supported:
-    //   0x10000 = reduced profile used by this backend
-    //   0x80000 = common full SPI backup size
-    // Larger files are rejected so a wrong file cannot silently produce garbage.
-    if (len != (std::streamoff)0x10000 && len != (std::streamoff)0x80000) {
-        std::fprintf(stderr,
-                     "[spi-profile] unsupported size %lld for %s; expected 65536 or 524288 bytes\n",
-                     (long long)len, path.c_str());
-        return false;
-    }
-
-    f.seekg(0, std::ios::beg);
-    try {
-        out.resize((size_t)len);
-    } catch (...) {
-        std::fprintf(stderr, "[spi-profile] out of memory reading: %s\n", path.c_str());
-        return false;
-    }
-
-    f.read(reinterpret_cast<char*>(out.data()), len);
-    if (!f) {
-        std::fprintf(stderr, "[spi-profile] short read: %s\n", path.c_str());
-        out.clear();
-        return false;
-    }
-
-    return true;
-}
-
-static bool apply_spi_profile(uint8_t* flash, const std::vector<uint8_t>& src, int ctrl) {
-    if (!flash || src.empty()) return false;
-
-    if (src.size() < SPI_FLASH_SIZE) {
-        std::fprintf(stderr,
-                     "[spi-profile] source too small: got %zu, need at least %zu\n",
-                     src.size(), SPI_FLASH_SIZE);
-        return false;
-    }
-
-    // Use the user's SPI profile exactly for the virtual 0x0000..0xFFFF SPI
-    // region. This preserves subtle capability flags/model bytes.
-    //
-    // Important: visible runtime identity is NOT taken from SPI here.
-    // USB 0x81 and subcmd 0x02 still use generated CTRL_MAC_BE/serial.
-    std::memcpy(flash, src.data(), SPI_FLASH_SIZE);
-
-    if (g_verbose) {
-        std::printf("[spi-profile] full-copied first 0x%zX bytes to pad%d (%zu-byte source)\n",
-                    SPI_FLASH_SIZE, ctrl + 1, src.size());
-    }
-    return true;
-}
-
-static void apply_private_controller_spi_profile(uint8_t* flash, int ctrl) {
-    if (!flash || g_spi_profile_path.empty()) return;
-
-    std::vector<uint8_t> profile;
-    if (!read_file_bytes(g_spi_profile_path, profile)) {
-        std::fprintf(stderr, "[spi-profile] keeping synthetic SPI fallback for pad%d\n", ctrl + 1);
-        return;
-    }
-
-    if (!apply_spi_profile(flash, profile, ctrl)) {
-        std::fprintf(stderr, "[spi-profile] apply failed; keeping synthetic SPI fallback for pad%d\n", ctrl + 1);
-        return;
-    }
-}
-
 static void init_spi_flash(int ctrl) {
     if (ctrl < 0 || ctrl >= 4 || g_spi_initialized[ctrl]) return;
 
@@ -1278,7 +1188,6 @@ static void init_spi_flash(int ctrl) {
     flash[0x6059] = 0xFF;    flash[0x605A] = 0xFF;    flash[0x605B] = 0xFF;
     flash[0x605C] = 0x00;
 
-    apply_private_controller_spi_profile(flash, ctrl);
     g_spi_initialized[ctrl] = true;
 }
 
@@ -2347,8 +2256,8 @@ static void writer_thread(int hz) {
                     have_report_to_write = true;
                     wrote_subcmd_reply = true;
                 } else if (rt[h].full_report_enabled) {
-                    // Active/player-assigned ports run at the same boring
-                    // ~66Hz / 15ms cadence as a real USB Pro Controller.
+                    // Active/player-assigned ports run at the shared boring
+                    // 250Hz / 4ms cadence used by UDP clients and servers.
                     // Unassigned ports still send neutral keepalive reports,
                     // but only at a low heartbeat rate so we do not spam neutral data.
                     bool release_burst = rt[h].neutral_burst_until_us != 0 &&
@@ -2361,11 +2270,9 @@ static void writer_thread(int hz) {
                     bool standard_due = (rt[h].last_standard_report_us == 0) ||
                                         (elapsed_us_saturated(now_stamp, rt[h].last_standard_report_us) >= PRO_REPORT_INTERVAL_US);
 
-                    // A real USB gamepad over USB emits full 0x30 input
-                    // reports roughly every 15ms.  Sending 0x30 at 125-250Hz
-                    // makes the 3 IMU samples/timer cadence unrealistic and
-                    // some host software appears to ignore motion even though
-                    // button/stick input still works.
+                    // Standard 0x30 reports use the same 250Hz cadence as the
+                    // UDP input stream so reconnects and backend switching do
+                    // not change timing behavior.
                     bool should_write_standard = false;
                     if (port_needed || release_burst) should_write_standard = standard_due;
                     else should_write_standard = idle_due;
@@ -4043,6 +3950,21 @@ static void clear_udp_rumble_state(ClientSession& c) {
         c.udp_last_rumble_seq[s] = c.rumble_seq[s];
 }
 
+static void reset_udp_client_session_locked(ClientSession& c) {
+    c.active = false;
+    c.first_pkt = true;
+    c.expected_seq = 0;
+    c.last_rx_us = 0;
+    c.report.reset();
+    clear_all_motion(c);
+    c.uses_pad_presence = false;
+    clear_udp_rumble_state(c);
+    for (int s = 0; s < 4; ++s) {
+        c.pad_present[s] = false;
+        c.pad_last_present_us[s] = 0;
+    }
+}
+
 static void enable_udp_rumble_state(ClientSession& c) {
     if (!c.udp_rumble_enabled) {
         c.udp_rumble_enabled = true;
@@ -4870,7 +4792,6 @@ int main(int argc, char** argv) {
         else if (a == "-b" && i+1 < argc) bind_addr = argv[++i];
         else if (a == "-v")               g_verbose  = true;
         else if (a == "--upnp")           do_upnp    = true;
-        else if (a == "--spi" && i+1 < argc) g_spi_profile_path = argv[++i];
         else if (a == "-w") {
             if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9')
                 web_port = std::atoi(argv[++i]);
@@ -4879,22 +4800,12 @@ int main(int argc, char** argv) {
         }
         else if (a == "-h") {
             puts("ns-backend  [-p PORT] [-b ADDR] [--upnp] [-w [WEB_PORT]] [-v]");
-            puts("            [--spi FILE]");
             puts("");
-            puts("  --spi FILE  Load a local user-provided controller SPI profile.");
-            puts("              Supports 65536-byte reduced profiles or 524288-byte full dumps.");
-            puts("              Copies the first 64KB for best rumble/gyro compatibility.");
-            puts("              MAC/serial still stay generated by runtime replies.");
             return 0;
         }
     }
 
     randomize_controller_identity();
-
-    if (!g_spi_profile_path.empty()) {
-        std::printf("[spi-profile] using local profile: %s (full-copy first 64KB)\n",
-                    g_spi_profile_path.c_str());
-    }
 
     // Always recreate the built-in gadget at process startup.  This makes every
     // launch self-healing: stale configfs state, leftover /dev/hidg* nodes, or a
@@ -5099,6 +5010,18 @@ int main(int argc, char** argv) {
             }
             if (hmac_ok != 0) {
                 if (g_verbose) puts("bad HMAC, dropped");
+                continue;
+            }
+
+            uint8_t packet_flags = is_extended_udp ? ext_pkt.flags : pkt.flags;
+            if (packet_flags & FLAG_DISCONNECT) {
+                server_macro_stop_all_for_client(client_idx);
+                {
+                    std::lock_guard<std::mutex> lk(g_mtx[client_idx]);
+                    reset_udp_client_session_locked(g_clients[client_idx]);
+                }
+                if (g_verbose) std::printf("UDP client %d sent disconnect and was released.\n", client_idx + 1);
+                ++g_pkts_rx;
                 continue;
             }
 
