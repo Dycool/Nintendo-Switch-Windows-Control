@@ -1694,7 +1694,7 @@ static void SenderThread(std::string host, uint16_t port) {
             rumble.update_timeouts(controller_for_slot);
         }
 
-        if (active_count > 0) next_tick += std::chrono::milliseconds(4);
+        if (active_count > 0) next_tick += std::chrono::milliseconds(15);
         else next_tick += std::chrono::milliseconds(50);
     }
 

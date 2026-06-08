@@ -854,11 +854,6 @@ private:
         bool gyro_enabled = false;
         bool rumble_capable = false;
         bool trigger_rumble_capable = false;
-        // At 250Hz the PC loop can poll the same physical controller sensor
-        // frame multiple times. Remember the last raw gyro sample so motion is
-        // only marked as "new" when the device actually reported new values.
-        bool last_raw_gyro_valid = false;
-        float last_raw_gyro[3] = {0.0f, 0.0f, 0.0f};
 
         std::string name;
         uint16_t vid = 0;
@@ -974,39 +969,6 @@ private:
                r.lx != 128 || r.ly != 128 || r.rx != 128 || r.ry != 128;
     }
 
-    static float clampf_local(float v, float lo, float hi) {
-        return v < lo ? lo : (v > hi ? hi : v);
-    }
-
-    static float motion_deadzone_float(float v, float dz) {
-        if (std::fabs(v) <= dz) return 0.0f;
-        return v > 0.0f ? (v - dz) : (v + dz);
-    }
-
-    static bool raw_gyro_changed(Device& d, const float gyro[3]) {
-        if (!d.last_raw_gyro_valid) {
-            d.last_raw_gyro_valid = true;
-            d.last_raw_gyro[0] = gyro[0];
-            d.last_raw_gyro[1] = gyro[1];
-            d.last_raw_gyro[2] = gyro[2];
-            return true;
-        }
-
-        // SDL returns cached sensor frames between physical reports. Exact float
-        // equality is intentional here: duplicate cached frames compare equal,
-        // while a real new HID sensor report normally changes at least one axis.
-        if (gyro[0] == d.last_raw_gyro[0] &&
-            gyro[1] == d.last_raw_gyro[1] &&
-            gyro[2] == d.last_raw_gyro[2]) {
-            return false;
-        }
-
-        d.last_raw_gyro[0] = gyro[0];
-        d.last_raw_gyro[1] = gyro[1];
-        d.last_raw_gyro[2] = gyro[2];
-        return true;
-    }
-
     static void apply_motion(Device& d, ns::MotionReport& out, bool& has_motion) {
         SDL_Gamepad* pad = d.pad;
         out.reset();
@@ -1023,14 +985,6 @@ private:
 
         float gyro[3] = {};
         if (d.gyro_enabled && SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3)) {
-            // At 250Hz, avoid sending the same physical gyro frame repeatedly.
-            // Buttons/sticks still go out every 4ms through the normal report path,
-            // but IMU history only advances when the controller reports new gyro.
-            if (!raw_gyro_changed(d, gyro)) {
-                has_motion = false;
-                return;
-            }
-
             constexpr float RAD_TO_DEG = 57.29577951308232f;
             constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.384f;
 
@@ -1040,8 +994,6 @@ private:
             out.gy = clamp_motion_i16(gyro[1] * CONSOLE_GYRO_SCALE);
             out.gz = clamp_motion_i16(gyro[2] * CONSOLE_GYRO_SCALE);
 
-            // Only now mark motion as present. This makes duplicate 250Hz polls
-            // keep buttons current without pushing repeated IMU samples.
             has_motion = true;
         }
     }
@@ -2846,9 +2798,8 @@ static void SenderThread() {
         pump_udp_rumble(sock, rumble, sdlForSlot);
         rumble.update_timeouts(sdlForSlot);
 
-        // 4ms active sleep = 250Hz sender loop. This keeps input latency low
-        // without hammering UDP at 1000Hz.
-        if (activeCount > 0) std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        // Match a real USB Pro Controller's boring ~66Hz / 15ms input cadence.
+        if (activeCount > 0) std::this_thread::sleep_for(std::chrono::milliseconds(15));
         else std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 

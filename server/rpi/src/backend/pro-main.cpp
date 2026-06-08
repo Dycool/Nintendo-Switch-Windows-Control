@@ -99,9 +99,9 @@ struct ClientSession {
     bool        first_pkt = true;
     ExtendedMultiReport report{}; // Inputs + optional motion coming from this specific PC/WebSocket
 
-    // Input report 0x30 carries three IMU samples per input report.  Keep a
-    // tiny newest-first history per logical pad so the virtual USB gamepad
-    // looks like a real controller instead of repeating the same sample 3x.
+    // The client sends current/raw motion at the same 15ms cadence as report
+    // 0x30, so keep only the newest sample. build_standard_report repeats it
+    // into the three IMU slots without inventing extra history.
     MotionReport motion_history[4][3]{};
     uint8_t      motion_history_count[4]{};
 
@@ -186,10 +186,10 @@ static MotionReport stabilize_real_pro_motion_sample(const ClientSession& c, int
 static void push_motion_history(ClientSession& c, int subpad, const MotionReport& motion) {
     if (subpad < 0 || subpad >= 4) return;
     MotionReport stable = stabilize_real_pro_motion_sample(c, subpad, motion);
-    c.motion_history[subpad][2] = c.motion_history[subpad][1];
-    c.motion_history[subpad][1] = c.motion_history[subpad][0];
+    c.motion_history[subpad][1].reset();
+    c.motion_history[subpad][2].reset();
     c.motion_history[subpad][0] = stable;
-    if (c.motion_history_count[subpad] < 3) c.motion_history_count[subpad]++;
+    c.motion_history_count[subpad] = 1;
 }
 
 // Diagnostics
@@ -954,6 +954,7 @@ static constexpr size_t PRO_REPORT_SIZE = 64;
 // Full input reports run at the common 15ms cadence, with 3 IMU samples spaced
 // roughly 5ms apart.
 static constexpr uint64_t PRO_REPORT_INTERVAL_US = 15'000ULL;
+static constexpr int PRO_WRITER_HZ = 1'000'000 / PRO_REPORT_INTERVAL_US;
 static constexpr uint8_t  PRO_BAT_CON = 0x91;
 static constexpr uint8_t  PRO_VIBRATOR_REPORT = 0x0B;
 static constexpr int PRO_IDLE_REPORT_HZ = 30;
@@ -2361,8 +2362,9 @@ static void writer_thread(int hz) {
                     have_report_to_write = true;
                     wrote_subcmd_reply = true;
                 } else if (rt[h].full_report_enabled) {
-                    // Active/player-assigned ports run at the normal writer rate
-                    // (250 Hz).  Unassigned ports still send neutral keepalive reports,
+                    // Active/player-assigned ports run at the same boring
+                    // ~66Hz / 15ms cadence as a real USB Pro Controller.
+                    // Unassigned ports still send neutral keepalive reports,
                     // but only at a low heartbeat rate so we do not spam neutral data.
                     bool release_burst = rt[h].neutral_burst_until_us != 0 &&
                                          now_stamp < rt[h].neutral_burst_until_us;
@@ -4937,8 +4939,8 @@ int main(int argc, char** argv) {
     if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); close(sock); return 1; }
     
     std::printf("UDP %s:%u writer=%d Hz\n",
-                bind_addr.c_str(), port, WRITER_HZ);
-    std::thread wt(writer_thread, WRITER_HZ);
+                bind_addr.c_str(), port, PRO_WRITER_HZ);
+    std::thread wt(writer_thread, PRO_WRITER_HZ);
     std::thread st(stats_thread);
 
     int ep = epoll_create1(0); epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = sock; epoll_ctl(ep, EPOLL_CTL_ADD, sock, &ev);
