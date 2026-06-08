@@ -77,7 +77,7 @@ static bool g_spi_profile_full_copy = true;
 // on shutdown, so setup_gadget.sh is no longer needed at runtime.
 static std::atomic<bool> g_gadget_setup_attempted{false};
 
-static constexpr int HID_PORT_COUNT = 1;
+static constexpr int HID_PORT_COUNT = 4;
 
 // HMAC authentication (key derived from DEFAULT_SECRET at startup)
 static uint8_t  g_hmac_key[32];

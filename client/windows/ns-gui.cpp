@@ -841,12 +841,33 @@ public:
         Device* d = device_for_slot_locked(sdl_slot);
         if (!d || !d->pad || !SDL_GamepadConnected(d->pad)) return false;
 
-        const bool ok = SDL_SendGamepadEffect(d->pad, precision, 8);
-        if (!ok) {
-            const char* e = SDL_GetError();
-            last_error = (e && *e) ? e : "SDL precision/HD rumble effect failed";
+        if (!supports_nintendo_hd_effect(*d)) {
+            // Not an error. This just means "use classic fallback".
+            return false;
         }
-        return ok;
+
+        const uint64_t now = ns::now_us();
+        if (d->precision_retry_after_us != 0 && now < d->precision_retry_after_us) {
+            return false;
+        }
+
+        if (SDL_SendGamepadEffect(d->pad, precision, 8)) {
+            d->precision_retry_after_us = 0;
+            return true;
+        }
+
+        const char* e = SDL_GetError();
+        std::ostringstream oss;
+        oss << "SDL_SendGamepadEffect failed for " << d->name
+            << " VID:PID=" << std::hex << d->vid << ":" << d->pid
+            << " - " << ((e && *e) ? e : "unknown error");
+        last_error = oss.str();
+
+        // Do not spam a controller with unsupported effect packets every frame.
+        // Let classic rumble handle feedback, then retry later in case the
+        // device was briefly unavailable.
+        d->precision_retry_after_us = now + 2000000ULL;
+        return false;
     }
 
     void stop_all_rumble() {
@@ -868,6 +889,7 @@ private:
         bool gyro_enabled = false;
         bool rumble_capable = false;
         bool trigger_rumble_capable = false;
+        uint64_t precision_retry_after_us = 0;
         std::string name;
         uint16_t vid = 0;
         uint16_t pid = 0;
@@ -896,6 +918,14 @@ private:
 
     static bool contains_upper(const std::string& haystack, const char* needle) {
         return upper_copy(haystack).find(needle) != std::string::npos;
+    }
+
+    static bool supports_nintendo_hd_effect(const Device& d) {
+        // SDL_SendGamepadEffect is gamepad-specific, not a generic HD-rumble API.
+        // Our 8-byte precision payload is a Nintendo/Switch HD-rumble frame.
+        // Sending it to DualShock/DualSense/Xbox can fail repeatedly or kick the
+        // device into a bad enhanced-report state, so let those use classic rumble.
+        return d.vid == 0x057E && (d.pid == 0x2009 || d.pid == 0x2006 || d.pid == 0x2007);
     }
 
     static bool has_native_home_capture(const Device& d) {
@@ -1129,17 +1159,13 @@ public:
                          const int sdl_for_slot[4]) {
         if (rp.subpad >= 4) return;
         const int slot = rp.subpad;
+        const bool neutral = (rp.low_freq == 0 && rp.high_freq == 0) || rp.duration_10ms == 0;
         bool precision_payload_zero = true;
         for (uint8_t b : rp.precision) precision_payload_zero = precision_payload_zero && b == 0;
-        const bool neutral = precision_payload_zero &&
-                             ((rp.low_freq == 0 && rp.high_freq == 0) || rp.duration_10ms == 0);
         const bool ok_precision = (!precision_payload_zero || neutral) &&
                            sdl_for_slot[slot] >= 0 &&
                            g_sdlInput.set_precision_rumble(sdl_for_slot[slot], rp.precision);
         if (ok_precision) {
-            // Backend sends precision first and classic fallback immediately after.
-            // Suppress the fallback long enough to cover scheduling/UDP jitter so
-            // HD-capable clients do not play two vibrations for one console frame.
             states[slot].suppress_classic_until_us = ns::now_us() + 150000ULL;
             if (neutral) {
                 states[slot].until_us = 0;
@@ -1167,9 +1193,6 @@ public:
         uint8_t high = rp.high_freq;
         bool neutral = (low == 0 && high == 0) || rp.duration_10ms == 0;
         uint64_t now = ns::now_us();
-        // Classic rumble is fallback only. Keep a small floor so very short
-        // pulses are still felt, but do not stretch every fallback pulse to 250ms,
-        // because that makes HD+fallback setups feel massively overpowered.
         uint64_t dur_us = neutral ? 0ULL : std::max<uint64_t>(80000ULL, (uint64_t)rp.duration_10ms * 10000ULL);
         uint32_t dur_ms = neutral ? 0U : (uint32_t)std::min<uint64_t>(dur_us / 1000ULL, 0xFFFFFFFFULL);
 
