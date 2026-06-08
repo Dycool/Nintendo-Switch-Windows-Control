@@ -974,7 +974,7 @@ private:
             constexpr float RAD_TO_DEG = 57.29577951308232f;
             constexpr float CONSOLE_GYRO_SCALE = RAD_TO_DEG * 16.384f;
 
-            out.az = 4096;
+            out.ay = 4096;
             out.gx = clamp_motion_i16(gyro[0] * CONSOLE_GYRO_SCALE);
             out.gy = clamp_motion_i16(gyro[1] * CONSOLE_GYRO_SCALE);
             out.gz = clamp_motion_i16(gyro[2] * CONSOLE_GYRO_SCALE);
