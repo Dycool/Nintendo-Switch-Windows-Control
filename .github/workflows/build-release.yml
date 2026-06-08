@@ -12,13 +12,13 @@ permissions:
 jobs:
   build-windows:
     uses: ./.github/workflows/build-windows.yml
-    
+
   build-linux:
     uses: ./.github/workflows/build-linux.yml
-    
+
   build-mac:
     uses: ./.github/workflows/build-mac.yml
-    
+
   build-pi-server:
     uses: ./.github/workflows/build-pi.yml
 
@@ -44,7 +44,7 @@ jobs:
             artifacts/linux-gamepad/ns-gamepad \
             artifacts/linux-gui/ns-gui
 
-          # macOS CLI + GUI (combined)
+          # macOS CLI + GUI combined
           mkdir -p _zips/_mac
           cp artifacts/macos-gamepad/ns-gamepad _zips/_mac/
           unzip -q artifacts/macos-gui/ns-pc-control-mac-gui.zip -d _zips/_mac/
@@ -53,10 +53,13 @@ jobs:
           cd ../..
           rm -rf _zips/_mac
 
-          # Pi
-          zip -j _zips/ns-pc-control-raspberry-pi.zip \
-            artifacts/pi-backend/ns-backend \
-            artifacts/pi-setup-gadget/setup_gadget.sh
+          # Raspberry Pi unified server
+          mkdir -p _zips/_pi
+          cp artifacts/pi-server/ns-backend _zips/_pi/ns-backend
+          cd _zips/_pi
+          zip -r ../ns-pc-control-raspberry-pi.zip ns-backend
+          cd ../..
+          rm -rf _zips/_pi
 
       - name: Create Draft Release
         uses: softprops/action-gh-release@v2

@@ -1,8 +1,8 @@
-# 🛠️ Building from Source
+# Building from Source
 
 If you prefer to compile the binaries yourself rather than using the release zips, follow the instructions for your platform below.
 
-## 🍓 Raspberry Pi (Server)
+## Raspberry Pi (Server)
 
 1. Clone the repository:
 ```bash
@@ -10,7 +10,15 @@ git clone https://github.com/Dycool/NS-PC-Control.git
 cd NS-PC-Control
 ```
 
-2. Compile the server:
+2. Install dependencies (miniupnpc for UPnP support is optional):
+```bash
+sudo apt-get update
+sudo apt-get install -y cmake g++ pkg-config
+# Optional: sudo apt-get install -y miniupnpc
+```
+
+3. Compile the unified backend:
+
 ```bash
 cd server/rpi
 mkdir build && cd build
@@ -18,9 +26,25 @@ cmake ..
 make
 ```
 
+Default runtime mode is Pro Controller with gyro, rumble, and macros:
+
+```bash
+sudo ./ns-backend
+```
+
+Use legacy Hori/Pokken 8-byte mode when you only want buttons/sticks:
+
+```bash
+sudo ./ns-backend -hori
+```
+
+> The server includes **built-in USB gadget setup** - no external `setup_gadget.sh` script needed. It automatically creates and binds the HID gadget on startup and cleans up on exit.
+
+> **Note:** To disable UPnP support, add `-DUSE_UPNP=OFF` to the cmake command.
+
 ---
 
-## 💻 PC Clients
+## PC Clients
 
 Clone the repository to your PC:
 ```bash
@@ -30,7 +54,8 @@ cd NS-PC-Control
 
 ---
 
-### 🪟 Windows
+### Windows
+
 On Windows, the CLI tool is built using MinGW (GCC), while the GUI application is built using Microsoft Visual C++ (MSVC).
 
 **To build the CLI (MinGW):**
@@ -38,7 +63,7 @@ On Windows, the CLI tool is built using MinGW (GCC), while the GUI application i
 2. Open the **MSYS2 UCRT64** terminal and navigate to `client/windows/`.
 3. Build the CLI client:
 ```bash
-g++ -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput -lwinmm -luser32
+g++ -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxinput -lwinmm -luser32 -lhid -lsetupapi
 ```
 
 **To build the GUI (MSVC):**
@@ -48,38 +73,42 @@ g++ -std=c++17 -O2 -Wall ns-gamepad.cpp -o ns-gamepad.exe -static -lws2_32 -lxin
 4. Compile the resources and the GUI application:
 ```cmd
 rc /nologo ns-gui.rc
-cl /std:c++17 /O2 /EHsc /W3 ns-gui.cpp ns-gui.res /link ws2_32.lib xinput.lib setupapi.lib comctl32.lib user32.lib kernel32.lib gdi32.lib advapi32.lib winmm.lib /out:ns-gui.exe
+cl /std:c++17 /O2 /EHsc /W3 ns-gui.cpp ns-gui.res /link ws2_32.lib xinput.lib setupapi.lib hid.lib comctl32.lib user32.lib kernel32.lib gdi32.lib advapi32.lib winmm.lib /out:ns-gui.exe
 ```
+
+Alternatively, run `build.bat` which auto-detects MinGW or MSVC and builds both targets.
 
 ---
 
-### 🐧 Linux (Ubuntu / Debian / SteamOS)
+### Linux (Ubuntu / Debian / SteamOS)
+
 To compile on Linux, you need a C++ compiler and the GTK3 development headers for the GUI.
 
 **Prerequisites:**
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential libgtk-3-dev libsdl2-dev
+sudo apt-get install -y build-essential libgtk-3-dev libsdl3-dev
 ```
 
 Navigate to `client/linux/` and run the following depending on what you want to build:
 
 **Build the CLI:**
 ```bash
-g++ -O3 -std=c++17 ns-gamepad.cpp -o ns-gamepad -lpthread -lSDL2
+g++ -O3 -std=c++17 ns-gamepad.cpp -o ns-gamepad -lpthread -lSDL3
 ```
 
 **Build the GUI:**
 ```bash
-g++ -O3 -std=c++17 ns-gui.cpp -o ns-gui $(pkg-config --cflags --libs gtk+-3.0) -lpthread -lSDL2
+g++ -O3 -std=c++17 ns-gui.cpp -o ns-gui $(pkg-config --cflags --libs gtk+-3.0) -lpthread -lSDL3
 ```
 
 ---
 
-### 🍎 macOS
+### macOS
+
 The macOS client uses Apple's **GameController framework**.
 
-**Prerequisite:** Install Xcode Command Line Tools: 
+**Prerequisite:** Install Xcode Command Line Tools:
 ```bash
 xcode-select --install
 ```
@@ -88,12 +117,14 @@ Navigate to `client/mac/` and run the following depending on what you want to bu
 
 **Build the CLI:**
 ```bash
-clang++ -std=c++17 -ObjC++ -framework GameController -framework Foundation -framework CoreGraphics ns-gamepad.mm -o ns-gamepad
+clang++ -std=c++17 -ObjC++ -framework GameController -framework Foundation -framework CoreGraphics -framework CoreHaptics ns-gamepad.mm -o ns-gamepad
 ```
-*(Note: On macOS 10.15+, Bluetooth controllers may require you to grant **Input Monitoring** permission to your terminal app in System Settings).*
+
+On macOS 10.15+, Bluetooth controllers may require you to grant **Input Monitoring** permission to your terminal app in System Settings.
 
 **Build the GUI App Bundle:**
-We have included a script that automatically compiles the GUI and packages it into a native `.app` bundle.
+
+The included script automatically compiles the GUI and packages it into a native `.app` bundle.
 ```bash
 bash build_gui.sh
 ```

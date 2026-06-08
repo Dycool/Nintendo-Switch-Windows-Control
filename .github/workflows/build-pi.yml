@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'server/rpi/**'
+      - '.github/workflows/build-pi.yml'
   workflow_dispatch:
   workflow_call:
 
@@ -15,11 +16,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      
+
       - name: Install ARM Cross-Compiler and deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y g++-aarch64-linux-gnu cmake zip wget
+          sudo apt-get install -y g++-aarch64-linux-gnu cmake wget
 
       - name: Cross-compile miniupnpc for aarch64
         run: |
@@ -35,23 +36,20 @@ jobs:
           make -j$(nproc)
           make install
 
-      - name: Build Pi Server
+      - name: Build Unified Pi Server
         run: |
           cd server/rpi
-          mkdir build && cd build
+          mkdir -p build && cd build
           cmake .. \
             -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
             -DMINIUPNPC_INCLUDE_DIRS=/tmp/miniupnpc/include \
             -DMINIUPNPC_LIBRARIES=/tmp/miniupnpc/lib/libminiupnpc.a
           make -j$(nproc)
-          cp ../setup_gadget.sh .
-          
-      - uses: actions/upload-artifact@v6
-        with:
-          name: pi-backend
-          path: server/rpi/build/ns-backend
+
+          mkdir -p artifact/pi-server
+          cp ns-backend artifact/pi-server/ns-backend
 
       - uses: actions/upload-artifact@v6
         with:
-          name: pi-setup-gadget
-          path: server/rpi/build/setup_gadget.sh
+          name: pi-server
+          path: server/rpi/build/artifact/pi-server/

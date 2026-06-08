@@ -25,6 +25,7 @@ if(USE_UPNP)
         if(PkgConfig_FOUND)
             pkg_check_modules(MINIUPNPC miniupnpc)
         endif()
+
         if(MINIUPNPC_FOUND)
             add_definitions(-DUSE_UPNP)
             message(STATUS "UPnP support enabled (miniupnpc found via pkg-config)")
@@ -38,6 +39,7 @@ endif()
 
 add_executable(ns-backend src/backend/main.cpp)
 target_link_libraries(ns-backend PRIVATE pthread)
+
 if(MINIUPNPC_FOUND)
     target_include_directories(ns-backend PRIVATE ${MINIUPNPC_INCLUDE_DIRS})
     target_link_libraries(ns-backend PRIVATE ${MINIUPNPC_LIBRARIES})
