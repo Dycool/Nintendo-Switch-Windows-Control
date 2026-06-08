@@ -1197,8 +1197,7 @@ static void pump_udp_rumble(SOCKET sock, RumbleManager& rumble, const int contro
     }
 }
 
-static int detect_server_udp_interval_ms(SOCKET sock, const sockaddr_in& dest, int fallback_ms, bool* out_is_legacy) {
-    if (out_is_legacy) *out_is_legacy = false;
+static bool detect_server_is_legacy(SOCKET sock, const sockaddr_in& dest) {
     ns::ServerInfoProbe probe{};
     send_all_udp(sock, dest, &probe, sizeof(probe));
     const uint64_t deadline = ns::now_us() + 150000ULL;
@@ -1215,14 +1214,13 @@ static int detect_server_udp_interval_ms(SOCKET sock, const sockaddr_in& dest, i
 #endif
         if (n == (int)sizeof(reply) &&
             reply.magic == ns::SERVER_INFO_MAGIC &&
-            reply.version == ns::SERVER_INFO_VERSION &&
-            reply.udp_interval_ms > 0) {
-            if (out_is_legacy) *out_is_legacy = reply.backend == ns::SERVER_BACKEND_LEGACY;
-            return fallback_ms;
+            reply.version == ns::SERVER_INFO_VERSION) {
+            return reply.backend == ns::SERVER_BACKEND_LEGACY;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    return fallback_ms;
+    // No reply: assume modern mode unless --hori was explicitly given.
+    return false;
 }
 
 static constexpr uint32_t MACRO_UDP_MAGIC = 0x4E534D43u;
@@ -2124,9 +2122,8 @@ static void sender_thread_main(std::string host, uint16_t port, bool legacy_udp)
         return;
     }
 
-    bool server_is_legacy = false;
-    const int active_send_interval_ms = detect_server_udp_interval_ms(
-        sock, dest, ns::LEGACY_UDP_INTERVAL_MS, &server_is_legacy);
+    const bool server_is_legacy = detect_server_is_legacy(sock, dest);
+    const int active_send_interval_ms = ns::LEGACY_UDP_INTERVAL_MS; // always 250 Hz
     const bool send_motion = !server_is_legacy && !legacy_udp;
     uint32_t seq = 0;
     RumbleManager rumble;
@@ -2424,9 +2421,8 @@ static int cli_main(const std::vector<std::string>& original_args) {
         closesocket(sock);
         return 1;
     }
-    bool server_is_legacy = false;
-    const int active_send_interval_ms = detect_server_udp_interval_ms(
-        sock, dest, ns::LEGACY_UDP_INTERVAL_MS, &server_is_legacy);
+    const bool server_is_legacy = detect_server_is_legacy(sock, dest);
+    const int active_send_interval_ms = ns::LEGACY_UDP_INTERVAL_MS; // always 250 Hz
     const bool send_motion = !server_is_legacy && !legacy_udp;
 
     if (macro_mode) {
