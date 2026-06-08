@@ -17,7 +17,7 @@ env:
 
   # Pin this later to a commit SHA for reproducible builds.
   JSL_REF: master
-  JSL_CACHE_VERSION: v1
+  JSL_CACHE_VERSION: v2
 
 jobs:
   build-windows:
@@ -86,20 +86,35 @@ jobs:
 
           Copy-Item _deps/JoyShockLibrary/JoyShockLibrary/JoyShockLibrary.h _cache/jsl-static/include/
 
-          $lib = Get-ChildItem _deps/JoyShockLibrary/build-static -Recurse -Filter JoyShockLibrary.lib |
+          $jsl = Get-ChildItem _deps/JoyShockLibrary/build-static -Recurse -Filter JoyShockLibrary.lib |
             Where-Object { $_.FullName -match "\\Release\\" } |
             Select-Object -First 1
 
-          if (-not $lib) {
-            $lib = Get-ChildItem _deps/JoyShockLibrary/build-static -Recurse -Filter JoyShockLibrary.lib |
+          if (-not $jsl) {
+            $jsl = Get-ChildItem _deps/JoyShockLibrary/build-static -Recurse -Filter JoyShockLibrary.lib |
               Select-Object -First 1
           }
 
-          if (-not $lib) {
+          if (-not $jsl) {
             throw "JoyShockLibrary.lib not found"
           }
 
-          Copy-Item $lib.FullName _cache/jsl-static/lib/JoyShockLibrary.lib
+          Copy-Item $jsl.FullName _cache/jsl-static/lib/JoyShockLibrary.lib
+
+          $hidapi = Get-ChildItem _deps/JoyShockLibrary/build-static -Recurse -Filter hidapi.lib |
+            Where-Object { $_.FullName -match "\\Release\\" } |
+            Select-Object -First 1
+
+          if (-not $hidapi) {
+            $hidapi = Get-ChildItem _deps/JoyShockLibrary/build-static -Recurse -Filter hidapi.lib |
+              Select-Object -First 1
+          }
+
+          if (-not $hidapi) {
+            throw "hidapi.lib not found"
+          }
+
+          Copy-Item $hidapi.FullName _cache/jsl-static/lib/hidapi.lib
 
       - name: Build Windows Clients (MSVC + cached static SDL3 + static JoyShockLibrary)
         shell: pwsh
@@ -126,6 +141,7 @@ jobs:
           set(JSL_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../_cache/jsl-static")
           set(JSL_INCLUDE_DIR "${JSL_ROOT}/include")
           set(JSL_LIBRARY "${JSL_ROOT}/lib/JoyShockLibrary.lib")
+          set(HIDAPI_LIBRARY "${JSL_ROOT}/lib/hidapi.lib")
 
           if(NOT EXISTS "${JSL_INCLUDE_DIR}/JoyShockLibrary.h")
             message(FATAL_ERROR "JoyShockLibrary.h not found at ${JSL_INCLUDE_DIR}")
@@ -135,10 +151,19 @@ jobs:
             message(FATAL_ERROR "JoyShockLibrary.lib not found at ${JSL_LIBRARY}")
           endif()
 
+          if(NOT EXISTS "${HIDAPI_LIBRARY}")
+            message(FATAL_ERROR "hidapi.lib not found at ${HIDAPI_LIBRARY}")
+          endif()
+
           add_library(JoyShockLibraryStatic STATIC IMPORTED)
           set_target_properties(JoyShockLibraryStatic PROPERTIES
             IMPORTED_LOCATION "${JSL_LIBRARY}"
             INTERFACE_INCLUDE_DIRECTORIES "${JSL_INCLUDE_DIR}"
+          )
+
+          add_library(HIDAPIStatic STATIC IMPORTED)
+          set_target_properties(HIDAPIStatic PROPERTIES
+            IMPORTED_LOCATION "${HIDAPI_LIBRARY}"
           )
 
           add_executable(ns-gamepad
@@ -200,7 +225,9 @@ jobs:
 
           target_link_libraries(ns-gui PRIVATE
             JoyShockLibraryStatic
+            HIDAPIStatic
             hid
+            setupapi
           )
           '@ | Set-Content -Encoding UTF8 CMakeLists.txt
 
