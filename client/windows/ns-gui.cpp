@@ -737,6 +737,12 @@ static uint8_t jsl_axis_to_byte(float v, bool invert = false) {
     return (uint8_t)out;
 }
 
+static int16_t jsl_clamp_motion_i16(float v) {
+    if (v > 32767.0f) return 32767;
+    if (v < -32768.0f) return -32768;
+    return (int16_t)std::lround(v);
+}
+
 class JoyShockInputManager {
 public:
     bool start() {
@@ -844,17 +850,17 @@ public:
             // JSL MotionState is already processed/fused enough for aim. Use
             // IMU accel for gravity and accumulated gyro for smooth polling.
             float gx = 0.0f, gy = 0.0f, gz = 0.0f;
-            JslGetAndFlushAccumulatedGyro(h, &gx, &gy, &gz);
+            JslGetAndFlushAccumulatedGyro(h, gx, gy, gz);
 
             st.motion.reset();
-            st.motion.ax = clamp_motion_i16(imu.accelX * 4096.0f);
-            st.motion.ay = clamp_motion_i16(imu.accelY * 4096.0f);
-            st.motion.az = clamp_motion_i16(imu.accelZ * 4096.0f);
+            st.motion.ax = jsl_clamp_motion_i16(imu.accelX * 4096.0f);
+            st.motion.ay = jsl_clamp_motion_i16(imu.accelY * 4096.0f);
+            st.motion.az = jsl_clamp_motion_i16(imu.accelZ * 4096.0f);
 
             // JSL gyro is degrees/sec. Backend convention is deg/sec * 16.
-            st.motion.gx = clamp_motion_i16(gx * 16.0f);
-            st.motion.gy = clamp_motion_i16(gy * 16.0f);
-            st.motion.gz = clamp_motion_i16(gz * 16.0f);
+            st.motion.gx = jsl_clamp_motion_i16(gx * 16.0f);
+            st.motion.gy = jsl_clamp_motion_i16(gy * 16.0f);
+            st.motion.gz = jsl_clamp_motion_i16(gz * 16.0f);
             st.has_motion = true;
 
             if (st.input.buttons || st.input.hat != ns::HAT_NEUTRAL ||
