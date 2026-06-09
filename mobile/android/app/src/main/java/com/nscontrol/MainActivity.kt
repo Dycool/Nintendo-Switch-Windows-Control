@@ -18,10 +18,7 @@ import okio.ByteString.Companion.toByteString
 import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import kotlin.math.abs
-import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
     private lateinit var connectView: View
@@ -41,7 +38,7 @@ class MainActivity : AppCompatActivity() {
     private var gyroListener: SensorEventListener? = null
     private var accelListener: SensorEventListener? = null
     private var gyroValues = FloatArray(3) // x, y, z angular velocity, rad/s
-    private var accelValues = floatArrayOf(0f, STANDARD_GRAVITY, 0f) // x, y, z acceleration, m/s^2
+    private var accelValues = floatArrayOf(0f, Protocol.STANDARD_GRAVITY, 0f) // x, y, z acceleration, m/s^2
 
     // Haptics
     private val vibrator by lazy { getSystemService(VIBRATOR_SERVICE) as Vibrator }
@@ -147,101 +144,48 @@ class MainActivity : AppCompatActivity() {
 
     private fun sendResetFrame() {
         // FLAG_RESET = 0x01. This releases all pads immediately before the WS closes.
-        sendFrameInternal(flagsOverride = 0x01, forceNeutral = true)
+        sendFrameInternal(flagsOverride = Protocol.FLAG_RESET, forceNeutral = true)
     }
 
     private fun sendFrameInternal(flagsOverride: Int? = null, forceNeutral: Boolean = false) {
         val controller = if (forceNeutral) null else snapshotController()
         val touchActive = !forceNeutral && touchModeActive()
-        val buf = ByteBuffer.allocate(116).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putInt(0x4E535743)        // magic
-        buf.put(5)                     // WEB_PROTO_VERSION
-        val flags = flagsOverride ?: if (controller == null && touchActive) 0x04 else 0 // FLAG_SINGLE_PAD only while the touch page is active
-        buf.put(flags.toByte())
-        buf.putShort(0)                // reserved
-        buf.putInt(seq++)
-        buf.putLong(System.nanoTime() / 1000)
+        val flags = flagsOverride ?: if (controller == null && touchActive) Protocol.FLAG_SINGLE_PAD else 0
 
-        for (p in 0 until 4) {
-            if (p == 0 && !forceNeutral) {
-                if (controller != null) {
-                    putControllerHid(buf, controller)
-                } else {
-                    val touch = touchFrame
-                    if (touchActive && touch != null && touch.size >= 28) {
-                        // The browser/mobile page sends a complete 116-byte web frame.
-                        // Pad 0's HIDReport starts at byte 20 and is 8 bytes long.
-                        buf.put(touch.sliceArray(20 until 28))
-                    } else {
-                        putNeutralHid(buf)
-                    }
-                }
-                // Touch mode uses phone gyro. Android's public controller APIs usually
-                // do not expose Switch Pro / Bluetooth gamepad IMU, so controller gyro
-                // uses phone IMU as a fallback only when a controller is active.
-                if (controller != null || touchActive) putMotion(buf) else buf.put(ByteArray(16))
-            } else {
-                putNeutralHid(buf)
-                buf.put(ByteArray(16))
-            }
+        val pad0Hid: ByteArray? = when {
+            forceNeutral -> null
+            controller != null -> Protocol.controllerHid(
+                controller.buttons,
+                controller.dpadUp,
+                controller.dpadDown,
+                controller.dpadLeft,
+                controller.dpadRight,
+                controller.lx,
+                controller.ly,
+                controller.rx,
+                controller.ry,
+                true
+            )
+            touchActive -> touchFrame?.let { Protocol.extractPad0HidFromWebFrame(it) }
+            else -> null
         }
-        ws?.send(buf.array().toByteString())
-    }
 
-    private fun putNeutralHid(buf: ByteBuffer) {
-        buf.putShort(0)  // buttons
-        buf.put(8)       // neutral hat
-        buf.put(128.toByte()); buf.put(128.toByte()) // left stick
-        buf.put(128.toByte()); buf.put(128.toByte()) // right stick
-        buf.put(0)       // vendor/present byte; FLAG_SINGLE_PAD keeps pad 0 present server-side
-    }
+        val pad0Motion: ByteArray? = if (!forceNeutral && (controller != null || touchActive)) {
+            val a = accelValues
+            val g = gyroValues
+            Protocol.motionFromAndroid(a[0], a[1], a[2], g[0], g[1], g[2])
+        } else {
+            null
+        }
 
-    private fun putControllerHid(buf: ByteBuffer, st: ControllerState) {
-        buf.putShort(st.buttons.toShort())
-        buf.put(resolveControllerHat(st))
-        buf.put(axisToByte(st.lx))
-        buf.put(axisToByte(st.ly))
-        buf.put(axisToByte(st.rx))
-        buf.put(axisToByte(st.ry))
-        buf.put(0x01) // EXT_PAD_PRESENT
-    }
-
-    private fun resolveControllerHat(st: ControllerState): Byte {
-        return when {
-            st.dpadUp && st.dpadRight -> 1
-            st.dpadUp && st.dpadLeft -> 7
-            st.dpadDown && st.dpadRight -> 3
-            st.dpadDown && st.dpadLeft -> 5
-            st.dpadUp -> 0
-            st.dpadRight -> 2
-            st.dpadDown -> 4
-            st.dpadLeft -> 6
-            else -> 8
-        }.toByte()
-    }
-
-    private fun axisToByte(v: Float): Byte {
-        val clamped = v.coerceIn(-1f, 1f)
-        return ((clamped + 1f) * 127.5f).roundToInt().coerceIn(0, 255).toByte()
-    }
-
-    private fun putMotion(buf: ByteBuffer) {
-        val a = accelValues
-        val g = gyroValues
-
-        // Match the desktop SDL path and protocol.hpp layout:
-        // MotionReport = ax, ay, az, gx, gy, gz.
-        val ax = clampMotion(-a[0] * ACCEL_SCALE)
-        val ay = clampMotion(-a[2] * ACCEL_SCALE)
-        val az = clampMotion( a[1] * ACCEL_SCALE)
-        val gx = clampMotion(-g[0] * GYRO_SCALE)
-        val gy = clampMotion(-g[2] * GYRO_SCALE)
-        val gz = clampMotion( g[1] * GYRO_SCALE)
-
-        buf.putShort(ax); buf.putShort(ay); buf.putShort(az)
-        buf.putShort(gx); buf.putShort(gy); buf.putShort(gz)
-        buf.put(1)          // has_motion
-        buf.put(ByteArray(3))
+        val frame = Protocol.buildFrame(
+            seq++,
+            flags,
+            System.nanoTime() / 1000L,
+            pad0Hid,
+            pad0Motion
+        )
+        ws?.send(frame.toByteString())
     }
 
     // ═══════════════════════════════
@@ -585,32 +529,20 @@ class MainActivity : AppCompatActivity() {
         accelListener = null
     }
 
-    private fun clampMotion(v: Float): Short {
-        return when {
-            v > 32767f -> 32767
-            v < -32768f -> -32768
-            else -> v.roundToInt().toShort()
-        }
-    }
-
     companion object {
-        private const val BTN_Y = 1 shl 0
-        private const val BTN_B = 1 shl 1
-        private const val BTN_A = 1 shl 2
-        private const val BTN_X = 1 shl 3
-        private const val BTN_L = 1 shl 4
-        private const val BTN_R = 1 shl 5
-        private const val BTN_ZL = 1 shl 6
-        private const val BTN_ZR = 1 shl 7
-        private const val BTN_MINUS = 1 shl 8
-        private const val BTN_PLUS = 1 shl 9
-        private const val BTN_LSTICK = 1 shl 10
-        private const val BTN_RSTICK = 1 shl 11
-        private const val BTN_HOME = 1 shl 12
-
-        private const val STANDARD_GRAVITY = 9.80665f
-        private const val ACCEL_SCALE = 4096.0f / STANDARD_GRAVITY
-        private const val GYRO_SCALE = 938.732f // 57.2958 * 16.384, rad/s → Switch IMU units
+        private val BTN_Y: Int get() = Protocol.BTN_Y
+        private val BTN_B: Int get() = Protocol.BTN_B
+        private val BTN_A: Int get() = Protocol.BTN_A
+        private val BTN_X: Int get() = Protocol.BTN_X
+        private val BTN_L: Int get() = Protocol.BTN_L
+        private val BTN_R: Int get() = Protocol.BTN_R
+        private val BTN_ZL: Int get() = Protocol.BTN_ZL
+        private val BTN_ZR: Int get() = Protocol.BTN_ZR
+        private val BTN_MINUS: Int get() = Protocol.BTN_MINUS
+        private val BTN_PLUS: Int get() = Protocol.BTN_PLUS
+        private val BTN_LSTICK: Int get() = Protocol.BTN_LSTICK
+        private val BTN_RSTICK: Int get() = Protocol.BTN_RSTICK
+        private val BTN_HOME: Int get() = Protocol.BTN_HOME
 
         // Injected at <head> — overrides WebSocket to bridge through native
         private val BRIDGE_SCRIPT = """

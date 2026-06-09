@@ -17,12 +17,16 @@ targets:
     platform: iOS
     sources:
       - NSControl
+      - ../shared/ns_protocol.c
+      - ../shared/ns_protocol.h
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nscontrol.app
         PRODUCT_NAME: NS-mobile
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: NSControl/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: NSControl/ProtocolBridge.h
+        HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/../shared"
         DEVELOPMENT_TEAM: ""
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: ""

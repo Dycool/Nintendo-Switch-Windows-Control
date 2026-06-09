@@ -23,12 +23,14 @@ jobs:
           distribution: zulu
           java-version: '17'
 
-      # The mobile project has a fake/incomplete Gradle wrapper
-      # (gradle-wrapper.jar is not committed), so install Gradle explicitly.
       - name: Set up Gradle 8.5
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.5'
+
+      - name: Install Android native build tools
+        run: |
+          yes | sdkmanager "cmake;3.22.1" "ndk;26.3.11579264"
 
       - name: Build debug APK
         working-directory: mobile/android
@@ -61,7 +63,7 @@ jobs:
         working-directory: mobile/ios
         run: xcodegen generate
 
-      - name: Build iOS app (unsigned)
+      - name: Build iOS app unsigned
         working-directory: mobile/ios
         run: |
           xcodebuild \
@@ -76,20 +78,24 @@ jobs:
             CODE_SIGN_IDENTITY='' \
             build
 
-      - name: Package iOS IPA (unsigned)
+      - name: Package iOS IPA unsigned
         run: |
           set -euo pipefail
           mkdir -p _artifact Payload
           APP="$(find mobile/ios/build/Release-iphoneos -maxdepth 1 -type d -name '*.app' -print -quit)"
+
           if [ -z "$APP" ]; then
             echo "Could not find built .app"
             find mobile/ios/build -maxdepth 4 -print | sort
             exit 1
           fi
+
           rm -rf Payload/NS-mobile.app
           ditto "$APP" Payload/NS-mobile.app
+
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName NS-mobile" Payload/NS-mobile.app/Info.plist 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleName NS-mobile" Payload/NS-mobile.app/Info.plist 2>/dev/null || true
+
           ditto -c -k --sequesterRsrc --keepParent Payload _artifact/NS-mobile.ipa
 
       - name: Upload iOS IPA

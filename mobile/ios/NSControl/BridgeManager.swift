@@ -3,27 +3,26 @@ import CoreMotion
 import CoreHaptics
 import GameController
 
-// Constants matching server/include/protocol.hpp (Swift-friendly)
-private let kProtoMagic: UInt32   = 0x4E535743
-private let kWebProtoVer: UInt8   = 5
-private let kSinglePad: UInt8     = 0x04
-private let kExtPresent: UInt8    = 0x01
-private let kPadSize              = 24 // sizeof(ExtendedHIDReport)
+// Thin Swift aliases for the shared C protocol library.
+private let kSinglePad: UInt8     = UInt8(NS_FLAG_SINGLE_PAD)
+private let kExtPresent: UInt8    = UInt8(NS_EXT_PAD_PRESENT)
+private let kFrameSize            = Int(NS_PROTOCOL_WEB_FRAME_SIZE)
+private let kPadSize              = Int(NS_PROTOCOL_EXT_PAD_SIZE)
+private let kMotionSize           = Int(NS_PROTOCOL_MOTION_SIZE)
 
-private let kBtnY: UInt16      = 1<<0;  let kBtnB: UInt16      = 1<<1
-private let kBtnA: UInt16      = 1<<2;  let kBtnX: UInt16      = 1<<3
-private let kBtnL: UInt16      = 1<<4;  let kBtnR: UInt16      = 1<<5
-private let kBtnZL: UInt16     = 1<<6;  let kBtnZR: UInt16     = 1<<7
-private let kBtnMinus: UInt16  = 1<<8;  let kBtnPlus: UInt16   = 1<<9
-private let kBtnLStick: UInt16 = 1<<10; let kBtnRStick: UInt16 = 1<<11
-private let kBtnHome: UInt16   = 1<<12; let kBtnCapture: UInt16 = 1<<13
+private let kBtnY: UInt16      = UInt16(NS_BTN_Y);      let kBtnB: UInt16      = UInt16(NS_BTN_B)
+private let kBtnA: UInt16      = UInt16(NS_BTN_A);      let kBtnX: UInt16      = UInt16(NS_BTN_X)
+private let kBtnL: UInt16      = UInt16(NS_BTN_L);      let kBtnR: UInt16      = UInt16(NS_BTN_R)
+private let kBtnZL: UInt16     = UInt16(NS_BTN_ZL);     let kBtnZR: UInt16     = UInt16(NS_BTN_ZR)
+private let kBtnMinus: UInt16  = UInt16(NS_BTN_MINUS);  let kBtnPlus: UInt16   = UInt16(NS_BTN_PLUS)
+private let kBtnLStick: UInt16 = UInt16(NS_BTN_LSTICK); let kBtnRStick: UInt16 = UInt16(NS_BTN_RSTICK)
+private let kBtnHome: UInt16   = UInt16(NS_BTN_HOME);   let kBtnCapture: UInt16 = UInt16(NS_BTN_CAPTURE)
 
-private let kHatN: UInt8 = 0; let kHatNE: UInt8 = 1; let kHatE: UInt8 = 2; let kHatSE: UInt8 = 3
-private let kHatS: UInt8 = 4; let kHatSW: UInt8 = 5; let kHatW: UInt8 = 6; let kHatNW: UInt8 = 7
-private let kHatNeutral: UInt8 = 8
-
-private let kAccelScale: Float = 4096.0
-private let kGyroScale: Float = 938.732 // 57.2958 * 16.384 (rad/s → Switch IMU)
+private let kHatN: UInt8 = UInt8(NS_HAT_N);   let kHatNE: UInt8 = UInt8(NS_HAT_NE)
+private let kHatE: UInt8 = UInt8(NS_HAT_E);   let kHatSE: UInt8 = UInt8(NS_HAT_SE)
+private let kHatS: UInt8 = UInt8(NS_HAT_S);   let kHatSW: UInt8 = UInt8(NS_HAT_SW)
+private let kHatW: UInt8 = UInt8(NS_HAT_W);   let kHatNW: UInt8 = UInt8(NS_HAT_NW)
+private let kHatNeutral: UInt8 = UInt8(NS_HAT_NEUTRAL)
 
 final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     static let shared = BridgeManager()
@@ -131,31 +130,27 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func sendResetFrame() {
-        var frame = Data(capacity: 116)
-        withUnsafeBytes(of: kProtoMagic.littleEndian) { frame.append(contentsOf: $0) }
-        frame.append(kWebProtoVer)
-        frame.append(0x01) // FLAG_RESET
-        frame.append(contentsOf: [0, 0])
-        withUnsafeBytes(of: seq.littleEndian) { frame.append(contentsOf: $0) }
+        var frame = Data(count: kFrameSize)
+        let timestampUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
+        frame.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            ns_web_frame_init(base, UInt8(NS_FLAG_RESET), seq, timestampUs)
+        }
         seq &+= 1
-        let ts = UInt64(Date().timeIntervalSince1970 * 1_000_000).littleEndian
-        withUnsafeBytes(of: ts) { frame.append(contentsOf: $0) }
-        frame.append(Data(count: 96))
         ws?.send(.data(frame)) { _ in }
     }
 
     private func sendFrame() {
-        var frame = Data(capacity: 116)
-        // Header (all little-endian)
-        withUnsafeBytes(of: kProtoMagic.littleEndian) { frame.append(contentsOf: $0) }
-        frame.append(kWebProtoVer)
+        var frame = Data(count: kFrameSize)
         let hasController = controllers.contains { $0 != nil }
         let touchActive = touchModeActive()
-        frame.append((!hasController && touchActive) ? kSinglePad : UInt8(0)) // touch mode is single-pad only while the touch page is active
-        frame.append(contentsOf: [0, 0]) // reserved
-        withUnsafeBytes(of: seq.littleEndian) { frame.append(contentsOf: $0) }
-        let ts = UInt64(Date().timeIntervalSince1970 * 1_000_000).littleEndian
-        withUnsafeBytes(of: ts) { frame.append(contentsOf: $0) }
+        let flags: UInt8 = (!hasController && touchActive) ? kSinglePad : UInt8(0)
+        let timestampUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
+
+        frame.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            ns_web_frame_init(base, flags, seq, timestampUs)
+        }
 
         for p in 0..<4 {
             var pad = self.neutralPad()
@@ -168,7 +163,13 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
                 objc_sync_exit(self)
                 self.mergePhoneMotion(into: &pad)
             }
-            frame.append(pad)
+            frame.withUnsafeMutableBytes { frameRaw in
+                pad.withUnsafeBytes { padRaw in
+                    guard let frameBase = frameRaw.bindMemory(to: UInt8.self).baseAddress,
+                          let padBase = padRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                    ns_web_frame_set_pad(frameBase, Int32(p), padBase)
+                }
+            }
         }
         seq &+= 1
         ws?.send(.data(frame)) { _ in }
@@ -197,44 +198,46 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
     private func neutralPad() -> Data {
         var pad = Data(count: kPadSize)
-        pad[2] = kHatNeutral
-        pad[3] = 128; pad[4] = 128
-        pad[5] = 128; pad[6] = 128
+        pad.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            ns_pad_write_neutral(base)
+        }
         return pad
     }
 
-    private func writeMotion(into pad: inout Data, ax: Int16, ay: Int16, az: Int16,
-                             gx: Int16, gy: Int16, gz: Int16) {
-        pad[8..<10] = withUnsafeBytes(of: ax.littleEndian) { Data($0) }
-        pad[10..<12] = withUnsafeBytes(of: ay.littleEndian) { Data($0) }
-        pad[12..<14] = withUnsafeBytes(of: az.littleEndian) { Data($0) }
-        pad[14..<16] = withUnsafeBytes(of: gx.littleEndian) { Data($0) }
-        pad[16..<18] = withUnsafeBytes(of: gy.littleEndian) { Data($0) }
-        pad[18..<20] = withUnsafeBytes(of: gz.littleEndian) { Data($0) }
-        pad[20] = 1
+    private func mergeMotionBytes(_ motion: Data, into pad: inout Data) {
+        pad.withUnsafeMutableBytes { padRaw in
+            motion.withUnsafeBytes { motionRaw in
+                guard let padBase = padRaw.bindMemory(to: UInt8.self).baseAddress,
+                      let motionBase = motionRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                ns_pad_set_motion(padBase, motionBase)
+            }
+        }
     }
 
     private func mergePhoneMotion(into pad: inout Data) {
         guard let g = currentGyro else { return }
-        let ax = clampMotion(Float(-g.gravity.x) * kAccelScale)
-        let ay = clampMotion(Float(-g.gravity.z) * kAccelScale)
-        let az = clampMotion(Float( g.gravity.y) * kAccelScale)
-        let gx = clampMotion(Float(-g.rotationRate.x) * kGyroScale)
-        let gy = clampMotion(Float(-g.rotationRate.z) * kGyroScale)
-        let gz = clampMotion(Float( g.rotationRate.y) * kGyroScale)
-        writeMotion(into: &pad, ax: ax, ay: ay, az: az, gx: gx, gy: gy, gz: gz)
+        var motionBytes = Data(count: kMotionSize)
+        motionBytes.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            ns_motion_from_apple(base,
+                                 Float(g.gravity.x), Float(g.gravity.y), Float(g.gravity.z),
+                                 Float(g.rotationRate.x), Float(g.rotationRate.y), Float(g.rotationRate.z))
+        }
+        mergeMotionBytes(motionBytes, into: &pad)
     }
 
     private func mergeGCControllerMotion(_ gc: GCController, into pad: inout Data) -> Bool {
         guard let m = gc.motion else { return false }
         if m.sensorsRequireManualActivation && !m.sensorsActive { m.sensorsActive = true }
-        let ax = clampMotion(Float(-m.gravity.x) * kAccelScale)
-        let ay = clampMotion(Float(-m.gravity.z) * kAccelScale)
-        let az = clampMotion(Float( m.gravity.y) * kAccelScale)
-        let gx = clampMotion(Float(-m.rotationRate.x) * kGyroScale)
-        let gy = clampMotion(Float(-m.rotationRate.z) * kGyroScale)
-        let gz = clampMotion(Float( m.rotationRate.y) * kGyroScale)
-        writeMotion(into: &pad, ax: ax, ay: ay, az: az, gx: gx, gy: gy, gz: gz)
+        var motionBytes = Data(count: kMotionSize)
+        motionBytes.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            ns_motion_from_apple(base,
+                                 Float(m.gravity.x), Float(m.gravity.y), Float(m.gravity.z),
+                                 Float(m.rotationRate.x), Float(m.rotationRate.y), Float(m.rotationRate.z))
+        }
+        mergeMotionBytes(motionBytes, into: &pad)
         return true
     }
 
@@ -381,12 +384,6 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         if let m = gc.motion {
             m.sensorsActive = true
         }
-    }
-
-    private func clampMotion(_ v: Float) -> Int16 {
-        if v > 32767 { return 32767 }
-        if v < -32768 { return -32768 }
-        return Int16(v.rounded())
     }
 
     /// Merges GCController state into the 24-byte pad buffer (little-endian)

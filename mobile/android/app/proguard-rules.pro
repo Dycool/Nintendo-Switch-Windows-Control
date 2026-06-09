@@ -1,2 +1,2 @@
--keep class com.nscontrol.MainActivity$JSBridge { *; }
--keepattributes JavascriptInterface
+# Keep JNI protocol bridge stable for release/minified builds.
+-keep class com.nscontrol.Protocol { *; }
