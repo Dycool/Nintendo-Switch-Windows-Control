@@ -33,6 +33,14 @@ if(WIN32)
         _UNICODE
     )
     target_link_libraries(ns-client PRIVATE ws2_32 winmm)
+    add_custom_command(TARGET ns-client POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/icon.png"
+            "$<TARGET_FILE_DIR:ns-client>/icon.png"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/icon.ico"
+            "$<TARGET_FILE_DIR:ns-client>/icon.ico"
+    )
 endif()
 
 if(APPLE)
