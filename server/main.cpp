@@ -3920,8 +3920,13 @@ static bool req_match(const char *buf, const char *path) {
 }
 
 
-// ── Web Server Thread (single-threaded poll reactor, fully non-blocking) ─────
-static void web_server_thread(int web_port, uint16_t udp_port) {
+enum class WebServerMode : uint8_t {
+    WebSocketOnly,
+    WebApp
+};
+
+// ── WebSocket/Web Server Thread (single-threaded poll reactor, fully non-blocking) ─────
+static void web_server_thread(int web_port, uint16_t udp_port, WebServerMode mode) {
     (void)udp_port;
     int srv = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (srv < 0) { perror("web socket"); return; }
@@ -3937,7 +3942,10 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("web bind"); close(srv); return; }
     if (listen(srv, 8) < 0) { perror("web listen"); close(srv); return; }
 
-    std::printf("[web] HTTP + WebSocket server listening on port %d\n", web_port);
+    if (mode == WebServerMode::WebApp)
+        std::printf("[web] HTTP + WebSocket server listening on port %d\n", web_port);
+    else
+        std::printf("[ws] WebSocket server listening on port %d\n", web_port);
 
     struct pollfd pfds[1 + MAX_WS_CLIENTS];
     static WebClient clients[MAX_WS_CLIENTS];
@@ -4123,8 +4131,13 @@ static void web_server_thread(int web_port, uint16_t udp_port) {
                         int status = 200;
                         const char *status_str = "OK";
 
-                        if (req_match(c->http_buf, "GET / ") ||
-                            req_match(c->http_buf, "GET /index.html ")) {
+                        if (mode == WebServerMode::WebSocketOnly) {
+                            body = "WebSocket only\n";
+                            body_len = strlen(body);
+                            status = 404;
+                            status_str = "Not Found";
+                        } else if (req_match(c->http_buf, "GET / ") ||
+                                   req_match(c->http_buf, "GET /index.html ")) {
                             body = INDEX_HTML;
                             body_len = strlen(INDEX_HTML);
                         } else if (req_match(c->http_buf, "GET /mobile ")) {
@@ -4269,7 +4282,8 @@ int main(int argc, char** argv) {
     uint16_t    port      = DEFAULT_PORT;
     std::string bind_addr = "0.0.0.0";
     bool        do_upnp   = false;
-    int         web_port  = 0; // 0 = disabled
+    int         web_port  = 8080; // WebSocket server is enabled by default
+    WebServerMode web_mode = WebServerMode::WebSocketOnly;
 
     for (int i = 1; i < argc; ++i) {
         std::string a(argv[i]);
@@ -4291,6 +4305,7 @@ int main(int argc, char** argv) {
         else if (a == "-hori")          g_legacy_mode = true;
         else if (a == "--upnp")           do_upnp    = true;
         else if (a == "-w") {
+            web_mode = WebServerMode::WebApp;
             if (i+1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9')
                 web_port = std::atoi(argv[++i]);
             else
@@ -4299,8 +4314,12 @@ int main(int argc, char** argv) {
         else if (a == "-h") {
             puts("ns-backend  [-b ADDR[:PORT]|PORT] [--upnp] [-w [WEB_PORT]] [-v] [-hori]");
             puts("");
+            puts("  By default, UDP and WebSocket input are both enabled.");
+            puts("  WebSocket listens on port 8080 and does not serve the browser webapp.");
+            puts("");
             puts("  -b ADDR[:PORT]  Bind UDP to an address and optional port.");
             puts("  -b PORT         Keep 0.0.0.0 with a custom UDP port.");
+            puts("  -w [PORT]       Serve the browser webapp too, using this port or 8080.");
             puts("  -hori           Expose the legacy 8-byte HORI controller gadget.");
             puts("                  Default mode exposes the 64-byte motion/rumble gadget.");
             puts("");
@@ -4325,10 +4344,10 @@ int main(int argc, char** argv) {
 
     if (do_upnp) upnp_add_mapping(port);
 
-    // Start web server if requested
+    // Start WebSocket server by default. -w keeps WebSocket enabled and also serves the browser webapp.
     std::thread web_thread;
     if (web_port > 0)
-        web_thread = std::thread(web_server_thread, web_port, port);
+        web_thread = std::thread(web_server_thread, web_port, port, web_mode);
 
     int sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (sock < 0) { perror("socket"); return 1; }
