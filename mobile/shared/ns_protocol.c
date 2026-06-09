@@ -165,30 +165,6 @@ void ns_motion_from_apple(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
                            1);
 }
 
-void ns_motion_from_apple_phone_touch(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
-                                      float gravity_x,
-                                      float gravity_y,
-                                      float gravity_z,
-                                      float rotation_x,
-                                      float rotation_y,
-                                      float rotation_z) {
-    const float accel_scale = ns_accel_scale_apple();
-    const float gyro_scale = ns_gyro_scale();
-
-    // Direct iPhone/iPad touch controls are held like a flat controller:
-    // landscape, screen facing up. Do not reuse the controller-mounted
-    // GameController mapping, because that makes the neutral pose feel
-    // like the phone must be upright with the screen facing the player.
-    ns_motion_write_values(out_motion,
-                           ns_clamp_motion(-gravity_x * accel_scale),
-                           ns_clamp_motion(-gravity_y * accel_scale),
-                           ns_clamp_motion( gravity_z * accel_scale),
-                           ns_gyro_deadzone_i16(ns_clamp_motion(-rotation_x * gyro_scale)),
-                           ns_gyro_deadzone_i16(ns_clamp_motion(-rotation_y * gyro_scale)),
-                           ns_gyro_deadzone_i16(ns_clamp_motion( rotation_z * gyro_scale)),
-                           1);
-}
-
 void ns_pad_write_neutral(uint8_t out_pad[NS_PROTOCOL_EXT_PAD_SIZE]) {
     if (!out_pad) return;
     memset(out_pad, 0, NS_PROTOCOL_EXT_PAD_SIZE);

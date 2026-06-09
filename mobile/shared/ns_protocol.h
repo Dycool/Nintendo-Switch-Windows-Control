@@ -112,16 +112,6 @@ void ns_motion_from_apple(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
                           float rotation_y,
                           float rotation_z);
 
-// Apple CoreMotion phone touch controls use a different neutral pose from
-// controller-mounted GameController motion: landscape, screen facing up.
-void ns_motion_from_apple_phone_touch(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
-                                      float gravity_x,
-                                      float gravity_y,
-                                      float gravity_z,
-                                      float rotation_x,
-                                      float rotation_y,
-                                      float rotation_z);
-
 void ns_pad_write_neutral(uint8_t out_pad[NS_PROTOCOL_EXT_PAD_SIZE]);
 void ns_pad_set_hid(uint8_t out_pad[NS_PROTOCOL_EXT_PAD_SIZE],
                     const uint8_t hid[NS_PROTOCOL_HID_SIZE]);

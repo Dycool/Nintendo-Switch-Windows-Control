@@ -203,7 +203,7 @@ object Protocol {
     private fun clampMotionShort(v: Float): Short =
         v.roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
 
-    private fun gyroDeadzoneShort(v: Short): Short = if (kotlin.math.abs(v.toInt()) <= 32) 0 else v
+    private fun gyroDeadzoneShort(v: Short): Short = if (kotlin.math.abs(v.toInt()) <= 8) 0 else v
 
     private fun writeU16LE(out: ByteArray, off: Int, value: Int) {
         out[off] = (value and 0xFF).toByte()

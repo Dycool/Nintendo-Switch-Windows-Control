@@ -1,35 +1,8 @@
 import SwiftUI
 import WebKit
-import UIKit
-
-
-final class AppDelegate: NSObject, UIApplicationDelegate {
-    func application(_ application: UIApplication,
-                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
-        OrientationLock.mask
-    }
-}
-
-final class OrientationLock {
-    static var mask: UIInterfaceOrientationMask = [.portrait, .landscapeLeft, .landscapeRight]
-
-    static func set(_ newMask: UIInterfaceOrientationMask) {
-        mask = newMask
-        DispatchQueue.main.async {
-            if #available(iOS 16.0, *) {
-                for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
-                    scene.requestGeometryUpdate(.iOS(interfaceOrientations: newMask), errorHandler: { _ in })
-                }
-            }
-            UIViewController.attemptRotationToDeviceOrientation()
-        }
-    }
-}
 
 @main
 struct NSControlApp: App {
-    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-
     var body: some Scene {
         WindowGroup { ContentView() }
     }
@@ -42,14 +15,6 @@ struct ContentView: View {
     @State private var connected = false
 
     enum Page: String { case mainMenu, touchControls, editor }
-
-    private func applyOrientationLock(for page: Page) {
-        if page == .touchControls {
-            OrientationLock.set(.landscape)
-        } else {
-            OrientationLock.set([.portrait, .landscapeLeft, .landscapeRight])
-        }
-    }
 
     var body: some View {
         NavigationStack {
@@ -83,11 +48,6 @@ struct ContentView: View {
         }
         .animation(.easeInOut, value: connected)
         .animation(.easeInOut, value: page)
-        .onAppear { applyOrientationLock(for: page) }
-        .onChange(of: page) { newPage in applyOrientationLock(for: newPage) }
-        .onChange(of: connected) { isConnected in
-            if !isConnected { applyOrientationLock(for: .mainMenu) }
-        }
     }
 
     var connectionView: some View {
