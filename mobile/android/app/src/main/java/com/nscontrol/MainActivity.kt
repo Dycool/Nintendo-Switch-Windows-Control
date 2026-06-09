@@ -5,6 +5,9 @@ import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Bundle
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -12,6 +15,7 @@ import android.view.*
 import android.webkit.*
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.OnBackPressedCallback
 import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
@@ -19,6 +23,7 @@ import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.math.abs
+import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : AppCompatActivity() {
     private lateinit var connectView: View
@@ -30,13 +35,15 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var controlClientActive = false // actual input/rumble WebSocket client
     private var ws: WebSocket? = null
     private val client = OkHttpClient.Builder().build()
-    private var seq = 0
-    private var sending = false
+    private val seq = AtomicInteger(0)
+    @Volatile private var sending = false
+    private val sendLock = Any()
 
     // Gyro (rad/s)
     private val sensorManager by lazy { getSystemService(SENSOR_SERVICE) as SensorManager }
     private var gyroListener: SensorEventListener? = null
     private var accelListener: SensorEventListener? = null
+    private var sensorThread: HandlerThread? = null
     private val sensorLock = Any()
     private var gyroValues = FloatArray(3) // x, y, z angular velocity, rad/s
     private var accelValues = floatArrayOf(0f, Protocol.STANDARD_GRAVITY, 0f) // x, y, z gravity/acceleration, m/s^2
@@ -82,6 +89,18 @@ class MainActivity : AppCompatActivity() {
         hostInput = connectView.findViewById(R.id.hostInput)
         statusText = connectView.findViewById(R.id.statusText)
         connectView.findViewById<Button>(R.id.connectBtn).setOnClickListener { onConnect() }
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                when {
+                    connected && currentPage != Page.MAIN_MENU -> goBack()
+                    connected -> disconnect()
+                    else -> {
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                    }
+                }
+            }
+        })
         setContentView(connectView)
         getPreferences(MODE_PRIVATE).getString("host", "")?.let {
             hostInput.setText(it); hostInput.setSelection(it.length)
@@ -149,10 +168,11 @@ class MainActivity : AppCompatActivity() {
                 override fun onMessage(w: WebSocket, bytes: ByteString) {
                     try {
                         if (bytes.size >= 8) {
+                            val subpad = bytes[4].toInt() and 0xFF
                             val low = bytes[5].toInt() and 0xFF
                             val high = bytes[6].toInt() and 0xFF
                             runOnUiThread {
-                                try { routeRumble(low, high) } catch (_: Throwable) {}
+                                try { routeRumble(subpad, low, high) } catch (_: Throwable) {}
                             }
                         }
                     } catch (_: Throwable) {
@@ -211,51 +231,57 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendResetFrame() {
-        // FLAG_RESET = 0x01. This releases all pads immediately before the WS closes.
+        ws?.let { sendResetFrameTo(it) }
+    }
+
+    private fun sendResetFrameTo(socket: WebSocket) {
         try {
-            sendFrameInternal(flagsOverride = Protocol.FLAG_RESET, forceNeutral = true)
+            sendFrameInternal(socketOverride = socket, flagsOverride = Protocol.FLAG_RESET, forceNeutral = true)
         } catch (_: Throwable) {
             // Never let cleanup/reset crash the app while leaving the touch page.
         }
     }
 
-    private fun sendFrameInternal(flagsOverride: Int? = null, forceNeutral: Boolean = false) {
-        val controller = if (forceNeutral) null else snapshotController()
-        val touchActive = !forceNeutral && touchClientActive()
-        val flags = flagsOverride ?: if (controller == null && touchActive) Protocol.FLAG_SINGLE_PAD else 0
+    private fun sendFrameInternal(socketOverride: WebSocket? = null, flagsOverride: Int? = null, forceNeutral: Boolean = false) {
+        synchronized(sendLock) {
+            val socket = socketOverride ?: ws ?: return
+            val controller = if (forceNeutral || !controllerClientActive()) null else snapshotController()
+            val touchActive = !forceNeutral && touchClientActive()
+            val flags = flagsOverride ?: if (controller == null && touchActive) Protocol.FLAG_SINGLE_PAD else 0
 
-        val pad0Hid: ByteArray? = when {
-            forceNeutral -> null
-            controller != null -> Protocol.controllerHid(
-                controller.buttons,
-                controller.dpadUp,
-                controller.dpadDown,
-                controller.dpadLeft,
-                controller.dpadRight,
-                controller.lx,
-                controller.ly,
-                controller.rx,
-                controller.ry,
-                true
+            val pad0Hid: ByteArray? = when {
+                forceNeutral -> null
+                controller != null -> Protocol.controllerHid(
+                    normalizeSystemShortcuts(controller.buttons),
+                    controller.dpadUp,
+                    controller.dpadDown,
+                    controller.dpadLeft,
+                    controller.dpadRight,
+                    controller.lx,
+                    controller.ly,
+                    controller.rx,
+                    controller.ry,
+                    true
+                )
+                touchActive -> touchHid ?: touchFrame?.let { Protocol.extractPad0HidFromWebFrame(it) } ?: Protocol.neutralHid()
+                else -> null
+            }
+
+            val pad0Motion: ByteArray? = if (!forceNeutral && (controller != null || touchActive)) {
+                currentMotionBytes()
+            } else {
+                null
+            }
+
+            val frame = Protocol.buildFrame(
+                seq.getAndIncrement(),
+                flags,
+                System.nanoTime() / 1000L,
+                pad0Hid,
+                pad0Motion
             )
-            touchActive -> touchHid ?: touchFrame?.let { Protocol.extractPad0HidFromWebFrame(it) } ?: Protocol.neutralHid()
-            else -> null
+            socket.send(frame.toByteString())
         }
-
-        val pad0Motion: ByteArray? = if (!forceNeutral && (controller != null || touchActive)) {
-            currentMotionBytes()
-        } else {
-            null
-        }
-
-        val frame = Protocol.buildFrame(
-            seq++,
-            flags,
-            System.nanoTime() / 1000L,
-            pad0Hid,
-            pad0Motion
-        )
-        ws?.send(frame.toByteString())
     }
 
     private fun currentMotionBytes(): ByteArray {
@@ -265,7 +291,25 @@ class MainActivity : AppCompatActivity() {
             System.arraycopy(accelValues, 0, a, 0, 3)
             System.arraycopy(gyroValues, 0, g, 0, 3)
         }
-        return Protocol.motionFromAndroid(a[0], a[1], a[2], g[0], g[1], g[2])
+        val ar = remapSensorForDisplay(a)
+        val gr = remapSensorForDisplay(g)
+        return Protocol.motionFromAndroid(ar[0], ar[1], ar[2], gr[0], gr[1], gr[2])
+    }
+
+    private fun remapSensorForDisplay(v: FloatArray): FloatArray {
+        // Android sensors are fixed to the physical device axes.  The app is used
+        // mostly in landscape, so rotate X/Y into the current screen orientation
+        // before converting to Switch-style motion.  Z is unchanged.
+        val rotation = try {
+            if (Build.VERSION.SDK_INT >= 30) display?.rotation ?: Surface.ROTATION_0
+            else legacyDisplayRotation()
+        } catch (_: Throwable) { Surface.ROTATION_0 }
+        return when (rotation) {
+            Surface.ROTATION_90  -> floatArrayOf(-v[1],  v[0], v[2])
+            Surface.ROTATION_180 -> floatArrayOf(-v[0], -v[1], v[2])
+            Surface.ROTATION_270 -> floatArrayOf( v[1], -v[0], v[2])
+            else -> floatArrayOf(v[0], v[1], v[2])
+        }
     }
 
     private fun makeHid(buttons: Int, hat: Int, lx: Int, ly: Int, rx: Int, ry: Int, present: Boolean = true): ByteArray {
@@ -289,37 +333,55 @@ class MainActivity : AppCompatActivity() {
         // Avoid duplicate listeners if the page reconnects quickly.
         stopGyro()
         try {
+            sensorThread = HandlerThread("NSMobileSensors").also { it.start() }
+            val handler = Handler(sensorThread!!.looper)
+
             val gyro = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
             if (gyro != null) {
                 gyroListener = object : SensorEventListener {
                     override fun onSensorChanged(e: SensorEvent) {
                         if (e.values.size >= 3) synchronized(sensorLock) {
-                            System.arraycopy(e.values, 0, gyroValues, 0, 3)
+                            gyroValues[0] = e.values[0]
+                            gyroValues[1] = e.values[1]
+                            gyroValues[2] = e.values[2]
                         }
                     }
                     override fun onAccuracyChanged(s: Sensor, a: Int) {}
                 }
-                sensorManager.registerListener(gyroListener, gyro, SensorManager.SENSOR_DELAY_FASTEST)
+                sensorManager.registerListener(gyroListener, gyro, SensorManager.SENSOR_DELAY_FASTEST, handler)
             }
 
-            // Prefer the gravity sensor for a stable tilt vector; fall back to the
-            // normal accelerometer on devices that do not expose TYPE_GRAVITY.
-            val accel = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
-                ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+            // Prefer TYPE_GRAVITY: it is already a stable gravity vector and does
+            // not jump when the phone is moved.  Fall back to accelerometer with a
+            // small low-pass filter so gyro aiming does not wobble from taps.
+            val gravity = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
+            val accel = gravity ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
             if (accel != null) {
+                val usingGravity = gravity != null
                 accelListener = object : SensorEventListener {
                     override fun onSensorChanged(e: SensorEvent) {
                         if (e.values.size >= 3) synchronized(sensorLock) {
-                            System.arraycopy(e.values, 0, accelValues, 0, 3)
+                            if (usingGravity) {
+                                accelValues[0] = e.values[0]
+                                accelValues[1] = e.values[1]
+                                accelValues[2] = e.values[2]
+                            } else {
+                                val alpha = 0.12f
+                                accelValues[0] = accelValues[0] + alpha * (e.values[0] - accelValues[0])
+                                accelValues[1] = accelValues[1] + alpha * (e.values[1] - accelValues[1])
+                                accelValues[2] = accelValues[2] + alpha * (e.values[2] - accelValues[2])
+                            }
                         }
                     }
                     override fun onAccuracyChanged(s: Sensor, a: Int) {}
                 }
-                sensorManager.registerListener(accelListener, accel, SensorManager.SENSOR_DELAY_FASTEST)
+                sensorManager.registerListener(accelListener, accel, SensorManager.SENSOR_DELAY_FASTEST, handler)
             }
         } catch (_: Throwable) {
             gyroListener = null
             accelListener = null
+            try { sensorThread?.quitSafely() } catch (_: Throwable) {}
+            sensorThread = null
         }
     }
 
@@ -327,29 +389,29 @@ class MainActivity : AppCompatActivity() {
     //  Haptics
     // ═══════════════════════════════
 
-    private fun routeRumble(low: Int, high: Int) {
+    private fun routeRumble(subpad: Int, low: Int, high: Int) {
         val controller = snapshotController()
         if (low == 0 && high == 0) {
-            try {
-                if (controller != null) {
-                    InputDevice.getDevice(controller.deviceId)?.vibrator?.cancel()
-                } else {
-                    vibrator.cancel()
-                }
-            } catch (_: Throwable) {}
+            // Stop only the requested subpad. With the current Android input model
+            // there is one native controller slot, so non-zero subpads must not
+            // accidentally stop/rumble pad 0.
+            if (subpad == 0) {
+                try { controller?.let { stopControllerRumble(it.deviceId) } } catch (_: Throwable) {}
+                try { vibrator.cancel() } catch (_: Throwable) {}
+            }
             return
         }
 
-        // If a Bluetooth/USB controller is the active input source, never rumble
-        // the phone as a fake fallback. Either rumble the controller, or stay silent.
-        if (controller != null) {
-            playControllerRumble(controller.deviceId, low, high)
-            return
-        }
+        if (subpad != 0) return
 
-        // Do not rumble the phone from the main menu / editor. Phone haptics are
-        // only for the actual touch-controls page while it is actively sending input.
-        if (touchClientActive()) playPhoneHaptic(low, high)
+        // Prefer the physical controller motor when Android exposes one.  Some
+        // controllers do not expose haptics through Android even though input works;
+        // in that case fall back to phone haptics so rumble is not silently lost.
+        if (controller != null && playControllerRumble(controller.deviceId, low, high)) return
+
+        // Phone haptics are valid for touch controls and as a fallback for Android
+        // controllers whose vibrator API is missing/broken.
+        if (touchClientActive() || controller != null) playPhoneHaptic(low, high)
     }
 
     private fun touchClientActive(): Boolean {
@@ -360,12 +422,31 @@ class MainActivity : AppCompatActivity() {
         return controlClientActive && currentPage == Page.MAIN_MENU
     }
 
+    @Suppress("DEPRECATION")
+    private fun legacyDisplayRotation(): Int = windowManager.defaultDisplay.rotation
+
+    @Suppress("DEPRECATION")
+    private fun legacyDeviceVibrator(dev: InputDevice): Vibrator = dev.vibrator
+
+    private fun controllerVibrator(deviceId: Int): Vibrator? {
+        val dev = InputDevice.getDevice(deviceId) ?: return null
+        return try {
+            if (Build.VERSION.SDK_INT >= 31) dev.vibratorManager.defaultVibrator else legacyDeviceVibrator(dev)
+        } catch (_: Throwable) {
+            try { legacyDeviceVibrator(dev) } catch (_: Throwable) { null }
+        }
+    }
+
+    private fun stopControllerRumble(deviceId: Int) {
+        try { controllerVibrator(deviceId)?.cancel() } catch (_: Throwable) {}
+    }
+
     private fun playControllerRumble(deviceId: Int, low: Int, high: Int): Boolean {
         return try {
-            val v = InputDevice.getDevice(deviceId)?.vibrator ?: return false
+            val v = controllerVibrator(deviceId) ?: return false
             if (!v.hasVibrator()) return false
             val amp = ((low + high) / 2).coerceIn(1, 255)
-            v.vibrate(VibrationEffect.createOneShot(70, amp))
+            v.vibrate(VibrationEffect.createOneShot(90, amp))
             true
         } catch (_: Throwable) {
             false
@@ -488,7 +569,7 @@ class MainActivity : AppCompatActivity() {
         fun onTouchState(buttons: Int, hat: Int, lx: Int, ly: Int, rx: Int, ry: Int) {
             if (currentPage != Page.TOUCH_CONTROLS || !controlClientActive) return
             try {
-                touchHid = makeHid(buttons, hat, lx, ly, rx, ry, true)
+                touchHid = makeHid(normalizeSystemShortcuts(buttons), hat, lx, ly, rx, ry, true)
                 lastTouchFrameMs = SystemClock.uptimeMillis()
             } catch (_: Throwable) {}
         }
@@ -514,23 +595,24 @@ class MainActivity : AppCompatActivity() {
         val device = event.device ?: return super.onGenericMotionEvent(event)
         synchronized(controllerLock) {
             controllerState.deviceId = event.deviceId
-            controllerState.lx = centeredAxis(event, device, MotionEvent.AXIS_X)
-            controllerState.ly = centeredAxis(event, device, MotionEvent.AXIS_Y)
-            val rz = centeredAxis(event, device, MotionEvent.AXIS_RZ)
-            val z = centeredAxis(event, device, MotionEvent.AXIS_Z)
-            val rx = centeredAxis(event, device, MotionEvent.AXIS_RX)
-            val ry = centeredAxis(event, device, MotionEvent.AXIS_RY)
-            controllerState.rx = if (abs(z) >= abs(rx)) z else rx
-            controllerState.ry = if (abs(rz) >= abs(ry)) rz else ry
-            val hatX = centeredAxis(event, device, MotionEvent.AXIS_HAT_X)
-            val hatY = centeredAxis(event, device, MotionEvent.AXIS_HAT_Y)
+            controllerState.lx = axis(event, device, MotionEvent.AXIS_X)
+            controllerState.ly = axis(event, device, MotionEvent.AXIS_Y)
+
+            // Android is messy here: some pads use RX/RY for the right stick,
+            // others use Z/RZ. Prefer RX/RY when the device actually exposes
+            // them, otherwise use Z/RZ. Do not treat trigger axes as right stick.
+            val hasRxRy = hasAxis(device, event.source, MotionEvent.AXIS_RX) || hasAxis(device, event.source, MotionEvent.AXIS_RY)
+            controllerState.rx = if (hasRxRy) axis(event, device, MotionEvent.AXIS_RX) else axis(event, device, MotionEvent.AXIS_Z)
+            controllerState.ry = if (hasRxRy) axis(event, device, MotionEvent.AXIS_RY) else axis(event, device, MotionEvent.AXIS_RZ)
+            val hatX = axis(event, device, MotionEvent.AXIS_HAT_X)
+            val hatY = axis(event, device, MotionEvent.AXIS_HAT_Y)
             controllerState.dpadLeft = hatX < -0.5f
             controllerState.dpadRight = hatX > 0.5f
             controllerState.dpadUp = hatY < -0.5f
             controllerState.dpadDown = hatY > 0.5f
 
-            val lt = event.getAxisValue(MotionEvent.AXIS_LTRIGGER).coerceIn(0f, 1f)
-            val rt = event.getAxisValue(MotionEvent.AXIS_RTRIGGER).coerceIn(0f, 1f)
+            val lt = triggerAxis(event, device, MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_BRAKE)
+            val rt = triggerAxis(event, device, MotionEvent.AXIS_RTRIGGER, MotionEvent.AXIS_GAS)
             if (lt > 0.5f) controllerState.buttons = controllerState.buttons or BTN_ZL
             else controllerState.buttons = controllerState.buttons and BTN_ZL.inv()
             if (rt > 0.5f) controllerState.buttons = controllerState.buttons or BTN_ZR
@@ -554,8 +636,8 @@ class MainActivity : AppCompatActivity() {
                 KeyEvent.KEYCODE_BUTTON_Y -> setControllerButton(BTN_X, down)      // physical NORTH -> Switch X
                 KeyEvent.KEYCODE_BUTTON_L1 -> setControllerButton(BTN_L, down)
                 KeyEvent.KEYCODE_BUTTON_R1 -> setControllerButton(BTN_R, down)
-                KeyEvent.KEYCODE_BUTTON_L2 -> setControllerButton(BTN_ZL, down)
-                KeyEvent.KEYCODE_BUTTON_R2 -> setControllerButton(BTN_ZR, down)
+                KeyEvent.KEYCODE_BUTTON_L2, KeyEvent.KEYCODE_BUTTON_C -> setControllerButton(BTN_ZL, down)
+                KeyEvent.KEYCODE_BUTTON_R2, KeyEvent.KEYCODE_BUTTON_Z -> setControllerButton(BTN_ZR, down)
                 KeyEvent.KEYCODE_BUTTON_SELECT -> setControllerButton(BTN_MINUS, down)
                 KeyEvent.KEYCODE_BUTTON_START -> setControllerButton(BTN_PLUS, down)
                 KeyEvent.KEYCODE_BUTTON_THUMBL -> setControllerButton(BTN_LSTICK, down)
@@ -589,24 +671,41 @@ class MainActivity : AppCompatActivity() {
                (source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
     }
 
-    private fun centeredAxis(event: MotionEvent, device: InputDevice, axis: Int): Float {
-        val range = device.getMotionRange(axis, event.source)
+    private fun normalizeSystemShortcuts(buttonsIn: Int): Int {
+        var buttons = buttonsIn
+        val captureCombo = (buttons and BTN_MINUS) != 0 && (buttons and BTN_PLUS) != 0
+        val homeCombo = (buttons and BTN_LSTICK) != 0 && (buttons and BTN_RSTICK) != 0
+        if (captureCombo) {
+            buttons = buttons or BTN_CAPTURE
+            buttons = buttons and BTN_MINUS.inv() and BTN_PLUS.inv() and BTN_HOME.inv()
+            if (homeCombo) buttons = buttons and BTN_LSTICK.inv() and BTN_RSTICK.inv()
+        } else if (homeCombo) {
+            buttons = buttons or BTN_HOME
+            buttons = buttons and BTN_LSTICK.inv() and BTN_RSTICK.inv() and BTN_CAPTURE.inv()
+        }
+        return buttons
+    }
+
+    private fun hasAxis(device: InputDevice, source: Int, axis: Int): Boolean {
+        return device.getMotionRange(axis, source) != null
+    }
+
+    private fun axis(event: MotionEvent, device: InputDevice, axis: Int): Float {
+        val range = device.getMotionRange(axis, event.source) ?: return 0f
         val value = event.getAxisValue(axis)
-        val flat = range?.flat ?: 0.05f
+        val flat = range.flat.coerceAtLeast(0.05f)
         return if (abs(value) > flat) value.coerceIn(-1f, 1f) else 0f
+    }
+
+    private fun triggerAxis(event: MotionEvent, device: InputDevice, primary: Int, fallback: Int): Float {
+        val p = if (hasAxis(device, event.source, primary)) event.getAxisValue(primary).coerceIn(0f, 1f) else 0f
+        if (p > 0.05f) return p
+        return if (hasAxis(device, event.source, fallback)) event.getAxisValue(fallback).coerceIn(0f, 1f) else 0f
     }
 
     // ═══════════════════════════════
     //  Android back button
     // ═══════════════════════════════
-
-    override fun onBackPressed() {
-        when {
-            connected && currentPage != Page.MAIN_MENU -> goBack()
-            connected -> disconnect()
-            else -> super.onBackPressed()
-        }
-    }
 
     override fun onDestroy() {
         disconnect(); super.onDestroy()
@@ -630,13 +729,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun deactivateControlClient() {
         if (!controlClientActive && ws == null && !sending) return
-        // Send a few reset frames before closing so the backend releases inputs immediately.
-        if (ws != null) {
-            repeat(3) {
-                sendResetFrame()
-                try { Thread.sleep(4) } catch (_: InterruptedException) {}
-            }
-        }
+        val closingWs = ws
         sending = false
         controlClientActive = false
         touchHid = null
@@ -644,9 +737,20 @@ class MainActivity : AppCompatActivity() {
         lastTouchFrameMs = 0
         lastBridgeFrameParseMs = 0
         try { vibrator.cancel() } catch (_: Throwable) {}
-        try { ws?.close(1000, "Leaving controller mode") } catch (_: Throwable) {}
-        ws = null
         stopGyro()
+        ws = null
+
+        if (closingWs != null) {
+            Thread {
+                try {
+                    repeat(3) {
+                        sendResetFrameTo(closingWs)
+                        try { Thread.sleep(4) } catch (_: InterruptedException) { return@Thread }
+                    }
+                    try { closingWs.close(1000, "Leaving controller mode") } catch (_: Throwable) {}
+                } catch (_: Throwable) {}
+            }.start()
+        }
     }
 
     private fun disconnect() {
@@ -657,10 +761,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopGyro() {
-        gyroListener?.let { sensorManager.unregisterListener(it) }
-        accelListener?.let { sensorManager.unregisterListener(it) }
+        try { gyroListener?.let { sensorManager.unregisterListener(it) } } catch (_: Throwable) {}
+        try { accelListener?.let { sensorManager.unregisterListener(it) } } catch (_: Throwable) {}
         gyroListener = null
         accelListener = null
+        try { sensorThread?.quitSafely() } catch (_: Throwable) {}
+        sensorThread = null
     }
 
     companion object {
@@ -677,6 +783,7 @@ class MainActivity : AppCompatActivity() {
         private val BTN_LSTICK: Int get() = Protocol.BTN_LSTICK
         private val BTN_RSTICK: Int get() = Protocol.BTN_RSTICK
         private val BTN_HOME: Int get() = Protocol.BTN_HOME
+        private val BTN_CAPTURE: Int get() = Protocol.BTN_CAPTURE
 
         // Injected at <head> — overrides WebSocket to bridge through native
         private val BRIDGE_SCRIPT = """

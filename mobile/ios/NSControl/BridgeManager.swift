@@ -24,6 +24,28 @@ private let kHatS: UInt8 = UInt8(NS_HAT_S);   let kHatSW: UInt8 = UInt8(NS_HAT_S
 private let kHatW: UInt8 = UInt8(NS_HAT_W);   let kHatNW: UInt8 = UInt8(NS_HAT_NW)
 private let kHatNeutral: UInt8 = UInt8(NS_HAT_NEUTRAL)
 
+private func normalizeSystemShortcuts(_ buttonsIn: UInt16) -> UInt16 {
+    var buttons = buttonsIn
+    let captureCombo = (buttons & kBtnMinus) != 0 && (buttons & kBtnPlus) != 0
+    let homeCombo = (buttons & kBtnLStick) != 0 && (buttons & kBtnRStick) != 0
+    if captureCombo {
+        buttons |= kBtnCapture
+        buttons &= ~kBtnMinus
+        buttons &= ~kBtnPlus
+        buttons &= ~kBtnHome
+        if homeCombo {
+            buttons &= ~kBtnLStick
+            buttons &= ~kBtnRStick
+        }
+    } else if homeCombo {
+        buttons |= kBtnHome
+        buttons &= ~kBtnLStick
+        buttons &= ~kBtnRStick
+        buttons &= ~kBtnCapture
+    }
+    return buttons
+}
+
 final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     static let shared = BridgeManager()
 
@@ -37,12 +59,29 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     private var engineNeedsStart = true
     private var controllerHapticEngines: [ObjectIdentifier: CHHapticEngine] = [:]
     private var seq: UInt32 = 0
+    private let seqLock = NSLock()
+    private let gyroLock = NSLock()
+    private let motionQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "NSMobileMotion"
+        q.maxConcurrentOperationCount = 1
+        q.qualityOfService = .userInitiated
+        return q
+    }()
     private var connected = false
     private var activeHost: String? = nil
     private let queue = DispatchQueue(label: "bridge", qos: .userInitiated)
     // Pad 0 touch data bridged from WebView JS (24 raw bytes)
     private var touchPad = Data(count: kPadSize)
     private var lastTouchPadAt = Date.distantPast
+
+    private func nextSeq() -> UInt32 {
+        seqLock.lock()
+        defer { seqLock.unlock() }
+        let value = seq
+        seq &+= 1
+        return value
+    }
 
     private override init() {
         super.init()
@@ -85,6 +124,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         engine?.stop(completionHandler: nil)
         engineNeedsStart = true
         for e in controllerHapticEngines.values { e.stop(completionHandler: nil) }
+        controllerHapticEngines.removeAll()
         if hadClient { DispatchQueue.main.async { self.onStatus?("Disconnected") } }
     }
 
@@ -126,7 +166,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         var hid = Data(count: Int(NS_PROTOCOL_HID_SIZE))
         hid.withUnsafeMutableBytes { raw in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-            ns_hid_write(base, buttons, hat, lx, ly, rx, ry, 1)
+            ns_hid_write(base, normalizeSystemShortcuts(buttons), hat, lx, ly, rx, ry, 1)
         }
         var pad = neutralPad()
         pad.withUnsafeMutableBytes { padRaw in
@@ -157,11 +197,11 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     private func sendResetFrame() {
         var frame = Data(count: kFrameSize)
         let timestampUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
+        let frameSeq = nextSeq()
         frame.withUnsafeMutableBytes { raw in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-            ns_web_frame_init(base, UInt8(NS_FLAG_RESET), seq, timestampUs)
+            ns_web_frame_init(base, UInt8(NS_FLAG_RESET), frameSeq, timestampUs)
         }
-        seq &+= 1
         ws?.send(.data(frame)) { _ in }
     }
 
@@ -172,16 +212,19 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         let flags: UInt8 = (!hasController && touchActive) ? kSinglePad : UInt8(0)
         let timestampUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
 
+        let frameSeq = nextSeq()
         frame.withUnsafeMutableBytes { raw in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-            ns_web_frame_init(base, flags, seq, timestampUs)
+            ns_web_frame_init(base, flags, frameSeq, timestampUs)
         }
 
         for p in 0..<4 {
             var pad = self.neutralPad()
             if p < self.controllers.count, let gc = self.controllers[p] {
                 self.mergeGCController(gc, into: &pad)
-                _ = self.mergeGCControllerMotion(gc, into: &pad)
+                if !self.mergeGCControllerMotion(gc, into: &pad) {
+                    self.mergePhoneMotion(into: &pad)
+                }
             } else if p == 0 && touchActive {
                 objc_sync_enter(self)
                 pad = self.touchPad
@@ -196,7 +239,6 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
                 }
             }
         }
-        seq &+= 1
         ws?.send(.data(frame)) { _ in }
     }
 
@@ -208,17 +250,29 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
     private var currentGyro: CMDeviceMotion?
 
+    private func setCurrentGyro(_ value: CMDeviceMotion?) {
+        gyroLock.lock()
+        currentGyro = value
+        gyroLock.unlock()
+    }
+
+    private func snapshotCurrentGyro() -> CMDeviceMotion? {
+        gyroLock.lock()
+        defer { gyroLock.unlock() }
+        return currentGyro
+    }
+
     private func startGyro() {
         guard motion.isDeviceMotionAvailable else { return }
         motion.deviceMotionUpdateInterval = 1.0 / 250.0
-        motion.startDeviceMotionUpdates(to: .main) { [weak self] m, _ in
-            self?.currentGyro = m
+        motion.startDeviceMotionUpdates(to: motionQueue) { [weak self] m, _ in
+            self?.setCurrentGyro(m)
         }
     }
 
     private func stopGyro() {
         motion.stopDeviceMotionUpdates()
-        currentGyro = nil
+        setCurrentGyro(nil)
     }
 
     private func neutralPad() -> Data {
@@ -241,7 +295,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func mergePhoneMotion(into pad: inout Data) {
-        guard let g = currentGyro else { return }
+        guard let g = snapshotCurrentGyro() else { return }
         var motionBytes = Data(count: kMotionSize)
         motionBytes.withUnsafeMutableBytes { raw in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
@@ -307,18 +361,30 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     private func routeRumble(subpad: Int, low: UInt8, high: UInt8) {
         guard connected else { return }
         if subpad >= 0 && subpad < controllers.count, let gc = controllers[subpad] {
-            _ = playControllerHaptic(gc, low: low, high: high)
+            if playControllerHaptic(gc, low: low, high: high) { return }
+            // Some controllers expose input but no haptic engine through iOS.
+            // Fall back to phone haptics instead of silently dropping rumble.
+            playPhoneHaptic(low: low, high: high)
             return
         }
 
-        // If any physical controller is active, never fake its rumble with phone
-        // haptics. And if we are in the main menu/editor, stay silent too.
-        if controllers.contains(where: { $0 != nil }) { return }
+        // A stop packet must stop phone haptics too. Previously a (0,0) packet
+        // could be ignored when no controller was attached, leaving a short
+        // haptic player running until its natural timeout.
+        if low == 0 && high == 0 {
+            playPhoneHaptic(low: low, high: high)
+            return
+        }
+
         if touchModeActive() { playPhoneHaptic(low: low, high: high) }
     }
 
     private func playPhoneHaptic(low: UInt8, high: UInt8) {
-        guard low != 0 || high != 0 else { return }
+        if low == 0 && high == 0 {
+            engine?.stop(completionHandler: nil)
+            engineNeedsStart = true
+            return
+        }
         guard let engine = engine else { return }
         if engineNeedsStart { try? engine.start(); engineNeedsStart = false }
         do {
@@ -428,6 +494,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         if gp.buttonMenu.isPressed { buttons |= kBtnPlus }
         if gp.buttonOptions?.isPressed == true { buttons |= kBtnMinus }
         if gp.buttonHome?.isPressed == true { buttons |= kBtnHome }
+        buttons = normalizeSystemShortcuts(buttons)
         pad[0..<2] = withUnsafeBytes(of: buttons.littleEndian) { Data($0) }
         // D-pad → hat at offset 2, including diagonals.
         let up = gp.dpad.up.isPressed
