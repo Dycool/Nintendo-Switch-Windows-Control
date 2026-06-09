@@ -35,7 +35,7 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: NSControl/ProtocolBridge.h
         HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/../shared $(PROJECT_DIR)/SDL3/include"
         LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/SDL3/lib"
-        OTHER_LINKER_FLAGS: "-lSDL3 -framework AudioToolbox -framework AVFoundation -framework CoreAudio -framework CoreBluetooth -framework CoreGraphics -framework CoreHaptics -framework CoreMotion -framework CoreVideo -framework Foundation -framework GameController -framework Metal -framework OpenGLES -framework QuartzCore -framework UIKit"
+        OTHER_LDFLAGS: "$(PROJECT_DIR)/SDL3/lib/libSDL3.a -framework AudioToolbox -framework AVFoundation -framework CoreAudio -framework CoreBluetooth -framework CoreGraphics -framework CoreHaptics -framework CoreMotion -framework CoreVideo -framework Foundation -framework GameController -framework Metal -framework OpenGLES -framework QuartzCore -framework UIKit"
         DEVELOPMENT_TEAM: ""
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: ""
@@ -43,10 +43,55 @@ targets:
     info:
       path: NSControl/Info.plist
     preBuildScripts:
-      - name: "Build SDL3 (if not present)"
+      - name: "Build/install SDL3 for iOS if missing"
         script: |
-          if [ ! -f "${SRCROOT}/SDL3/lib/libSDL3.a" ]; then
-            echo "warning: SDL3 static library not found at ${SRCROOT}/SDL3/lib/libSDL3.a"
-            echo "warning: Build SDL3 first: cd ${SRCROOT}/SDL3 && xcodebuild ..."
+          set -euo pipefail
+
+          SDL_INSTALL="${SRCROOT}/SDL3"
+          SDL_HEADER="${SDL_INSTALL}/include/SDL3/SDL.h"
+          SDL_LIB="${SDL_INSTALL}/lib/libSDL3.a"
+          SDL_SOURCE="${SRCROOT}/../../SDL3"
+          SDL_BUILD="${SDL_SOURCE}/build/ios"
+
+          if [ -f "${SDL_HEADER}" ] && [ -f "${SDL_LIB}" ]; then
+            echo "SDL3 already installed for iOS at ${SDL_INSTALL}"
+            exit 0
           fi
+
+          echo "SDL3 iOS install is incomplete."
+          echo "Expected header: ${SDL_HEADER}"
+          echo "Expected library: ${SDL_LIB}"
+
+          if [ ! -d "${SDL_SOURCE}" ]; then
+            echo "error: SDL3 source checkout not found at ${SDL_SOURCE}"
+            echo "error: In CI, run the Checkout SDL3 step before xcodebuild, or place libsdl-org/SDL at repo-root/SDL3."
+            exit 1
+          fi
+
+          rm -rf "${SDL_INSTALL}"
+          cmake -S "${SDL_SOURCE}" -B "${SDL_BUILD}" \
+            -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${SDL_INSTALL}" \
+            -DSDL_STATIC=ON \
+            -DSDL_SHARED=OFF \
+            -DSDL_TEST_LIBRARY=OFF \
+            -DSDL_TESTS=OFF \
+            -DSDL_EXAMPLES=OFF \
+            -DSDL_INSTALL=ON
+          cmake --build "${SDL_BUILD}" --config Release -j"$(sysctl -n hw.logicalcpu)"
+          cmake --install "${SDL_BUILD}" --config Release --prefix "${SDL_INSTALL}"
+
+          # Some SDL CMake/install combinations install the static lib but skip
+          # copying public headers. Keep the Xcode include path stable anyway.
+          if [ ! -f "${SDL_HEADER}" ] && [ -d "${SDL_SOURCE}/include/SDL3" ]; then
+            mkdir -p "${SDL_INSTALL}/include"
+            rsync -a "${SDL_SOURCE}/include/SDL3" "${SDL_INSTALL}/include/"
+          fi
+
+          test -f "${SDL_HEADER}" || { echo "error: SDL3 header still missing: ${SDL_HEADER}"; exit 1; }
+          test -f "${SDL_LIB}" || { echo "error: SDL3 library still missing: ${SDL_LIB}"; exit 1; }
         basedOnDependencyAnalysis: false

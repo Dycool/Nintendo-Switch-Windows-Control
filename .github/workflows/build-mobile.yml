@@ -147,6 +147,13 @@ jobs:
         working-directory: mobile/ios
         run: xcodegen generate
 
+      - name: Verify iOS SDL3 linker settings
+        working-directory: mobile/ios
+        run: |
+          set -euo pipefail
+          xcodebuild -project NSControl.xcodeproj -scheme NSControl -configuration Release -sdk iphoneos -showBuildSettings | tee /tmp/nscontrol-buildsettings.txt
+          grep -q "OTHER_LDFLAGS.*SDL3/lib/libSDL3.a" /tmp/nscontrol-buildsettings.txt
+
       - name: Build iOS app unsigned
         working-directory: mobile/ios
         run: |
