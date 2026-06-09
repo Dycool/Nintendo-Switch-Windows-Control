@@ -273,6 +273,11 @@ static int16_t clamp_motion_i16(float v) {
     return (int16_t)std::lround(v);
 }
 
+static int16_t gyro_deadzone_i16(int16_t v) {
+    constexpr int16_t GYRO_DEADZONE = 32;
+    return std::abs((int)v) <= GYRO_DEADZONE ? 0 : v;
+}
+
 class SDLInputManager {
 public:
     bool start() {
@@ -383,9 +388,6 @@ private:
         bool accel_enabled = false;
         bool rumble_capable = false;
         bool trigger_rumble_capable = false;
-        float gyro_bias[3] = {0.0f, 0.0f, 0.0f};
-        uint32_t gyro_bias_samples = 0;
-        bool gyro_bias_ready = false;
         std::string name;
         uint16_t vid = 0;
         uint16_t pid = 0;
@@ -500,19 +502,12 @@ private:
         if (d.gyro_enabled) {
             float gyro[3] = {0, 0, 0};
             if (SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3)) {
-                if (!d.gyro_bias_ready) {
-                    for (int i = 0; i < 3; ++i) d.gyro_bias[i] += gyro[i];
-                    if (++d.gyro_bias_samples >= 60) {
-                        for (float& b : d.gyro_bias) b /= 60.0f;
-                        d.gyro_bias_ready = true;
-                    }
-                }
-                float gx = -(gyro[0] - d.gyro_bias[0]);
-                float gy = -(gyro[2] - d.gyro_bias[2]);
-                float gz = (gyro[1] - d.gyro_bias[1]);
-                out.gx = clamp_motion_i16(gx * GYRO_SCALE);
-                out.gy = clamp_motion_i16(gy * GYRO_SCALE);
-                out.gz = clamp_motion_i16(gz * GYRO_SCALE);
+                float gx = -gyro[0];
+                float gy = -gyro[2];
+                float gz =  gyro[1];
+                out.gx = gyro_deadzone_i16(clamp_motion_i16(gx * GYRO_SCALE));
+                out.gy = gyro_deadzone_i16(clamp_motion_i16(gy * GYRO_SCALE));
+                out.gz = gyro_deadzone_i16(clamp_motion_i16(gz * GYRO_SCALE));
                 has_motion = true;
             }
         }
