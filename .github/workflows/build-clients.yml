@@ -80,16 +80,18 @@ jobs:
 
           cmake --build client/build --config Release --target ns-client --parallel
 
-      - name: Stage single exe
+      - name: Stage Windows artifact
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force client/artifacts/windows | Out-Null
           Copy-Item client/build/Release/ns-client.exe client/artifacts/windows/ns-client.exe
+          Copy-Item client/icon.png client/artifacts/windows/icon.png
+          Copy-Item client/icon.ico client/artifacts/windows/icon.ico
 
       - uses: actions/upload-artifact@v6
         with:
           name: windows-static-exe
-          path: client/artifacts/windows/ns-client.exe
+          path: client/artifacts/windows/*
 
   build-linux:
     name: Linux single AppImage
