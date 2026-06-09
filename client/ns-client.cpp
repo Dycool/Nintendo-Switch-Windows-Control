@@ -101,34 +101,36 @@ static constexpr uint8_t EXT_PAD_PRESENT = 0x01;
 #endif
 struct ExtendedUdpPacket {
     uint32_t magic = ns::PROTO_MAGIC;
-    uint8_t version = ns::WEB_PROTO_VERSION;
+    uint8_t version = ns::WEB_PROTO_VERSION_3;
     uint8_t flags = ns::FLAG_NONE;
     uint16_t reserved = 0;
     uint32_t seq = 0;
     uint64_t timestamp_us = 0;
-    ns::ExtendedMultiReport report{};
+    ns::ExtendedMultiReport3 report{};
     uint8_t hmac[ns::HMAC_TAG_SIZE]{};
 } NS_PACKED_ATTR;
 #ifdef _MSC_VER
 #pragma pack(pop)
 #endif
 
-static constexpr size_t EXT_UDP_PACKET_AUTH_SIZE = 20 + sizeof(ns::ExtendedMultiReport);
+static constexpr size_t EXT_UDP_PACKET_AUTH_SIZE = 20 + sizeof(ns::ExtendedMultiReport3);
 static constexpr size_t EXT_UDP_PACKET_SIZE = EXT_UDP_PACKET_AUTH_SIZE + ns::HMAC_TAG_SIZE;
 static_assert(sizeof(ExtendedUdpPacket) == EXT_UDP_PACKET_SIZE, "ExtendedUdpPacket wire layout changed");
 
-static void set_pad_present_flag(ns::ExtendedHIDReport& r, bool present) {
+static void set_pad_present_flag(ns::ExtendedHIDReport3& r, bool present) {
     if (present) r.input.vendor |= EXT_PAD_PRESENT;
     else r.input.vendor &= (uint8_t)~EXT_PAD_PRESENT;
 }
 
-static void fill_extended_pad(ns::ExtendedHIDReport& dst, const ns::HIDReport& input,
-                              bool present, const ns::MotionReport* motion = nullptr) {
+static void fill_extended_pad(ns::ExtendedHIDReport3& dst, const ns::HIDReport& input,
+                              bool present, const ns::MotionReport motion[3] = nullptr) {
     dst.reset();
     dst.input = input;
     set_pad_present_flag(dst, present);
     if (motion) {
-        dst.motion = *motion;
+        dst.motion[0] = motion[0];
+        dst.motion[1] = motion[1];
+        dst.motion[2] = motion[2];
         dst.has_motion = 1;
     }
 }
@@ -250,6 +252,7 @@ struct SdlPadState {
     bool connected = false;
     ns::HIDReport input{};
     ns::MotionReport motion{};
+    ns::MotionReport motion_samples[3]{};
     bool has_motion = false;
     uint64_t last_input_us = 0;
     std::string name;
@@ -391,8 +394,8 @@ private:
         std::string name;
         uint16_t vid = 0;
         uint16_t pid = 0;
-        int16_t cached_gx = 0, cached_gy = 0, cached_gz = 0;
-        uint64_t last_gyro_us = 0;
+        ns::MotionReport motion_samples[3]{};
+        bool has_motion_samples = false;
     };
 
     mutable std::mutex mtx;
@@ -480,45 +483,65 @@ private:
                r.lx != 128 || r.ly != 128 || r.rx != 128 || r.ry != 128;
     }
 
-    static void apply_motion(Device& d, ns::MotionReport& out, bool& has_motion) {
+    static void push_motion_sample(Device& d, const ns::MotionReport& sample) {
+        if (!d.has_motion_samples) {
+            d.motion_samples[0] = sample;
+            d.motion_samples[1] = sample;
+            d.motion_samples[2] = sample;
+            d.has_motion_samples = true;
+            return;
+        }
+        d.motion_samples[0] = d.motion_samples[1];
+        d.motion_samples[1] = d.motion_samples[2];
+        d.motion_samples[2] = sample;
+    }
+
+    static void apply_motion(Device& d, ns::MotionReport out_samples[3], bool& has_motion) {
         SDL_Gamepad* pad = d.pad;
-        out.reset();
+        for (int i = 0; i < 3; ++i) out_samples[i].reset();
         has_motion = false;
+
+        ns::MotionReport sample{};
         constexpr float STANDARD_GRAVITY = 9.80665f;
         constexpr float ACCEL_SCALE = 4096.0f / STANDARD_GRAVITY;
         constexpr float RAD_TO_DEG = 57.29577951308232f;
         constexpr float GYRO_SCALE = RAD_TO_DEG * 16.384f;
+
         if (d.accel_enabled) {
             float accel[3] = {0, 0, 0};
             if (SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, accel, 3)) {
-                out.ax = clamp_motion_i16(-accel[0] * ACCEL_SCALE);
-                out.ay = clamp_motion_i16(-accel[2] * ACCEL_SCALE);
-                out.az = clamp_motion_i16(accel[1] * ACCEL_SCALE);
+                sample.ax = clamp_motion_i16(-accel[0] * ACCEL_SCALE);
+                sample.ay = clamp_motion_i16(-accel[2] * ACCEL_SCALE);
+                sample.az = clamp_motion_i16(accel[1] * ACCEL_SCALE);
                 has_motion = true;
             } else {
-                out.az = 4096;
+                sample.az = 4096;
             }
         } else {
-            out.az = 4096;
+            sample.az = 4096;
         }
+
         if (d.gyro_enabled) {
             float gyro[3] = {0, 0, 0};
             if (SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3)) {
-                uint64_t now = ns::now_us();
-                if (now - d.last_gyro_us >= 5000) {
-                    d.last_gyro_us = now;
-                    float gx = -gyro[0];
-                    float gy = -gyro[2];
-                    float gz =  gyro[1];
-                    d.cached_gx = gyro_deadzone_i16(clamp_motion_i16(gx * GYRO_SCALE));
-                    d.cached_gy = gyro_deadzone_i16(clamp_motion_i16(gy * GYRO_SCALE));
-                    d.cached_gz = gyro_deadzone_i16(clamp_motion_i16(gz * GYRO_SCALE));
-                }
-                out.gx = d.cached_gx;
-                out.gy = d.cached_gy;
-                out.gz = d.cached_gz;
+                const float gx = -gyro[0];
+                const float gy = -gyro[2];
+                const float gz =  gyro[1];
+                sample.gx = gyro_deadzone_i16(clamp_motion_i16(gx * GYRO_SCALE));
+                sample.gy = gyro_deadzone_i16(clamp_motion_i16(gy * GYRO_SCALE));
+                sample.gz = gyro_deadzone_i16(clamp_motion_i16(gz * GYRO_SCALE));
                 has_motion = true;
             }
+        }
+
+        if (has_motion) {
+            push_motion_sample(d, sample);
+            out_samples[0] = d.motion_samples[0];
+            out_samples[1] = d.motion_samples[1];
+            out_samples[2] = d.motion_samples[2];
+        } else {
+            d.has_motion_samples = false;
+            for (int i = 0; i < 3; ++i) d.motion_samples[i].reset();
         }
     }
 
@@ -620,7 +643,8 @@ private:
             st.vid = d.vid;
             st.pid = d.pid;
             st.instance_id = d.id;
-            apply_motion(d, st.motion, st.has_motion);
+            apply_motion(d, st.motion_samples, st.has_motion);
+            st.motion = st.has_motion ? st.motion_samples[2] : ns::MotionReport{};
             if (report_non_neutral(st.input) || st.has_motion) st.last_input_us = now;
             states[d.slot] = st;
         }
@@ -1355,7 +1379,7 @@ static void raise_sender_priority() {
 
 struct ClientFrame {
     ns::HIDReport reports[4];
-    ns::MotionReport motion[4];
+    ns::MotionReport motion[4][3];
     bool present[4] = {false, false, false, false};
     bool has_motion[4] = {false, false, false, false};
     int controller_for_slot[4] = {-1, -1, -1, -1};
@@ -1365,7 +1389,7 @@ struct ClientFrame {
         active_count = 0;
         for (int i = 0; i < 4; ++i) {
             reports[i].reset();
-            motion[i].reset();
+            for (int j = 0; j < 3; ++j) motion[i][j].reset();
             present[i] = false;
             has_motion[i] = false;
             controller_for_slot[i] = -1;
@@ -1400,7 +1424,7 @@ static void build_client_frame(ClientFrame& frame,
 
         frame.reports[i] = sdl[i].input;
         filters[i].apply(frame.reports[i], filter_now);
-        frame.motion[i] = sdl[i].motion;
+        for (int j = 0; j < 3; ++j) frame.motion[i][j] = sdl[i].motion_samples[j];
         frame.present[i] = true;
         frame.has_motion[i] = send_motion && sdl[i].has_motion;
         frame.controller_for_slot[i] = i;
@@ -1415,7 +1439,7 @@ static void build_client_frame(ClientFrame& frame,
             }
             if (target >= 0) {
                 frame.reports[target] = frame.reports[0];
-                frame.motion[target] = frame.motion[0];
+                for (int j = 0; j < 3; ++j) frame.motion[target][j] = frame.motion[0][j];
                 frame.has_motion[target] = frame.has_motion[0];
                 frame.present[target] = true;
                 frame.controller_for_slot[target] = frame.controller_for_slot[0];
@@ -1424,7 +1448,7 @@ static void build_client_frame(ClientFrame& frame,
         }
 
         frame.reports[0].reset();
-        frame.motion[0].reset();
+        for (int j = 0; j < 3; ++j) frame.motion[0][j].reset();
         apply_keyboard_to_report(frame.reports[0], false);
         frame.present[0] = true;
         frame.has_motion[0] = false;
@@ -1464,16 +1488,16 @@ static void send_client_frame(SOCKET sock,
 
     ExtendedUdpPacket pkt{};
     pkt.magic = ns::PROTO_MAGIC;
-    pkt.version = ns::WEB_PROTO_VERSION;
+    pkt.version = ns::WEB_PROTO_VERSION_3;
     pkt.flags = ns::FLAG_NONE;
     pkt.seq = seq++;
     pkt.timestamp_us = ns::now_us();
     pkt.report.reset();
 
-    ns::ExtendedHIDReport* pads[4] = {&pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4};
+    ns::ExtendedHIDReport3* pads[4] = {&pkt.report.p1, &pkt.report.p2, &pkt.report.p3, &pkt.report.p4};
     for (int i = 0; i < 4; ++i) {
         fill_extended_pad(*pads[i], frame.reports[i], frame.present[i],
-                          frame.has_motion[i] ? &frame.motion[i] : nullptr);
+                          frame.has_motion[i] ? frame.motion[i] : nullptr);
     }
 
     uint8_t full_hmac[32];

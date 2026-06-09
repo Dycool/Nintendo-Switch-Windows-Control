@@ -28,6 +28,7 @@ namespace ns {
 static constexpr uint32_t PROTO_MAGIC   = 0x4E535743u; // 'NSWC'
 static constexpr uint8_t  PROTO_VERSION = 4;           // Legacy 4-player UDP packet
 static constexpr uint8_t  WEB_PROTO_VERSION = 5;       // Extended input + optional motion
+static constexpr uint8_t  WEB_PROTO_VERSION_3 = 6;     // Extended input + 3 motion samples per pad
 static constexpr uint16_t DEFAULT_PORT  = 7331;
 static constexpr int      WATCHDOG_MS   = 1200;
 static constexpr int      LEGACY_UDP_HZ = 250;
@@ -153,6 +154,28 @@ struct ExtendedMultiReport {
     void reset() noexcept { p1.reset(); p2.reset(); p3.reset(); p4.reset(); }
 } NS_PACKED_ATTR;
 
+// New extended report used by WEB_PROTO_VERSION_3.  It carries the three
+// Pro-controller IMU samples explicitly instead of making the backend synthesize
+// sample 0/1 from a single latest motion value.
+struct ExtendedHIDReport3 {
+    HIDReport input{};        // 8 bytes; input.vendor bit 0 = EXT_PAD_PRESENT.
+    MotionReport motion[3]{}; // 3x 12 bytes, oldest -> newest.
+    uint8_t has_motion = 0;
+    uint8_t reserved[3]{};
+
+    void reset() noexcept {
+        input.reset();
+        for (auto& m : motion) m.reset();
+        has_motion = 0;
+        reserved[0] = reserved[1] = reserved[2] = 0;
+    }
+} NS_PACKED_ATTR;
+
+struct ExtendedMultiReport3 {
+    ExtendedHIDReport3 p1, p2, p3, p4;
+    void reset() noexcept { p1.reset(); p2.reset(); p3.reset(); p4.reset(); }
+} NS_PACKED_ATTR;
+
 struct RumblePacket {
     uint32_t magic = RUMBLE_MAGIC;
     uint8_t  subpad = 0;        // 0..3 logical pad inside the client.
@@ -201,9 +224,12 @@ struct Packet {
 static constexpr std::size_t PACKET_SIZE      = sizeof(Packet);
 static constexpr std::size_t PACKET_AUTH_SIZE = PACKET_SIZE - HMAC_TAG_SIZE;
 
-static constexpr std::size_t EXT_REPORT_SIZE  = sizeof(ExtendedHIDReport);
-static constexpr std::size_t EXT_MULTI_SIZE   = sizeof(ExtendedMultiReport);
-static constexpr std::size_t WEB_PACKET_SIZE  = 20 + sizeof(ExtendedMultiReport);
+static constexpr std::size_t EXT_REPORT_SIZE   = sizeof(ExtendedHIDReport);
+static constexpr std::size_t EXT_MULTI_SIZE    = sizeof(ExtendedMultiReport);
+static constexpr std::size_t EXT3_REPORT_SIZE  = sizeof(ExtendedHIDReport3);
+static constexpr std::size_t EXT3_MULTI_SIZE   = sizeof(ExtendedMultiReport3);
+static constexpr std::size_t WEB_PACKET_SIZE   = 20 + sizeof(ExtendedMultiReport);
+static constexpr std::size_t WEB_PACKET3_SIZE  = 20 + sizeof(ExtendedMultiReport3);
 
 // ── Hard wire-layout checks ──────────────────────────────────────────────────
 static_assert(sizeof(HIDReport) == 8,
@@ -216,6 +242,10 @@ static_assert(sizeof(ExtendedHIDReport) == 24,
               "ExtendedHIDReport wire layout changed");
 static_assert(sizeof(ExtendedMultiReport) == 96,
               "ExtendedMultiReport wire layout changed");
+static_assert(sizeof(ExtendedHIDReport3) == 48,
+              "ExtendedHIDReport3 wire layout changed");
+static_assert(sizeof(ExtendedMultiReport3) == 192,
+              "ExtendedMultiReport3 wire layout changed");
 static_assert(sizeof(Packet) == 68,
               "Legacy Packet wire layout changed");
 static_assert(sizeof(RumblePacket) == 8,

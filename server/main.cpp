@@ -166,6 +166,15 @@ static void set_motion(ClientSession& c, int subpad, const MotionReport& motion)
     c.motion_last_collect_us[subpad] = now;
 }
 
+static void set_motion_samples(ClientSession& c, int subpad, const MotionReport samples[3]) {
+    if (subpad < 0 || subpad >= 4 || !samples) return;
+    c.motion_samples[subpad][0] = samples[0];
+    c.motion_samples[subpad][1] = samples[1];
+    c.motion_samples[subpad][2] = samples[2];
+    c.has_motion[subpad] = true;
+    c.motion_last_collect_us[subpad] = now_us();
+}
+
 // Diagnostics
 static std::atomic<uint64_t> g_pkts_rx{0};
 static std::atomic<uint64_t> g_hid_writes{0};
@@ -3383,22 +3392,54 @@ struct NS_LOCAL_PACKED ExtendedUdpPacket {
     uint8_t  hmac[HMAC_TAG_SIZE];
 };
 
-static constexpr size_t EXT_UDP_PACKET_AUTH_SIZE = 20 + sizeof(ExtendedMultiReport);
-static constexpr size_t EXT_UDP_PACKET_SIZE      = EXT_UDP_PACKET_AUTH_SIZE + HMAC_TAG_SIZE;
-static constexpr size_t UDP_RX_MAX_PACKET_SIZE   =
-    sizeof(ExtendedUdpPacket) > sizeof(Packet) ? sizeof(ExtendedUdpPacket) : sizeof(Packet);
+struct NS_LOCAL_PACKED ExtendedUdpPacket3 {
+    uint32_t magic;
+    uint8_t  version;
+    uint8_t  flags;
+    uint16_t reserved;
+    uint32_t seq;
+    uint64_t timestamp_us;
+    ExtendedMultiReport3 report;
+    uint8_t  hmac[HMAC_TAG_SIZE];
+};
+
+static constexpr size_t EXT_UDP_PACKET_AUTH_SIZE  = 20 + sizeof(ExtendedMultiReport);
+static constexpr size_t EXT_UDP_PACKET_SIZE       = EXT_UDP_PACKET_AUTH_SIZE + HMAC_TAG_SIZE;
+static constexpr size_t EXT3_UDP_PACKET_AUTH_SIZE = 20 + sizeof(ExtendedMultiReport3);
+static constexpr size_t EXT3_UDP_PACKET_SIZE      = EXT3_UDP_PACKET_AUTH_SIZE + HMAC_TAG_SIZE;
+static constexpr size_t UDP_RX_MAX_PACKET_SIZE    =
+    sizeof(ExtendedUdpPacket3) > sizeof(Packet) ? sizeof(ExtendedUdpPacket3) : sizeof(Packet);
 static_assert(sizeof(ExtendedUdpPacket) == EXT_UDP_PACKET_SIZE,
               "ExtendedUdpPacket size must match its wire format");
+static_assert(sizeof(ExtendedUdpPacket3) == EXT3_UDP_PACKET_SIZE,
+              "ExtendedUdpPacket3 size must match its wire format");
 
 static bool extended_udp_packet_ok(const ExtendedUdpPacket& p) {
     return p.magic == PROTO_MAGIC &&
            (p.version == WEB_PROTO_VERSION || p.version == PROTO_VERSION);
 }
 
+static bool extended_udp3_packet_ok(const ExtendedUdpPacket3& p) {
+    return p.magic == PROTO_MAGIC && p.version == WEB_PROTO_VERSION_3;
+}
+
 static bool extended_report_pad_present(const ExtendedMultiReport& report, int subpad) {
     if (subpad < 0 || subpad >= 4) return false;
     const uint8_t* raw = reinterpret_cast<const uint8_t*>(&report);
     return (raw[subpad * sizeof(ExtendedHIDReport) + 7] & 0x01) != 0;
+}
+
+static bool extended3_report_pad_present(const ExtendedMultiReport3& report, int subpad) {
+    if (subpad < 0 || subpad >= 4) return false;
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(&report);
+    return (raw[subpad * sizeof(ExtendedHIDReport3) + 7] & 0x01) != 0;
+}
+
+static void extended3_to_extended_latest(const ExtendedHIDReport3& in, ExtendedHIDReport& out) {
+    out.reset();
+    out.input = in.input;
+    out.has_motion = in.has_motion;
+    if (in.has_motion) out.motion = in.motion[2];
 }
 
 static void clear_udp_rumble_state(ClientSession& c) {
@@ -3661,7 +3702,7 @@ static size_t process_ws_frame(WebClient *c) {
         }
     }
 
-    if (flen != PACKET_SIZE && flen != WEB_PACKET_SIZE) {
+    if (flen != PACKET_SIZE && flen != WEB_PACKET_SIZE && flen != WEB_PACKET3_SIZE) {
         c->state = WebClient::CLOSED;
         return total;
     }
@@ -3674,7 +3715,10 @@ static size_t process_ws_frame(WebClient *c) {
     uint32_t seq; memcpy(&seq, payload + 8, 4);
 
     ExtendedMultiReport report;
+    ExtendedMultiReport3 report3;
     report.reset();
+    report3.reset();
+    bool is_report3 = false;
     bool pad_present[4] = {};
 
     if (ver == PROTO_VERSION && flen == PACKET_SIZE) {
@@ -3696,6 +3740,23 @@ static size_t process_ws_frame(WebClient *c) {
             report.p2.reset();
             report.p3.reset();
             report.p4.reset();
+            pad_present[0] = true;
+            pad_present[1] = false;
+            pad_present[2] = false;
+            pad_present[3] = false;
+        }
+    } else if (ver == WEB_PROTO_VERSION_3 && flen == WEB_PACKET3_SIZE) {
+        is_report3 = true;
+        memcpy(&report3, payload + 20, sizeof(ExtendedMultiReport3));
+        const ExtendedHIDReport3* src3[4] = { &report3.p1, &report3.p2, &report3.p3, &report3.p4 };
+        ExtendedHIDReport* dst1[4] = { &report.p1, &report.p2, &report.p3, &report.p4 };
+        for (int s = 0; s < 4; ++s) {
+            pad_present[s] = (payload[20 + s * sizeof(ExtendedHIDReport3) + 7] & 0x01) != 0;
+            extended3_to_extended_latest(*src3[s], *dst1[s]);
+        }
+        if (flags & FLAG_SINGLE_PAD) {
+            report.p2.reset(); report.p3.reset(); report.p4.reset();
+            report3.p2.reset(); report3.p3.reset(); report3.p4.reset();
             pad_present[0] = true;
             pad_present[1] = false;
             pad_present[2] = false;
@@ -3754,6 +3815,9 @@ static size_t process_ws_frame(WebClient *c) {
         const ExtendedHIDReport* src_pads[4] = {
             &report.p1, &report.p2, &report.p3, &report.p4,
         };
+        const ExtendedHIDReport3* src_pads3[4] = {
+            &report3.p1, &report3.p2, &report3.p3, &report3.p4,
+        };
 
         if (is_reset) {
             g_clients[c->ws_slot].report.reset();
@@ -3766,10 +3830,17 @@ static size_t process_ws_frame(WebClient *c) {
             for (int s = 0; s < 4; ++s) {
                 if (pad_present[s]) {
                     *dst_pads[s] = *src_pads[s];
-                    if (src_pads[s]->has_motion)
-                        set_motion(g_clients[c->ws_slot], s, src_pads[s]->motion);
-                    else
-                        clear_motion(g_clients[c->ws_slot], s);
+                    if (is_report3) {
+                        if (src_pads3[s]->has_motion)
+                            set_motion_samples(g_clients[c->ws_slot], s, src_pads3[s]->motion);
+                        else
+                            clear_motion(g_clients[c->ws_slot], s);
+                    } else {
+                        if (src_pads[s]->has_motion)
+                            set_motion(g_clients[c->ws_slot], s, src_pads[s]->motion);
+                        else
+                            clear_motion(g_clients[c->ws_slot], s);
+                    }
                     g_clients[c->ws_slot].pad_present[s] = true;
                     g_clients[c->ws_slot].pad_last_present_us[s] = now;
                 } else {
@@ -4448,14 +4519,19 @@ int main(int argc, char** argv) {
             }
 
             bool is_extended_udp = false;
+            bool is_extended_udp3 = false;
             Packet pkt{};
             ExtendedUdpPacket ext_pkt{};
+            ExtendedUdpPacket3 ext3_pkt{};
 
             if (bytes == (ssize_t)PACKET_SIZE) {
                 memcpy(&pkt, udp_rx.data(), sizeof(pkt));
             } else if (bytes == (ssize_t)EXT_UDP_PACKET_SIZE) {
                 memcpy(&ext_pkt, udp_rx.data(), sizeof(ext_pkt));
                 is_extended_udp = true;
+            } else if (bytes == (ssize_t)EXT3_UDP_PACKET_SIZE) {
+                memcpy(&ext3_pkt, udp_rx.data(), sizeof(ext3_pkt));
+                is_extended_udp3 = true;
             } else {
                 if (g_verbose) std::printf("[udp] unexpected packet size=%zd, dropped\n", bytes);
                 continue;
@@ -4472,6 +4548,11 @@ int main(int argc, char** argv) {
             if (is_extended_udp) {
                 if (!extended_udp_packet_ok(ext_pkt)) {
                     if (g_verbose) puts("bad extended UDP magic/version, dropped");
+                    continue;
+                }
+            } else if (is_extended_udp3) {
+                if (!extended_udp3_packet_ok(ext3_pkt)) {
+                    if (g_verbose) puts("bad extended UDP v3 magic/version, dropped");
                     continue;
                 }
             } else if (!packet_ok(pkt)) {
@@ -4532,6 +4613,12 @@ int main(int argc, char** argv) {
                                       EXT_UDP_PACKET_AUTH_SIZE,
                                       ext_pkt.hmac,
                                       HMAC_TAG_SIZE);
+            } else if (is_extended_udp3) {
+                hmac_ok = hmac_verify(g_hmac_key, 32,
+                                      reinterpret_cast<const uint8_t*>(&ext3_pkt),
+                                      EXT3_UDP_PACKET_AUTH_SIZE,
+                                      ext3_pkt.hmac,
+                                      HMAC_TAG_SIZE);
             } else {
                 hmac_ok = hmac_verify(g_hmac_key, 32,
                                       reinterpret_cast<const uint8_t*>(&pkt),
@@ -4544,7 +4631,7 @@ int main(int argc, char** argv) {
                 continue;
             }
 
-            uint8_t packet_flags = is_extended_udp ? ext_pkt.flags : pkt.flags;
+            uint8_t packet_flags = is_extended_udp3 ? ext3_pkt.flags : (is_extended_udp ? ext_pkt.flags : pkt.flags);
             if (packet_flags & FLAG_DISCONNECT) {
                 server_macro_stop_all_for_client(client_idx);
                 {
@@ -4564,8 +4651,8 @@ int main(int argc, char** argv) {
                 // Re-validate: writer may have deactivated the slot during HMAC.
                 if (!g_clients[client_idx].active) continue;
 
-                uint8_t flags = is_extended_udp ? ext_pkt.flags : pkt.flags;
-                uint32_t seq = is_extended_udp ? ext_pkt.seq : pkt.seq;
+                uint8_t flags = is_extended_udp3 ? ext3_pkt.flags : (is_extended_udp ? ext_pkt.flags : pkt.flags);
+                uint32_t seq = is_extended_udp3 ? ext3_pkt.seq : (is_extended_udp ? ext_pkt.seq : pkt.seq);
                 bool is_reset = (flags & FLAG_RESET);
                 bool sequence_jump = (g_clients[client_idx].expected_seq > seq) &&
                                      ((g_clients[client_idx].expected_seq - seq) > 100);
@@ -4585,9 +4672,10 @@ int main(int argc, char** argv) {
                         g_clients[client_idx].pad_present[s] = false;
                         g_clients[client_idx].pad_last_present_us[s] = 0;
                     }
-                } else if (is_extended_udp) {
+                } else if (is_extended_udp || is_extended_udp3) {
                     // Extended UDP carries motion/gyro and pad-present flags, so
-                    // neutral-but-connected pads can still receive rumble.
+                    // neutral-but-connected pads can still receive rumble.  Version 6
+                    // also carries the three Pro-controller IMU samples explicitly.
                     g_clients[client_idx].uses_pad_presence = true;
                     enable_udp_rumble_state(g_clients[client_idx]);
 
@@ -4601,15 +4689,29 @@ int main(int argc, char** argv) {
                         &ext_pkt.report.p1, &ext_pkt.report.p2,
                         &ext_pkt.report.p3, &ext_pkt.report.p4,
                     };
+                    const ExtendedHIDReport3* src_pads3[4] = {
+                        &ext3_pkt.report.p1, &ext3_pkt.report.p2,
+                        &ext3_pkt.report.p3, &ext3_pkt.report.p4,
+                    };
 
                     for (int s = 0; s < 4; ++s) {
-                        bool present = extended_report_pad_present(ext_pkt.report, s);
+                        bool present = is_extended_udp3 ?
+                            extended3_report_pad_present(ext3_pkt.report, s) :
+                            extended_report_pad_present(ext_pkt.report, s);
                         if (present) {
-                            *dst_pads[s] = *src_pads[s];
-                            if (src_pads[s]->has_motion)
-                                set_motion(g_clients[client_idx], s, src_pads[s]->motion);
-                            else
-                                clear_motion(g_clients[client_idx], s);
+                            if (is_extended_udp3) {
+                                extended3_to_extended_latest(*src_pads3[s], *dst_pads[s]);
+                                if (src_pads3[s]->has_motion)
+                                    set_motion_samples(g_clients[client_idx], s, src_pads3[s]->motion);
+                                else
+                                    clear_motion(g_clients[client_idx], s);
+                            } else {
+                                *dst_pads[s] = *src_pads[s];
+                                if (src_pads[s]->has_motion)
+                                    set_motion(g_clients[client_idx], s, src_pads[s]->motion);
+                                else
+                                    clear_motion(g_clients[client_idx], s);
+                            }
                             g_clients[client_idx].pad_present[s] = true;
                             g_clients[client_idx].pad_last_present_us[s] = now;
                         } else {
@@ -4643,7 +4745,7 @@ int main(int argc, char** argv) {
 
             // Extended UDP clients opted into rumble by using the new packet
             // format.  Legacy clients are not sent unexpected traffic.
-            if (is_extended_udp) {
+            if (is_extended_udp || is_extended_udp3) {
                 flush_rumble_to_udp(sock, client_idx);
             }
         } // drain loop
