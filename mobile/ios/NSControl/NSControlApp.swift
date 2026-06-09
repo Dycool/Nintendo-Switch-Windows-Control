@@ -110,6 +110,7 @@ struct WebViewContainer: UIViewRepresentable {
         // No visible Back button; use the platform back gesture where possible.
         wv.allowsBackForwardNavigationGestures = true
         wv.scrollView.contentInsetAdjustmentBehavior = .never
+        wv.scrollView.isScrollEnabled = false
         return wv
     }
 

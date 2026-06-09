@@ -7,8 +7,8 @@
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #FFFFFF;
-            color: #1A1A1A;
+            background-color: #111111;
+            color: #E0E0E0;
             padding: 20px;
             max-width: 480px;
         }
@@ -16,17 +16,18 @@
         .row { display: flex; align-items: center; margin-bottom: 12px; }
         .row label { width: 140px; text-align: right; margin-right: 10px; font-size: 14px; }
         input[type="text"], select {
-            flex: 1; padding: 4px; font-family: 'Consolas', monospace; border: 1px solid #ccc;
+            flex: 1; padding: 4px; font-family: 'Consolas', monospace; border: 1px solid #444; background: #222; color: #E0E0E0;
         }
         button {
             padding: 6px 16px; font-family: 'Segoe UI'; font-size: 14px;
-            background: #f0f0f0; border: 1px solid #ccc; cursor: pointer;
+            background: #333; border: 1px solid #555; cursor: pointer;
             border-radius: 4px;
             min-height: 30px;
+            color: #E0E0E0;
         }
-        button:hover { background: #e0e0e0; }
+        button:hover { background: #444; }
         .btn-group { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px; }
-        hr { border: none; border-top: 2px solid #DDDDDD; margin: 20px 0; }
+        hr { border: none; border-top: 2px solid #333; margin: 20px 0; }
         .status { font-size: 13px; margin-bottom: 4px; }
         
         #modalOverlay {
@@ -35,8 +36,8 @@
             z-index: 10000;
         }
         #modalContent {
-            background: white; padding: 20px; border-radius: 8px; width: 90%; max-width: 440px;
-            max-height: 80vh; display: flex; flex-direction: column; box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            background: #1E1E1E; padding: 20px; border-radius: 8px; width: 90%; max-width: 440px;
+            max-height: 80vh; display: flex; flex-direction: column; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
         }
         #modalContent h3 { margin-top: 0; margin-bottom: 15px; color: #CC0000; flex-shrink: 0; }
         
@@ -49,7 +50,7 @@
         .listening { background: #ffeb3b !important; border-color: #fbc02d !important; color: #000; transform: scale(1.02); }
         
         .modal-footer {
-            display: flex; justify-content: space-between; margin-top: 15px; padding-top: 15px; border-top: 1px solid #eee; flex-shrink: 0;
+            display: flex; justify-content: space-between; margin-top: 15px; padding-top: 15px; border-top: 1px solid #333; flex-shrink: 0;
         }
         .footer-group { display: flex; gap: 8px; }
         
@@ -109,8 +110,8 @@ window.WebSocket.CLOSED = 3;
         <button id="btnConnect">Connect</button>
         <button id="btnBindings">Bindings...</button>
         <button id="btnMacros">Macros...</button>
-        <button id="btnTouchControls" style="display: none; background: #e3f2fd; border-color: #90caf9;" onclick="window.location.href='mobile.html'">Touch Controls</button>
-        <button id="btnEditor" style="display: none; background: #fff9c4; border-color: #ffe082;" onclick="window.location.href='editor.html'">Editor</button>
+        <button id="btnTouchControls" style="display: none; background: #1a4a7a; border-color: #2a6a9a;" onclick="window.location.href='mobile.html'">Touch Controls</button>
+        <button id="btnEditor" style="display: none; background: #5a4a0a; border-color: #7a6a1a;" onclick="window.location.href='editor.html'">Editor</button>
     </div>
     <hr>
     <div class="status" id="statusText">Ready</div>
@@ -126,7 +127,7 @@ window.WebSocket.CLOSED = 3;
             </div>
             <div class="modal-footer">
                 <div class="footer-group">
-                    <button id="btnSaveBindings" style="background: #e3f2fd; border-color: #90caf9;">Save</button>
+                    <button id="btnSaveBindings" style="background: #1a4a7a; border-color: #2a6a9a;">Save</button>
                     <button id="btnCancelBindings">Cancel</button>
                 </div>
                 <div class="footer-group">
@@ -137,7 +138,7 @@ window.WebSocket.CLOSED = 3;
         </div>
     </div>
     <div id="macroOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); justify-content:center; align-items:center; z-index:10001;">
-        <div style="background:white; color:#1A1A1A; padding:18px; border-radius:8px; width:90%; max-width:520px; box-shadow:0 4px 12px rgba(0,0,0,0.25);">
+        <div style="background:#1E1E1E; color:#E0E0E0; padding:18px; border-radius:8px; width:90%; max-width:520px; box-shadow:0 4px 12px rgba(0,0,0,0.5);">
             <h3 style="margin-top:0; color:#CC0000;">Macros</h3>
             <div id="macroRows" style="min-height:28px; margin-bottom:12px;"></div>
             <input id="macroImportFile" type="file" accept="application/json,.json" style="display:none">
