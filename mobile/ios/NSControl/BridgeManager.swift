@@ -291,7 +291,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
     private func mergeSDLInput(_ slot: Int, into pad: inout Data) {
         let input = sdl.padInput(slot)
-        guard input.connected else { return }
+        guard input.connected != 0 else { return }
         var hid = Data(count: Int(NS_PROTOCOL_HID_SIZE))
         hid.withUnsafeMutableBytes { raw in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
@@ -314,7 +314,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
     private func mergeSDLMotion(_ slot: Int, into pad: inout Data) -> Bool {
         let motion = sdl.padMotion(slot)
-        guard motion.has_motion else { return false }
+        guard motion.has_motion != 0 else { return false }
         var motionBytes = Data(count: kMotionSize)
         motionBytes.withUnsafeMutableBytes { raw in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
@@ -336,7 +336,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         }
 
         let motion = sdl.phoneSensorsRead()
-        guard motion.has_motion else { return }
+        guard motion.has_motion != 0 else { return }
         var motionBytes = Data(count: kMotionSize)
         motionBytes.withUnsafeMutableBytes { raw in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }

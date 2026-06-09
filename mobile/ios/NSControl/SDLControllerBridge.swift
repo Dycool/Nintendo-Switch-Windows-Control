@@ -10,7 +10,7 @@ final class SDLControllerBridge {
     // MARK: - Lifecycle
 
     func start() -> Bool {
-        sdl_controller_init()
+        sdl_controller_init() != 0
     }
 
     func stop() {
@@ -26,7 +26,7 @@ final class SDLControllerBridge {
     // MARK: - Gamepad state (0-3)
 
     func padConnected(_ slot: Int) -> Bool {
-        sdl_controller_pad_connected(Int32(slot))
+        sdl_controller_pad_connected(Int32(slot)) != 0
     }
 
     func padInput(_ slot: Int) -> SdlPadInput {
@@ -48,7 +48,7 @@ final class SDLControllerBridge {
     // MARK: - Phone sensors (for touch controls)
 
     func phoneSensorsOpen() -> Bool {
-        sdl_controller_phone_sensors_open()
+        sdl_controller_phone_sensors_open() != 0
     }
 
     func phoneSensorsClose() {
@@ -62,7 +62,7 @@ final class SDLControllerBridge {
     // MARK: - Phone haptics (for touch controls)
 
     func phoneHapticOpen() -> Bool {
-        sdl_controller_phone_haptic_open()
+        sdl_controller_phone_haptic_open() != 0
     }
 
     func phoneHapticClose() {
