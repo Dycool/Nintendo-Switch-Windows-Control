@@ -5,7 +5,7 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>NS-mobile</string>
+    <string>NS Mobile</string>
     <key>CFBundleIconName</key>
     <string>AppIcon</string>
     <key>CFBundleExecutable</key>
@@ -15,7 +15,7 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>NS-mobile</string>
+    <string>NS Mobile</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

@@ -27,7 +27,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nscontrol.app
-        PRODUCT_NAME: NS-mobile
+        PRODUCT_NAME: NS Mobile
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: NSControl/Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: NSControl/ProtocolBridge.h

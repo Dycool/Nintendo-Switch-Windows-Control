@@ -11,13 +11,13 @@
         android:layout_width="96dp"
         android:layout_height="96dp"
         android:src="@drawable/app_logo"
-        android:contentDescription="NS-mobile"
+        android:contentDescription="NS Mobile"
         android:layout_marginBottom="16dp" />
 
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="NS-mobile"
+        android:text="NS Mobile"
         android:textSize="34sp"
         android:textStyle="bold"
         android:textColor="#CC0000"
@@ -35,7 +35,7 @@
         android:id="@+id/hostInput"
         android:layout_width="match_parent"
         android:layout_height="56dp"
-        android:hint="Server IP"
+        android:hint="Server IP or domain"
         android:inputType="textUri|textNoSuggestions"
         android:singleLine="true"
         android:imeOptions="actionDone"
