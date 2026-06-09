@@ -100,6 +100,10 @@ class MainActivity : AppCompatActivity() {
         var hasMotion: Boolean = false
         var hasRumble: Boolean = false
         var hasGyro: Boolean = false
+        var rumbleLow: Int = 0
+        var rumbleHigh: Int = 0
+        var rumbleUntilMs: Long = 0L
+        var rumbleLastSetMs: Long = 0L
         val motionSamples: Array<ByteArray> = Array(Protocol.MOTION_SAMPLE_COUNT) { Protocol.neutralMotion() }
         var motionSampleCount: Int = 0
 
@@ -116,6 +120,10 @@ class MainActivity : AppCompatActivity() {
             hasMotion = false
             hasRumble = false
             hasGyro = false
+            rumbleLow = 0
+            rumbleHigh = 0
+            rumbleUntilMs = 0L
+            rumbleLastSetMs = 0L
             motionSampleCount = 0
             for (i in 0 until Protocol.MOTION_SAMPLE_COUNT) motionSamples[i].fill(0)
         }
@@ -278,7 +286,9 @@ class MainActivity : AppCompatActivity() {
                     val high = bytes[6].toInt() and 0xFF
                     val duration10Ms = bytes[7].toInt() and 0xFF
                     Log.d(TAG, "rumble packet subpad=$subpad low=$low high=$high duration10ms=$duration10Ms")
-                    runOnUiThread { routeRumble(subpad, low, high, duration10Ms) }
+                    // OkHttp already calls this on a background thread. Keep rumble/haptics
+                    // off the UI thread; only the View haptic fallback hops to UI if needed.
+                    routeRumble(subpad, low, high, duration10Ms)
                 }
             })
             true
@@ -556,8 +566,13 @@ class MainActivity : AppCompatActivity() {
                 true
             } else false
             // Some devices expose weak/disabled vibrator access to WebView apps.
-            // Fire a platform haptic too; it is harmless if the real vibrator worked.
-            try { webView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) } catch (_: Throwable) {}
+            // Only use View haptic as a real fallback; firing both can feel like
+            // a double-click and can add jitter on some Android builds.
+            if (!didVibrate) {
+                runOnUiThread {
+                    try { webView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) } catch (_: Throwable) {}
+                }
+            }
             Log.d(TAG, "rumble start low=$low high=$high durationMs=$durationMs didVibrate=$didVibrate")
         } catch (t: Throwable) {
             Log.w(TAG, "phone rumble failed", t)
@@ -746,10 +761,12 @@ class MainActivity : AppCompatActivity() {
             stopPhysicalControllerSensorsLocked(clearPads = false)
             for (pad in physicalPads) pad.reset()
 
-            val devices = InputDevice.getDeviceIds()
-                .mapNotNull { InputDevice.getDevice(it) }
-                .filter { isControllerDevice(it) }
-                .take(Protocol.PAD_COUNT)
+            val devices = mutableListOf<InputDevice>()
+            for (id in InputDevice.getDeviceIds()) {
+                val device = InputDevice.getDevice(id) ?: continue
+                if (isControllerDevice(device)) devices.add(device)
+                if (devices.size >= Protocol.PAD_COUNT) break
+            }
 
             for ((slot, device) in devices.withIndex()) {
                 val prev = oldByDevice[device.id]
@@ -886,12 +903,38 @@ class MainActivity : AppCompatActivity() {
 
     private fun physicalRumble(subpad: Int, low: Int, high: Int, duration10Ms: Int) {
         if (subpad !in 0 until Protocol.PAD_COUNT) return
-        val deviceId = synchronized(physicalLock) { physicalPads[subpad].deviceId }
-        if (deviceId < 0) return
-        val device = InputDevice.getDevice(deviceId) ?: return
+
+        val now = SystemClock.uptimeMillis()
         val neutral = (low == 0 && high == 0) || duration10Ms == 0
         val durationMs = if (neutral) 0L else maxOf(250L, duration10Ms.coerceIn(1, 255) * 10L)
         val strength = maxOf(low, high).coerceIn(1, 255)
+
+        val deviceId = synchronized(physicalLock) {
+            val pad = physicalPads[subpad]
+            if (!pad.present || pad.deviceId < 0) return
+
+            if (neutral) {
+                pad.rumbleLow = 0
+                pad.rumbleHigh = 0
+                pad.rumbleUntilMs = 0L
+                pad.rumbleLastSetMs = now
+                pad.deviceId
+            } else {
+                // Match ns-client-style throttling: avoid restarting the Android
+                // controller vibrator every 10-16ms when the same rumble packet repeats.
+                if (pad.rumbleLow == low && pad.rumbleHigh == high && now - pad.rumbleLastSetMs < 100L) {
+                    pad.rumbleUntilMs = now + durationMs
+                    return
+                }
+                pad.rumbleLow = low
+                pad.rumbleHigh = high
+                pad.rumbleUntilMs = now + durationMs
+                pad.rumbleLastSetMs = now
+                pad.deviceId
+            }
+        }
+
+        val device = InputDevice.getDevice(deviceId) ?: return
         try {
             val vib: Vibrator? = if (Build.VERSION.SDK_INT >= 31) {
                 device.vibratorManager.defaultVibrator
@@ -1012,7 +1055,7 @@ class MainActivity : AppCompatActivity() {
             ClientMode.TOUCH -> "Touch Controls running"
             ClientMode.NONE -> "Ready"
         }
-        fun jsEscape(v: String) = v.replace("\", "\\").replace("'", "\'").replace("\n", " ")
+        fun jsEscape(v: String): String = v.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
         val js = buildString {
             append("(function(){")
             append("var s=document.getElementById('statusText'); if(s)s.textContent='").append(jsEscape(status)).append("';")
