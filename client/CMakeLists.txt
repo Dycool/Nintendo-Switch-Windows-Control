@@ -7,29 +7,44 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
 find_package(SDL3 REQUIRED CONFIG)
-
-set(NS_CLIENT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/ns-client.cpp")
-
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
-add_executable(ns-client WIN32 MACOSX_BUNDLE "${NS_CLIENT_SOURCE}")
+set(NS_CLIENT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/ns-client.cpp")
+set(NS_CLIENT_QRC "${CMAKE_CURRENT_LIST_DIR}/resources.qrc")
+
 set(CMAKE_AUTORCC ON)
+
+add_executable(ns-client
+    WIN32
+    MACOSX_BUNDLE
+    "${NS_CLIENT_SOURCE}"
+    "${NS_CLIENT_QRC}"
+)
+
+set_target_properties(ns-client PROPERTIES
+    AUTORCC ON
+)
+
 target_compile_definitions(ns-client PRIVATE
     SDL_MAIN_HANDLED
     NS_CLIENT_SOURCE_DIR="${CMAKE_CURRENT_LIST_DIR}"
 )
-target_link_libraries(ns-client PRIVATE Qt6::Widgets SDL3::SDL3 Threads::Threads)
+
+target_link_libraries(ns-client PRIVATE
+    Qt6::Widgets
+    SDL3::SDL3
+    Threads::Threads
+)
 
 if(WIN32 AND TARGET Qt6::EntryPoint)
     target_link_libraries(ns-client PRIVATE Qt6::EntryPoint)
 endif()
 
-target_sources(ns-client PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/resources.qrc")
-
 if(WIN32)
     target_sources(ns-client PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}/ns-gui.rc"
     )
+
     target_compile_definitions(ns-client PRIVATE
         WIN32_LEAN_AND_MEAN
         NOMINMAX
@@ -37,12 +52,19 @@ if(WIN32)
         UNICODE
         _UNICODE
     )
-    target_link_libraries(ns-client PRIVATE ws2_32 winmm)
+
+    target_link_libraries(ns-client PRIVATE
+        ws2_32
+        winmm
+    )
 endif()
 
 if(APPLE)
-    find_library(COREGRAPHICS_FRAMEWORK CoreGraphics)
-    target_link_libraries(ns-client PRIVATE ${COREGRAPHICS_FRAMEWORK})
+    find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
+
+    target_link_libraries(ns-client PRIVATE
+        ${COREGRAPHICS_FRAMEWORK}
+    )
 
     set_target_properties(ns-client PROPERTIES
         MACOSX_BUNDLE_BUNDLE_NAME "NS PC Control"
@@ -61,7 +83,15 @@ if(UNIX AND NOT APPLE)
 endif()
 
 if(MSVC)
-    target_compile_options(ns-client PRIVATE /W3 /permissive- /EHsc)
+    target_compile_options(ns-client PRIVATE
+        /W3
+        /permissive-
+        /EHsc
+    )
 else()
-    target_compile_options(ns-client PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(ns-client PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
 endif()
