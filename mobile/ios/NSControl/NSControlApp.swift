@@ -1,11 +1,27 @@
 import SwiftUI
 import WebKit
+import Network
 
 @main
 struct NSControlApp: App {
+    init() {
+        requestLocalNetworkPermission()
+    }
     var body: some Scene {
         WindowGroup { ContentView() }
     }
+}
+
+private func requestLocalNetworkPermission() {
+    let conn = NWConnection(host: "255.255.255.255", port: 9, using: .udp)
+    conn.stateUpdateHandler = { state in
+        if case .ready = state {
+            conn.send(content: Data([0]), completion: .contentProcessed({ _ in conn.cancel() }))
+        } else if case .failed = state {
+            conn.cancel()
+        }
+    }
+    conn.start(queue: .global())
 }
 
 struct ContentView: View {

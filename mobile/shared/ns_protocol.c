@@ -172,10 +172,10 @@ void ns_motion_from_apple(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
     const float accel_scale = ns_accel_scale_apple();
     const float gyro_scale = ns_gyro_scale();
     ns_motion_write_values(out_motion,
-                           ns_clamp_motion( gravity_y * accel_scale),
+                           ns_clamp_motion(-gravity_y * accel_scale),
                            ns_clamp_motion( gravity_z * accel_scale),
                            ns_clamp_motion( gravity_x * accel_scale),
-                           ns_gyro_deadzone(ns_clamp_motion( rotation_y * gyro_scale)),
+                           ns_gyro_deadzone(ns_clamp_motion(-rotation_y * gyro_scale)),
                            ns_gyro_deadzone(ns_clamp_motion( rotation_z * gyro_scale)),
                            ns_gyro_deadzone(ns_clamp_motion( rotation_x * gyro_scale)),
                            1);
