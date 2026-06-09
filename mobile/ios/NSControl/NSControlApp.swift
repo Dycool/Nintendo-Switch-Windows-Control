@@ -107,9 +107,11 @@ struct WebViewContainer: UIViewRepresentable {
     func updateUIView(_ wv: WKWebView, context: Context) {
         guard let target = Self.localURL(for: page) else { return }
 
-        if page == .touchControls {
-            BridgeManager.shared.connect(host: host)
-        } else {
+        // Merely opening the Touch Controls page must not bind a console player.
+        // The real native WebSocket starts only when the embedded touch UI presses
+        // its Connect button and creates its WebSocket. Leaving touch controls
+        // releases the player immediately.
+        if page != .touchControls {
             BridgeManager.shared.disconnect()
         }
 
@@ -172,6 +174,12 @@ struct WebViewContainer: UIViewRepresentable {
                   let dict = msg.body as? [String: Any],
                   let type = dict["type"] as? String else { return }
             switch type {
+            case "connect":
+                // Same behavior as the browser page: Touch Controls binds only
+                // after its Connect button creates the WebSocket. Ignore WebSocket
+                // creations from other bundled pages.
+                guard self.parent.page == .touchControls else { return }
+                BridgeManager.shared.connect(host: self.parent.host)
             case "back":
                 BridgeManager.shared.disconnect()
                 DispatchQueue.main.async { self.parent.page = .mainMenu }

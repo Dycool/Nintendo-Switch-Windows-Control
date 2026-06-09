@@ -102,26 +102,32 @@ class MainActivity : AppCompatActivity() {
     //  WebSocket
     // ═══════════════════════════════
 
-    private fun connectWs() {
-        val req = Request.Builder().url("ws://$host:8080/").build()
-        ws = client.newWebSocket(req, object : WebSocketListener() {
-            override fun onOpen(w: WebSocket, r: Response) {
-                runOnUiThread { statusText.text = "Connected" }
-            }
-            override fun onClosed(w: WebSocket, code: Int, reason: String) {
-                runOnUiThread { statusText.text = "Disconnected" }
-            }
-            override fun onFailure(w: WebSocket, t: Throwable, r: Response?) {
-                runOnUiThread { statusText.text = "Connection failed" }
-            }
-            override fun onMessage(w: WebSocket, bytes: ByteString) {
-                if (bytes.size >= 8) {
-                    val low = bytes[5].toInt() and 0xFF
-                    val high = bytes[6].toInt() and 0xFF
-                    routeRumble(low, high)
+    private fun connectWs(): Boolean {
+        return try {
+            val req = Request.Builder().url("ws://$host:8080/").build()
+            ws = client.newWebSocket(req, object : WebSocketListener() {
+                override fun onOpen(w: WebSocket, r: Response) {
+                    runOnUiThread { statusText.text = "Connected" }
                 }
-            }
-        })
+                override fun onClosed(w: WebSocket, code: Int, reason: String) {
+                    runOnUiThread { statusText.text = "Disconnected" }
+                }
+                override fun onFailure(w: WebSocket, t: Throwable, r: Response?) {
+                    runOnUiThread { statusText.text = "Connection failed" }
+                }
+                override fun onMessage(w: WebSocket, bytes: ByteString) {
+                    if (bytes.size >= 8) {
+                        val low = bytes[5].toInt() and 0xFF
+                        val high = bytes[6].toInt() and 0xFF
+                        routeRumble(low, high)
+                    }
+                }
+            })
+            true
+        } catch (e: Exception) {
+            runOnUiThread { statusText.text = "Invalid server address" }
+            false
+        }
     }
 
     // ═══════════════════════════════
@@ -318,7 +324,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun enterPage(page: Page) {
         currentPage = page
-        if (page == Page.TOUCH_CONTROLS) activateControlClient() else deactivateControlClient()
+        if (page != Page.TOUCH_CONTROLS) deactivateControlClient()
         loadUrl(pageUrl(page))
     }
 
@@ -343,7 +349,17 @@ class MainActivity : AppCompatActivity() {
 
     inner class JSBridge {
         @JavascriptInterface
+        fun onOpen() {
+            runOnUiThread {
+                if (currentPage == Page.TOUCH_CONTROLS) activateControlClient()
+            }
+        }
+
+        @JavascriptInterface
         fun onBinary(json: String) {
+            // Do not let mere page load or stray JS packets bind a console player.
+            // The native control WebSocket starts only after the touch page creates
+            // its fake WebSocket, which happens from the touch page Connect button.
             if (currentPage != Page.TOUCH_CONTROLS || !controlClientActive) return
             try {
                 val arr = org.json.JSONArray(json)
@@ -476,7 +492,10 @@ class MainActivity : AppCompatActivity() {
         touchFrame = null
         lastTouchFrameMs = 0
         controlClientActive = true
-        connectWs()
+        if (!connectWs()) {
+            controlClientActive = false
+            return
+        }
         startGyro()
         startSending()
     }

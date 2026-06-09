@@ -48,6 +48,7 @@ window.WebSocket = function(url, protocols) {
     this.close = function() { NSBridge.onClose(); };
     setTimeout(function() {
         this.readyState = 1;
+        if (NSBridge.onOpen) NSBridge.onOpen();
         if (this.onopen) this.onopen();
     }.bind(this), 0);
 };
