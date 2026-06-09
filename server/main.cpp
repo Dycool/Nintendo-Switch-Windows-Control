@@ -3478,7 +3478,6 @@ static void flush_rumble_to_udp(int sock, int client_idx) {
 
     sockaddr_in dest{};
     RumblePacket pending[4]{};
-    PrecisionRumblePacket precision_pending[4]{};
     bool has[4]{};
 
     {
@@ -3491,7 +3490,6 @@ static void flush_rumble_to_udp(int sock, int client_idx) {
             uint32_t seq = c.rumble_seq[s];
             if (seq != c.udp_last_rumble_seq[s]) {
                 pending[s] = c.rumble[s];
-                precision_pending[s] = c.precision_rumble[s];
                 c.udp_last_rumble_seq[s] = seq;
                 has[s] = true;
             }
@@ -3519,7 +3517,7 @@ static bool send_ws_binary_frame(WebClient* c, const uint8_t* payload, size_t le
 
     const size_t hdr = 2;
     const size_t total = hdr + len;
-    uint8_t small_frame[2 + sizeof(PrecisionRumblePacket)] = {};
+    uint8_t small_frame[2 + sizeof(RumblePacket)] = {};
     if (total > sizeof(small_frame)) return false;
 
     small_frame[0] = 0x82; // FIN + binary
@@ -4034,7 +4032,7 @@ static void web_server_thread(int web_port, uint16_t udp_port, WebServerMode mod
     for (int i = 0; i < MAX_WS_CLIENTS; i++) { pfds[i+1].fd = -1; }
 
     while (g_running.load(std::memory_order_relaxed)) {
-        // Push pending Precision rumble events back to browser/mobile WebSocket clients.
+        // Push pending classic NSVR rumble events back to browser/mobile WebSocket clients.
         for (int i = 0; i < n_clients; i++)
             if (clients[i].state == WebClient::WS_ACTIVE)
                 flush_rumble_to_ws(&clients[i]);

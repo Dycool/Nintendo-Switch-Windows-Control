@@ -32,7 +32,7 @@ targets:
         INFOPLIST_FILE: NSControl/Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: NSControl/ProtocolBridge.h
         HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/../shared"
-        OTHER_LDFLAGS: "-framework CoreMotion -framework UIKit -framework Foundation"
+        OTHER_LDFLAGS: "-framework CoreMotion -framework GameController -framework UIKit -framework Foundation"
         DEVELOPMENT_TEAM: ""
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: ""

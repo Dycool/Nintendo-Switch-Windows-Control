@@ -1,6 +1,7 @@
 import Foundation
 import CoreMotion
 import UIKit
+import GameController
 
 private let kSinglePad: UInt8 = UInt8(NS_FLAG_SINGLE_PAD)
 private let kFrameSize = Int(NS_PROTOCOL_WEB_FRAME_SIZE)
@@ -10,6 +11,7 @@ private let kMotionSampleCount = Int(NS_PROTOCOL_MOTION_SAMPLE_COUNT)
 
 enum BridgeClientMode {
     case touchControls
+    case controllerHub
 }
 
 private func normalizeSystemShortcuts(_ buttonsIn: UInt16) -> UInt16 {
@@ -45,6 +47,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     private var seq: UInt32 = 0
     private let seqLock = NSLock()
     private var connected = false
+    private var currentMode: BridgeClientMode = .touchControls
     private var activeHost: String? = nil
     private var sessionToken: UInt64 = 0
     private let queue = DispatchQueue(label: "bridge", qos: .userInitiated)
@@ -56,6 +59,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     private let phoneMotionLock = NSLock()
     private var nativePhoneMotionSamples: [Data] = []
     private var lastPhoneHapticAt: TimeInterval = 0
+    private var controllerMotionSamples: [[Data]] = Array(repeating: [], count: Int(NS_PROTOCOL_PAD_COUNT))
 
     private func nextSeq() -> UInt32 {
         seqLock.lock()
@@ -79,6 +83,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         let key = url.absoluteString
         if activeHost == key && ws != nil { return }
         disconnect()
+        currentMode = mode
         activeHost = key
         sessionToken &+= 1
         var req = URLRequest(url: url)
@@ -127,8 +132,9 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         touchPad = Data(count: kPadSize)
         lastTouchPadAt = Date.distantPast
         objc_sync_exit(self)
-        phoneHapticRumble(low: 0, high: 0)
+        phoneHapticRumble(low: 0, high: 0, duration10Ms: 0)
         stopNativePhoneMotion()
+        stopControllerHub()
         if hadClient { DispatchQueue.main.async { self.onStatus?("Disconnected") } }
     }
 
@@ -136,8 +142,12 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
                     webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) {
         connected = true
-        DispatchQueue.main.async { self.onStatus?("Connected") }
-        startNativePhoneMotion()
+        DispatchQueue.main.async { self.onStatus?(self.currentMode == .controllerHub ? "Controller Hub connected" : "Connected") }
+        if currentMode == .touchControls {
+            startNativePhoneMotion()
+        } else {
+            startControllerHub()
+        }
         let token = sessionToken
         startSendLoop(token: token)
     }
@@ -149,6 +159,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         connected = false
         activeHost = nil
         stopNativePhoneMotion()
+        stopControllerHub()
         DispatchQueue.main.async { self.onStatus?("Disconnected") }
     }
 
@@ -210,6 +221,10 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func sendFrame() {
+        if currentMode == .controllerHub {
+            sendControllerHubFrame()
+            return
+        }
         var frame = Data(count: kFrameSize)
         let timestampUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
         let frameSeq = nextSeq()
@@ -317,13 +332,25 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
             guard let self = self, self.sessionToken == token else { return }
             switch result {
             case .success(let msg):
-                if case .data(let d) = msg, d.count >= 8 {
-                    let subpad = Int(d[d.startIndex + 4])
-                    let low = d[d.startIndex + 5]
-                    let high = d[d.startIndex + 6]
-                    DispatchQueue.main.async {
-                        self.onRumble?(subpad, low, high)
-                        if subpad == 0 { self.phoneHapticRumble(low: low, high: high) }
+                if case .data(let d) = msg, d.count == 8 {
+                    let magic = UInt32(d[d.startIndex]) |
+                        (UInt32(d[d.startIndex + 1]) << 8) |
+                        (UInt32(d[d.startIndex + 2]) << 16) |
+                        (UInt32(d[d.startIndex + 3]) << 24)
+                    if magic == 0x4E535652 { // 'NSVR' little-endian payload
+                        let subpad = Int(d[d.startIndex + 4])
+                        let low = d[d.startIndex + 5]
+                        let high = d[d.startIndex + 6]
+                        let duration = d[d.startIndex + 7]
+                        DispatchQueue.main.async {
+                            self.onRumble?(subpad, low, high)
+                            if self.currentMode == .touchControls {
+                                // Touch mode owns a single virtual pad; accept any subpad while testing.
+                                self.phoneHapticRumble(low: low, high: high, duration10Ms: duration)
+                            } else {
+                                self.controllerRumble(slot: subpad, low: low, high: high, duration10Ms: duration)
+                            }
+                        }
                     }
                 }
                 self.readRumble(token: token)
@@ -333,16 +360,121 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    private func phoneHapticRumble(low: UInt8, high: UInt8) {
-        if low == 0 && high == 0 { return }
+    private func phoneHapticRumble(low: UInt8, high: UInt8, duration10Ms: UInt8 = 3) {
+        if (low == 0 && high == 0) || duration10Ms == 0 { return }
         let now = Date().timeIntervalSinceReferenceDate
-        if now - lastPhoneHapticAt < 0.045 { return }
+        // Desktop ns-client stretches short classic rumble pulses to roughly
+        // 250 ms; do the same conceptually by not rate-limiting too hard.
+        if now - lastPhoneHapticAt < 0.10 { return }
         lastPhoneHapticAt = now
-        let intensity = max(0.15, min(1.0, CGFloat(max(low, high)) / 255.0))
+        let intensity = max(0.25, min(1.0, CGFloat(max(low, high)) / 255.0))
         DispatchQueue.main.async {
-            let generator = UIImpactFeedbackGenerator(style: .medium)
+            let generator = UIImpactFeedbackGenerator(style: .heavy)
             generator.prepare()
             generator.impactOccurred(intensity: intensity)
         }
+    }
+
+    // MARK: - Controller Hub
+
+    private func startControllerHub() {
+        controllerMotionSamples = Array(repeating: [], count: Int(NS_PROTOCOL_PAD_COUNT))
+        GCController.startWirelessControllerDiscovery(completionHandler: nil)
+    }
+
+    private func stopControllerHub() {
+        GCController.stopWirelessControllerDiscovery()
+        controllerMotionSamples = Array(repeating: [], count: Int(NS_PROTOCOL_PAD_COUNT))
+    }
+
+    private func sendControllerHubFrame() {
+        var frame = Data(count: kFrameSize)
+        let timestampUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
+        let frameSeq = nextSeq()
+        frame.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            ns_web_frame_init(base, 0, frameSeq, timestampUs)
+        }
+
+        let controllers = Array(GCController.controllers().prefix(Int(NS_PROTOCOL_PAD_COUNT)))
+        for (slot, controller) in controllers.enumerated() {
+            var pad = padForController(controller, slot: slot)
+            frame.withUnsafeMutableBytes { frameRaw in
+                pad.withUnsafeBytes { padRaw in
+                    guard let frameBase = frameRaw.bindMemory(to: UInt8.self).baseAddress,
+                          let padBase = padRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                    ns_web_frame_set_pad(frameBase, Int32(slot), padBase)
+                }
+            }
+        }
+        ws?.send(.data(frame)) { _ in }
+    }
+
+    private func padForController(_ controller: GCController, slot: Int) -> Data {
+        var pad = neutralPad()
+        guard let gp = controller.extendedGamepad else { return pad }
+        var buttons: UInt16 = 0
+        if gp.buttonX.isPressed { buttons |= UInt16(NS_BTN_Y) }
+        if gp.buttonA.isPressed { buttons |= UInt16(NS_BTN_B) }
+        if gp.buttonB.isPressed { buttons |= UInt16(NS_BTN_A) }
+        if gp.buttonY.isPressed { buttons |= UInt16(NS_BTN_X) }
+        if gp.leftShoulder.isPressed { buttons |= UInt16(NS_BTN_L) }
+        if gp.rightShoulder.isPressed { buttons |= UInt16(NS_BTN_R) }
+        if gp.leftTrigger.value > 0.5 { buttons |= UInt16(NS_BTN_ZL) }
+        if gp.rightTrigger.value > 0.5 { buttons |= UInt16(NS_BTN_ZR) }
+        if gp.buttonOptions?.isPressed == true { buttons |= UInt16(NS_BTN_MINUS) }
+        if gp.buttonMenu.isPressed { buttons |= UInt16(NS_BTN_PLUS) }
+        if gp.leftThumbstickButton?.isPressed == true { buttons |= UInt16(NS_BTN_LSTICK) }
+        if gp.rightThumbstickButton?.isPressed == true { buttons |= UInt16(NS_BTN_RSTICK) }
+        if gp.buttonHome?.isPressed == true { buttons |= UInt16(NS_BTN_HOME) }
+
+        var hid = Data(count: Int(NS_PROTOCOL_HID_SIZE))
+        hid.withUnsafeMutableBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            ns_hid_write_controller(base, buttons,
+                                    gp.dpad.up.isPressed ? 1 : 0,
+                                    gp.dpad.down.isPressed ? 1 : 0,
+                                    gp.dpad.left.isPressed ? 1 : 0,
+                                    gp.dpad.right.isPressed ? 1 : 0,
+                                    gp.leftThumbstick.xAxis.value,
+                                    -gp.leftThumbstick.yAxis.value,
+                                    gp.rightThumbstick.xAxis.value,
+                                    -gp.rightThumbstick.yAxis.value,
+                                    1)
+        }
+        pad.withUnsafeMutableBytes { padRaw in
+            hid.withUnsafeBytes { hidRaw in
+                guard let padBase = padRaw.bindMemory(to: UInt8.self).baseAddress,
+                      let hidBase = hidRaw.bindMemory(to: UInt8.self).baseAddress else { return }
+                ns_pad_set_hid(padBase, hidBase)
+            }
+        }
+
+        if let motion = controller.motion {
+            var sample = Data(count: kMotionSize)
+            sample.withUnsafeMutableBytes { raw in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+                ns_motion_from_apple(base,
+                                     Float(motion.gravity.x), Float(motion.gravity.y), Float(motion.gravity.z),
+                                     Float(motion.rotationRate.x), Float(motion.rotationRate.y), Float(motion.rotationRate.z))
+            }
+            if slot < controllerMotionSamples.count {
+                controllerMotionSamples[slot].append(sample)
+                if controllerMotionSamples[slot].count > kMotionSampleCount {
+                    controllerMotionSamples[slot].removeFirst(controllerMotionSamples[slot].count - kMotionSampleCount)
+                }
+                if controllerMotionSamples[slot].count >= kMotionSampleCount {
+                    mergeMotionSamples(controllerMotionSamples[slot], into: &pad)
+                }
+            }
+        }
+        return pad
+    }
+
+    private func controllerRumble(slot: Int, low: UInt8, high: UInt8, duration10Ms: UInt8) {
+        // iOS exposes controller haptics through CoreHaptics engines per controller.
+        // Keep this no-crash for now; touch haptics are handled by phoneHapticRumble.
+        guard currentMode == .controllerHub, slot >= 0 else { return }
+        DispatchQueue.main.async { self.onRumble?(slot, low, high) }
     }
 }

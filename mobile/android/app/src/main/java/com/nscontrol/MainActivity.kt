@@ -5,6 +5,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.hardware.input.InputManager
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
@@ -12,6 +13,10 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
+import android.view.HapticFeedbackConstants
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
@@ -35,6 +40,7 @@ import okio.ByteString.Companion.toByteString
 import org.json.JSONArray
 import java.net.URI
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
@@ -76,8 +82,81 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var lastBridgeFrameParseMs: Long = 0
 
     private enum class Page { MAIN_MENU, TOUCH_CONTROLS, EDITOR }
+    private enum class ClientMode { NONE, TOUCH, HUB }
+
+    private class PhysicalPad {
+        var deviceId: Int = -1
+        var name: String = "Empty"
+        var present: Boolean = false
+        var buttons: Int = 0
+        var dpadUp: Boolean = false
+        var dpadDown: Boolean = false
+        var dpadLeft: Boolean = false
+        var dpadRight: Boolean = false
+        var lx: Int = 128
+        var ly: Int = 128
+        var rx: Int = 128
+        var ry: Int = 128
+        var hasMotion: Boolean = false
+        var hasRumble: Boolean = false
+        var hasGyro: Boolean = false
+        val motionSamples: Array<ByteArray> = Array(Protocol.MOTION_SAMPLE_COUNT) { Protocol.neutralMotion() }
+        var motionSampleCount: Int = 0
+
+        fun reset() {
+            deviceId = -1
+            name = "Empty"
+            present = false
+            buttons = 0
+            dpadUp = false
+            dpadDown = false
+            dpadLeft = false
+            dpadRight = false
+            lx = 128; ly = 128; rx = 128; ry = 128
+            hasMotion = false
+            hasRumble = false
+            hasGyro = false
+            motionSampleCount = 0
+            for (i in 0 until Protocol.MOTION_SAMPLE_COUNT) motionSamples[i].fill(0)
+        }
+
+        fun hid(): ByteArray {
+            val hat = when {
+                dpadUp && dpadRight -> Protocol.HAT_NE
+                dpadUp && dpadLeft -> Protocol.HAT_NW
+                dpadDown && dpadRight -> Protocol.HAT_SE
+                dpadDown && dpadLeft -> Protocol.HAT_SW
+                dpadUp -> Protocol.HAT_N
+                dpadRight -> Protocol.HAT_E
+                dpadDown -> Protocol.HAT_S
+                dpadLeft -> Protocol.HAT_W
+                else -> Protocol.HAT_NEUTRAL
+            }
+            return Protocol.hid(buttons, hat, lx, ly, rx, ry, present)
+        }
+    }
+
     private var currentPage = Page.MAIN_MENU
     private val pageStack = mutableListOf<Page>()
+    @Volatile private var activeClientMode = ClientMode.NONE
+
+    private lateinit var inputManager: InputManager
+    private val physicalLock = Any()
+    private val physicalPads = Array(Protocol.PAD_COUNT) { PhysicalPad() }
+    private val physicalGravity = Array(Protocol.PAD_COUNT) { FloatArray(3) }
+    private val physicalAccel = Array(Protocol.PAD_COUNT) { FloatArray(3) }
+    private val physicalGyro = Array(Protocol.PAD_COUNT) { FloatArray(3) }
+    private val physicalHasGravity = BooleanArray(Protocol.PAD_COUNT)
+    private val physicalHasAccel = BooleanArray(Protocol.PAD_COUNT)
+    private val physicalHasGyro = BooleanArray(Protocol.PAD_COUNT)
+    private val physicalSensorManagers = arrayOfNulls<SensorManager>(Protocol.PAD_COUNT)
+    private val physicalSensorListeners = arrayOfNulls<SensorEventListener>(Protocol.PAD_COUNT)
+
+    private val inputDeviceListener = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) { if (activeClientMode == ClientMode.HUB) runOnUiThread { scanPhysicalControllers() } }
+        override fun onInputDeviceRemoved(deviceId: Int) { if (activeClientMode == ClientMode.HUB) runOnUiThread { scanPhysicalControllers() } }
+        override fun onInputDeviceChanged(deviceId: Int) { if (activeClientMode == ClientMode.HUB) runOnUiThread { scanPhysicalControllers() } }
+    }
 
     private var rumbleLow = 0
     private var rumbleHigh = 0
@@ -136,6 +215,9 @@ class MainActivity : AppCompatActivity() {
             hostInput.setSelection(it.length)
         }
 
+        inputManager = getSystemService(Context.INPUT_SERVICE) as InputManager
+        inputManager.registerInputDeviceListener(inputDeviceListener, null)
+
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
         accelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -161,7 +243,7 @@ class MainActivity : AppCompatActivity() {
         statusText.text = "Loaded"
     }
 
-    // WebSocket to the Raspberry Pi backend. Only Touch Controls owns a session in this native-mobile v1.
+    // WebSocket to the Raspberry Pi backend. Either Controller Hub or Touch Controls owns the only live session.
     private fun connectWs(): Boolean {
         return try {
             val wsUrl = normalizeWsUrl(host)
@@ -267,7 +349,7 @@ class MainActivity : AppCompatActivity() {
         sending = true
         Thread {
             try {
-                startPhoneSensors()
+                if (activeClientMode == ClientMode.TOUCH) startPhoneSensors()
                 while (sending && controlClientActive && senderToken.get() == token) {
                     sendFrame()
                     Thread.sleep(4)
@@ -282,6 +364,7 @@ class MainActivity : AppCompatActivity() {
                 if (senderToken.get() == token) {
                     sending = false
                     stopPhoneSensors()
+                    if (activeClientMode != ClientMode.HUB) stopPhysicalControllerSensors()
                 }
             }
         }.start()
@@ -303,15 +386,29 @@ class MainActivity : AppCompatActivity() {
             val timestampUs = System.currentTimeMillis() * 1000L
             val frame = Protocol.initFrame(flags, seq.getAndIncrement(), timestampUs)
 
-            if (touchActive) {
-                val now = SystemClock.uptimeMillis()
-                val hid = if (now - lastTouchFrameMs <= 500L) {
-                    touchHid ?: touchFrame?.let { Protocol.extractPad0HidFromWebFrame(it) } ?: Protocol.neutralHid()
-                } else {
-                    Protocol.neutralHid()
+            when {
+                activeClientMode == ClientMode.TOUCH && touchActive -> {
+                    val now = SystemClock.uptimeMillis()
+                    val hid = if (now - lastTouchFrameMs <= 500L) {
+                        touchHid ?: touchFrame?.let { Protocol.extractPad0HidFromWebFrame(it) } ?: Protocol.neutralHid()
+                    } else {
+                        Protocol.neutralHid()
+                    }
+                    Protocol.setFrameHid(frame, 0, hid)
+                    phoneMotionSamples()?.let { Protocol.setFrameMotionSamples(frame, 0, it) }
                 }
-                Protocol.setFrameHid(frame, 0, hid)
-                phoneMotionSamples()?.let { Protocol.setFrameMotionSamples(frame, 0, it) }
+                activeClientMode == ClientMode.HUB && !forceNeutral -> {
+                    synchronized(physicalLock) {
+                        for (i in 0 until Protocol.PAD_COUNT) {
+                            val pad = physicalPads[i]
+                            if (!pad.present) continue
+                            Protocol.setFrameHid(frame, i, pad.hid())
+                            if (pad.hasMotion && pad.motionSampleCount >= Protocol.MOTION_SAMPLE_COUNT) {
+                                Protocol.setFrameMotionSamples(frame, i, Array(Protocol.MOTION_SAMPLE_COUNT) { j -> pad.motionSamples[j].copyOf() })
+                            }
+                        }
+                    }
+                }
             }
 
             if (!socket.send(frame.toByteString())) throw IllegalStateException("WebSocket send queue rejected frame")
@@ -404,15 +501,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun routeRumble(subpad: Int, low: Int, high: Int, duration10Ms: Int) {
-        // Native mobile v1 owns one logical pad. Accept any subpad so server-side
-        // remaps cannot make phone haptics disappear.
         if (!controlClientActive) return
-        phoneRumble(low, high, duration10Ms)
+        when (activeClientMode) {
+            ClientMode.HUB -> physicalRumble(subpad, low, high, duration10Ms)
+            ClientMode.TOUCH -> {
+                // Touch mode owns one virtual pad. The current backend should report
+                // subpad 0 for this session, but accept any subpad while testing so
+                // a temporary server-side mapping cannot make haptics vanish.
+                phoneRumble(low, high, duration10Ms)
+            }
+            ClientMode.NONE -> Unit
+        }
     }
 
     private fun phoneRumble(low: Int, high: Int, duration10Ms: Int = 0) {
         try {
-            val v = vibrator ?: return
+            val v = vibrator
             val neutral = (low == 0 && high == 0) || duration10Ms == 0
             val now = SystemClock.uptimeMillis()
             if (neutral) {
@@ -420,7 +524,7 @@ class MainActivity : AppCompatActivity() {
                 rumbleHigh = 0
                 rumbleUntilMs = 0L
                 rumbleLastSetMs = now
-                v.cancel()
+                v?.cancel()
                 Log.d(TAG, "rumble stop")
                 return
             }
@@ -441,20 +545,26 @@ class MainActivity : AppCompatActivity() {
             rumbleUntilMs = now + durationMs
             rumbleLastSetMs = now
 
-            if (Build.VERSION.SDK_INT >= 26) {
-                val amp = if (v.hasAmplitudeControl()) strength.coerceAtLeast(64) else VibrationEffect.DEFAULT_AMPLITUDE
-                v.vibrate(VibrationEffect.createOneShot(durationMs, amp))
-            } else {
-                @Suppress("DEPRECATION")
-                v.vibrate(durationMs)
-            }
-            Log.d(TAG, "rumble start low=$low high=$high durationMs=$durationMs")
+            val didVibrate = if (v != null && v.hasVibrator()) {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    val amp = if (v.hasAmplitudeControl()) strength.coerceAtLeast(80) else VibrationEffect.DEFAULT_AMPLITUDE
+                    v.vibrate(VibrationEffect.createOneShot(durationMs, amp))
+                } else {
+                    @Suppress("DEPRECATION")
+                    v.vibrate(durationMs)
+                }
+                true
+            } else false
+            // Some devices expose weak/disabled vibrator access to WebView apps.
+            // Fire a platform haptic too; it is harmless if the real vibrator worked.
+            try { webView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) } catch (_: Throwable) {}
+            Log.d(TAG, "rumble start low=$low high=$high durationMs=$durationMs didVibrate=$didVibrate")
         } catch (t: Throwable) {
             Log.w(TAG, "phone rumble failed", t)
         }
     }
 
-    private fun touchClientActive(): Boolean = controlClientActive && currentPage == Page.TOUCH_CONTROLS
+    private fun touchClientActive(): Boolean = controlClientActive && activeClientMode == ClientMode.TOUCH && currentPage == Page.TOUCH_CONTROLS
 
     private fun setupWebView() {
         val baseUserAgent = webView.settings.userAgentString ?: ""
@@ -493,6 +603,23 @@ class MainActivity : AppCompatActivity() {
                           if (touch) touch.style.display = 'inline-block';
                           var editor = document.getElementById('btnEditor');
                           if (editor) editor.style.display = 'inline-block';
+                          var group = document.querySelector('.btn-group');
+                          if (group && !document.getElementById('btnHubStart')) {
+                            var start = document.createElement('button');
+                            start.id = 'btnHubStart'; start.textContent = 'Controller Hub';
+                            start.style.cssText = 'background:#e8f5e9;border-color:#a5d6a7;';
+                            start.onclick = function(){ if (window.NSBridge && NSBridge.onHubStart) NSBridge.onHubStart(); };
+                            var stop = document.createElement('button');
+                            stop.id = 'btnHubStop'; stop.textContent = 'Stop Hub';
+                            stop.onclick = function(){ if (window.NSBridge && NSBridge.onHubStop) NSBridge.onHubStop(); };
+                            var refresh = document.createElement('button');
+                            refresh.id = 'btnHubRefresh'; refresh.textContent = 'Refresh Pads';
+                            refresh.onclick = function(){ if (window.NSBridge && NSBridge.onHubRefresh) NSBridge.onHubRefresh(); };
+                            group.insertBefore(start, group.firstChild);
+                            group.insertBefore(stop, start.nextSibling);
+                            group.insertBefore(refresh, stop.nextSibling);
+                          }
+                          if (window.NSBridge && NSBridge.onHubRefresh) NSBridge.onHubRefresh();
                         })();
                     """.trimIndent(), null)
                 }
@@ -566,6 +693,15 @@ class MainActivity : AppCompatActivity() {
         fun onClose() { runOnUiThread { deactivateControlClient() } }
 
         @JavascriptInterface
+        fun onHubStart() { runOnUiThread { activateControllerHub() } }
+
+        @JavascriptInterface
+        fun onHubStop() { runOnUiThread { deactivateControlClient(); updateHubStatusOnPage("Hub stopped") } }
+
+        @JavascriptInterface
+        fun onHubRefresh() { runOnUiThread { scanPhysicalControllers(); updateHubStatusOnPage() } }
+
+        @JavascriptInterface
         fun onBack() { runOnUiThread { goBack() } }
     }
 
@@ -584,19 +720,329 @@ class MainActivity : AppCompatActivity() {
         return buttons
     }
 
+    private fun activateControllerHub() {
+        if (controlClientActive && activeClientMode == ClientMode.HUB) {
+            scanPhysicalControllers()
+            updateHubStatusOnPage("Hub already running")
+            return
+        }
+        deactivateControlClient()
+        currentPage = Page.MAIN_MENU
+        activeClientMode = ClientMode.HUB
+        controlClientActive = true
+        scanPhysicalControllers()
+        updateHubStatusOnPage("Connecting hub...")
+        if (!connectWs()) {
+            controlClientActive = false
+            activeClientMode = ClientMode.NONE
+            updateHubStatusOnPage("Hub connection failed")
+        }
+    }
+
+    private fun scanPhysicalControllers() {
+        if (!::inputManager.isInitialized) return
+        synchronized(physicalLock) {
+            val oldByDevice = physicalPads.filter { it.present }.associateBy { it.deviceId }
+            stopPhysicalControllerSensorsLocked(clearPads = false)
+            for (pad in physicalPads) pad.reset()
+
+            val devices = InputDevice.getDeviceIds()
+                .mapNotNull { InputDevice.getDevice(it) }
+                .filter { isControllerDevice(it) }
+                .take(Protocol.PAD_COUNT)
+
+            for ((slot, device) in devices.withIndex()) {
+                val prev = oldByDevice[device.id]
+                val pad = physicalPads[slot]
+                pad.deviceId = device.id
+                pad.name = device.name ?: "Controller ${slot + 1}"
+                pad.present = true
+                pad.hasRumble = deviceHasVibrator(device)
+                if (prev != null) {
+                    pad.buttons = prev.buttons; pad.dpadUp = prev.dpadUp; pad.dpadDown = prev.dpadDown
+                    pad.dpadLeft = prev.dpadLeft; pad.dpadRight = prev.dpadRight
+                    pad.lx = prev.lx; pad.ly = prev.ly; pad.rx = prev.rx; pad.ry = prev.ry
+                }
+                startPhysicalControllerSensorsLocked(slot, device)
+            }
+        }
+        updateHubStatusOnPage()
+    }
+
+    private fun isControllerDevice(device: InputDevice): Boolean {
+        val sources = device.sources
+        val gamepad = (sources and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+        val joystick = (sources and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+        return gamepad || joystick
+    }
+
+    private fun slotForDeviceIdLocked(deviceId: Int): Int = physicalPads.indexOfFirst { it.present && it.deviceId == deviceId }
+
+    private fun hatFromDpad(up: Boolean, down: Boolean, left: Boolean, right: Boolean): Int = when {
+        up && right -> Protocol.HAT_NE
+        up && left -> Protocol.HAT_NW
+        down && right -> Protocol.HAT_SE
+        down && left -> Protocol.HAT_SW
+        up -> Protocol.HAT_N
+        right -> Protocol.HAT_E
+        down -> Protocol.HAT_S
+        left -> Protocol.HAT_W
+        else -> Protocol.HAT_NEUTRAL
+    }
+
+    private fun axisToByte(value: Float): Int {
+        val v = value.coerceIn(-1.0f, 1.0f)
+        return ((v + 1.0f) * 127.5f).roundToInt().coerceIn(0, 255)
+    }
+
+    private fun centeredAxis(event: MotionEvent, device: InputDevice?, axis: Int): Float {
+        val value = event.getAxisValue(axis)
+        val flat = device?.getMotionRange(axis, event.source)?.flat ?: 0.05f
+        return if (abs(value) <= flat) 0.0f else value.coerceIn(-1.0f, 1.0f)
+    }
+
+    private fun buttonBitForKeyCode(code: Int): Int = when (code) {
+        KeyEvent.KEYCODE_BUTTON_A -> Protocol.BTN_B
+        KeyEvent.KEYCODE_BUTTON_B -> Protocol.BTN_A
+        KeyEvent.KEYCODE_BUTTON_X -> Protocol.BTN_Y
+        KeyEvent.KEYCODE_BUTTON_Y -> Protocol.BTN_X
+        KeyEvent.KEYCODE_BUTTON_L1 -> Protocol.BTN_L
+        KeyEvent.KEYCODE_BUTTON_R1 -> Protocol.BTN_R
+        KeyEvent.KEYCODE_BUTTON_L2 -> Protocol.BTN_ZL
+        KeyEvent.KEYCODE_BUTTON_R2 -> Protocol.BTN_ZR
+        KeyEvent.KEYCODE_BUTTON_SELECT, KeyEvent.KEYCODE_BACK -> Protocol.BTN_MINUS
+        KeyEvent.KEYCODE_BUTTON_START -> Protocol.BTN_PLUS
+        KeyEvent.KEYCODE_BUTTON_THUMBL -> Protocol.BTN_LSTICK
+        KeyEvent.KEYCODE_BUTTON_THUMBR -> Protocol.BTN_RSTICK
+        KeyEvent.KEYCODE_BUTTON_MODE -> Protocol.BTN_HOME
+        else -> 0
+    }
+
+    private fun handleControllerKey(event: KeyEvent): Boolean {
+        if (activeClientMode != ClientMode.HUB || !controlClientActive) return false
+        val actionDown = event.action == KeyEvent.ACTION_DOWN
+        if (!actionDown && event.action != KeyEvent.ACTION_UP) return false
+        var handled = false
+        synchronized(physicalLock) {
+            val slot = slotForDeviceIdLocked(event.deviceId)
+            if (slot < 0) return false
+            val pad = physicalPads[slot]
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_DPAD_UP -> { pad.dpadUp = actionDown; handled = true }
+                KeyEvent.KEYCODE_DPAD_DOWN -> { pad.dpadDown = actionDown; handled = true }
+                KeyEvent.KEYCODE_DPAD_LEFT -> { pad.dpadLeft = actionDown; handled = true }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> { pad.dpadRight = actionDown; handled = true }
+                else -> {
+                    val bit = buttonBitForKeyCode(event.keyCode)
+                    if (bit != 0) {
+                        pad.buttons = if (actionDown) pad.buttons or bit else pad.buttons and bit.inv()
+                        handled = true
+                    }
+                }
+            }
+        }
+        return handled
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (handleControllerKey(event)) return true
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        if (activeClientMode == ClientMode.HUB && controlClientActive &&
+            (event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK &&
+            event.action == MotionEvent.ACTION_MOVE) {
+            synchronized(physicalLock) {
+                val slot = slotForDeviceIdLocked(event.deviceId)
+                if (slot >= 0) {
+                    val device = event.device
+                    val pad = physicalPads[slot]
+                    pad.lx = axisToByte(centeredAxis(event, device, MotionEvent.AXIS_X))
+                    pad.ly = axisToByte(centeredAxis(event, device, MotionEvent.AXIS_Y))
+                    pad.rx = axisToByte(centeredAxis(event, device, MotionEvent.AXIS_Z))
+                    pad.ry = axisToByte(centeredAxis(event, device, MotionEvent.AXIS_RZ))
+                    val l2 = maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE))
+                    val r2 = maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS))
+                    if (l2 > 0.5f) pad.buttons = pad.buttons or Protocol.BTN_ZL else pad.buttons = pad.buttons and Protocol.BTN_ZL.inv()
+                    if (r2 > 0.5f) pad.buttons = pad.buttons or Protocol.BTN_ZR else pad.buttons = pad.buttons and Protocol.BTN_ZR.inv()
+                    val hx = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+                    val hy = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+                    pad.dpadLeft = hx < -0.5f; pad.dpadRight = hx > 0.5f
+                    pad.dpadUp = hy < -0.5f; pad.dpadDown = hy > 0.5f
+                    return true
+                }
+            }
+        }
+        return super.onGenericMotionEvent(event)
+    }
+
+    private fun deviceHasVibrator(device: InputDevice): Boolean = try {
+        if (Build.VERSION.SDK_INT >= 31) device.vibratorManager.vibratorIds.isNotEmpty() else {
+            @Suppress("DEPRECATION")
+            device.vibrator.hasVibrator()
+        }
+    } catch (_: Throwable) { false }
+
+    private fun physicalRumble(subpad: Int, low: Int, high: Int, duration10Ms: Int) {
+        if (subpad !in 0 until Protocol.PAD_COUNT) return
+        val deviceId = synchronized(physicalLock) { physicalPads[subpad].deviceId }
+        if (deviceId < 0) return
+        val device = InputDevice.getDevice(deviceId) ?: return
+        val neutral = (low == 0 && high == 0) || duration10Ms == 0
+        val durationMs = if (neutral) 0L else maxOf(250L, duration10Ms.coerceIn(1, 255) * 10L)
+        val strength = maxOf(low, high).coerceIn(1, 255)
+        try {
+            val vib: Vibrator? = if (Build.VERSION.SDK_INT >= 31) {
+                device.vibratorManager.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                device.vibrator
+            }
+            if (neutral) {
+                vib?.cancel()
+                Log.d(TAG, "controller rumble stop slot=${subpad + 1}")
+                return
+            }
+            if (vib != null && vib.hasVibrator()) {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    val amp = if (vib.hasAmplitudeControl()) strength.coerceAtLeast(64) else VibrationEffect.DEFAULT_AMPLITUDE
+                    vib.vibrate(VibrationEffect.createOneShot(durationMs, amp))
+                } else {
+                    @Suppress("DEPRECATION")
+                    vib.vibrate(durationMs)
+                }
+                Log.d(TAG, "controller rumble slot=${subpad + 1} low=$low high=$high durationMs=$durationMs")
+            } else {
+                Log.d(TAG, "controller has no vibrator slot=${subpad + 1} ${device.name}")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "controller rumble failed slot=${subpad + 1}", t)
+        }
+    }
+
+    private fun stopAllPhysicalRumble() {
+        for (i in 0 until Protocol.PAD_COUNT) physicalRumble(i, 0, 0, 0)
+    }
+
+    private fun startPhysicalControllerSensorsLocked(slot: Int, device: InputDevice) {
+        if (Build.VERSION.SDK_INT < 31) return
+        try {
+            val sm = device.sensorManager ?: return
+            val gravity = sm.getDefaultSensor(Sensor.TYPE_GRAVITY)
+            val accel = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+            val gyro = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE) ?: return
+            val listener = object : SensorEventListener {
+                override fun onSensorChanged(event: SensorEvent) {
+                    synchronized(physicalLock) {
+                        if (slot !in 0 until Protocol.PAD_COUNT || physicalPads[slot].deviceId != device.id) return
+                        when (event.sensor.type) {
+                            Sensor.TYPE_GRAVITY -> { for (i in 0 until minOf(3, event.values.size)) physicalGravity[slot][i] = event.values[i]; physicalHasGravity[slot] = true }
+                            Sensor.TYPE_ACCELEROMETER -> { for (i in 0 until minOf(3, event.values.size)) physicalAccel[slot][i] = event.values[i]; physicalHasAccel[slot] = true }
+                            Sensor.TYPE_GYROSCOPE -> { for (i in 0 until minOf(3, event.values.size)) physicalGyro[slot][i] = event.values[i]; physicalHasGyro[slot] = true; pushPhysicalMotionSampleLocked(slot) }
+                        }
+                    }
+                }
+                override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+            }
+            gravity?.let { sm.registerListener(listener, it, SensorManager.SENSOR_DELAY_GAME) }
+            if (gravity == null) accel?.let { sm.registerListener(listener, it, SensorManager.SENSOR_DELAY_GAME) }
+            sm.registerListener(listener, gyro, SensorManager.SENSOR_DELAY_GAME)
+            physicalSensorManagers[slot] = sm
+            physicalSensorListeners[slot] = listener
+            physicalPads[slot].hasGyro = true
+        } catch (t: Throwable) {
+            Log.d(TAG, "controller gyro unavailable slot=${slot + 1}: ${t.message}")
+        }
+    }
+
+    private fun pushPhysicalMotionSampleLocked(slot: Int) {
+        if (!physicalHasGyro[slot] || (!physicalHasGravity[slot] && !physicalHasAccel[slot])) return
+        val accel = if (physicalHasGravity[slot]) physicalGravity[slot] else physicalAccel[slot]
+        val a = remapSensorForDisplay(accel)
+        val g = remapSensorForDisplay(physicalGyro[slot])
+        val accelScale = 4096.0f / Protocol.STANDARD_GRAVITY
+        val gyroScale = 57.29577951308232f * 16.384f
+        val sample = Protocol.motionFromValues(
+            clampMotionShort(-a[0] * accelScale),
+            clampMotionShort(-a[2] * accelScale),
+            clampMotionShort( a[1] * accelScale),
+            gyroDeadzoneShort(clampMotionShort(-g[0] * gyroScale)),
+            gyroDeadzoneShort(clampMotionShort(-g[2] * gyroScale)),
+            gyroDeadzoneShort(clampMotionShort( g[1] * gyroScale)),
+            hasMotion = true
+        )
+        val pad = physicalPads[slot]
+        pad.motionSamples[0] = pad.motionSamples[1]
+        pad.motionSamples[1] = pad.motionSamples[2]
+        pad.motionSamples[2] = sample
+        if (pad.motionSampleCount < Protocol.MOTION_SAMPLE_COUNT) pad.motionSampleCount++
+        pad.hasMotion = pad.motionSampleCount >= Protocol.MOTION_SAMPLE_COUNT
+    }
+
+    private fun stopPhysicalControllerSensors() {
+        synchronized(physicalLock) { stopPhysicalControllerSensorsLocked(clearPads = true) }
+    }
+
+    private fun stopPhysicalControllerSensorsLocked(clearPads: Boolean) {
+        for (i in 0 until Protocol.PAD_COUNT) {
+            try {
+                val sm = physicalSensorManagers[i]
+                val listener = physicalSensorListeners[i]
+                if (sm != null && listener != null) sm.unregisterListener(listener)
+            } catch (_: Throwable) {}
+            physicalSensorManagers[i] = null
+            physicalSensorListeners[i] = null
+            physicalHasGravity[i] = false; physicalHasAccel[i] = false; physicalHasGyro[i] = false
+            if (clearPads) physicalPads[i].reset()
+        }
+    }
+
+    private fun updateHubStatusOnPage(prefix: String? = null) {
+        if (currentPage != Page.MAIN_MENU) return
+        val lines = synchronized(physicalLock) {
+            Array(Protocol.PAD_COUNT) { i ->
+                val p = physicalPads[i]
+                if (!p.present) "P${i + 1}: Empty"
+                else "P${i + 1}: ${p.name}  gyro=${if (p.hasGyro) "yes" else "no"}  rumble=${if (p.hasRumble) "yes" else "no"}"
+            }
+        }
+        val status = prefix ?: when (activeClientMode) {
+            ClientMode.HUB -> "Controller Hub running"
+            ClientMode.TOUCH -> "Touch Controls running"
+            ClientMode.NONE -> "Ready"
+        }
+        fun jsEscape(v: String) = v.replace("\", "\\").replace("'", "\'").replace("\n", " ")
+        val js = buildString {
+            append("(function(){")
+            append("var s=document.getElementById('statusText'); if(s)s.textContent='").append(jsEscape(status)).append("';")
+            for (i in 0 until Protocol.PAD_COUNT) {
+                append("var p=document.getElementById('p").append(i + 1).append("Text'); if(p)p.textContent='").append(jsEscape(lines[i])).append("';")
+            }
+            append("})()")
+        }
+        try { webView.evaluateJavascript(js, null) } catch (_: Throwable) {}
+    }
+
     override fun onDestroy() {
         disconnect()
+        try { if (::inputManager.isInitialized) inputManager.unregisterInputDeviceListener(inputDeviceListener) } catch (_: Throwable) {}
         super.onDestroy()
     }
 
     private fun activateControlClient() {
-        if (controlClientActive) return
+        if (controlClientActive && activeClientMode == ClientMode.TOUCH) return
+        deactivateControlClient()
+        activeClientMode = ClientMode.TOUCH
         touchHid = null
         touchFrame = null
         lastTouchFrameMs = 0
         lastBridgeFrameParseMs = 0
         controlClientActive = true
-        if (!connectWs()) controlClientActive = false
+        if (!connectWs()) {
+            controlClientActive = false
+            activeClientMode = ClientMode.NONE
+        }
     }
 
     private fun deactivateControlClient() {
@@ -611,7 +1057,10 @@ class MainActivity : AppCompatActivity() {
         lastBridgeFrameParseMs = 0
         ws = null
         stopPhoneSensors()
+        stopPhysicalControllerSensors()
+        stopAllPhysicalRumble()
         phoneRumble(0, 0)
+        activeClientMode = ClientMode.NONE
 
         if (closingWs != null) {
             Thread {

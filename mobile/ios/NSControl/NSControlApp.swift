@@ -145,6 +145,12 @@ struct WebViewContainer: UIViewRepresentable {
     }
 
     static let bridgeJS = """
+    window.NSBridge = {
+        onHubStart: function(){ window.webkit.messageHandlers.nsBridge.postMessage({type:'hubStart'}); },
+        onHubStop: function(){ window.webkit.messageHandlers.nsBridge.postMessage({type:'hubStop'}); },
+        onHubRefresh: function(){ window.webkit.messageHandlers.nsBridge.postMessage({type:'hubRefresh'}); },
+        onBack: function(){ window.webkit.messageHandlers.nsBridge.postMessage({type:'back'}); }
+    };
     window.__bridge = {
         connect: function(url) {
             window.webkit.messageHandlers.nsBridge.postMessage({type:'connect',url:url});
@@ -220,6 +226,14 @@ struct WebViewContainer: UIViewRepresentable {
                 let rx = UInt8(max(0, min(255, intValue(dict["rx"], 128))))
                 let ry = UInt8(max(0, min(255, intValue(dict["ry"], 128))))
                 BridgeManager.shared.bridgeTouchState(buttons: buttons, hat: hat, lx: lx, ly: ly, rx: rx, ry: ry)
+            case "hubStart":
+                guard self.parent.page == .mainMenu else { return }
+                BridgeManager.shared.connect(host: self.parent.host, mode: .controllerHub)
+            case "hubStop":
+                BridgeManager.shared.disconnect()
+            case "hubRefresh":
+                // Discovery is handled by GameController; keep this as a harmless UI hook.
+                break
             default:
                 break
             }
@@ -268,6 +282,18 @@ struct WebViewContainer: UIViewRepresentable {
             if (touch) touch.style.display = 'inline-block';
             var editor = document.getElementById('btnEditor');
             if (editor) editor.style.display = 'inline-block';
+            var group = document.querySelector('.btn-group');
+            if (group && !document.getElementById('btnHubStart')) {
+                var start = document.createElement('button');
+                start.id = 'btnHubStart'; start.textContent = 'Controller Hub';
+                start.style.cssText = 'background:#e8f5e9;border-color:#a5d6a7;';
+                start.onclick = function(){ if(window.NSBridge && NSBridge.onHubStart) NSBridge.onHubStart(); };
+                var stop = document.createElement('button');
+                stop.id = 'btnHubStop'; stop.textContent = 'Stop Hub';
+                stop.onclick = function(){ if(window.NSBridge && NSBridge.onHubStop) NSBridge.onHubStop(); };
+                group.insertBefore(start, group.firstChild);
+                group.insertBefore(stop, start.nextSibling);
+            }
         })();
         """
 
