@@ -1,37 +1,108 @@
 package com.nscontrol
 
 object SDLController {
-    init { System.loadLibrary("nsprotocol") }
+    @Volatile private var libraryLoaded = false
+    @Volatile private var initialized = false
+    @Volatile private var permanentlyUnavailable = false
+    @Volatile private var lastError: String = ""
 
-    fun init(): Boolean = nativeInit()
-    fun quit() = nativeQuit()
-    fun poll() = nativePoll()
+    fun isAvailable(): Boolean = !permanentlyUnavailable
+    fun isReady(): Boolean = initialized
+    fun errorText(): String = lastError
 
-    fun padConnected(slot: Int): Boolean = nativePadConnected(slot)
-    fun padButtons(slot: Int): Int = nativePadButtons(slot)
-    fun padDpadUp(slot: Int): Boolean = nativePadDpadUp(slot)
-    fun padDpadDown(slot: Int): Boolean = nativePadDpadDown(slot)
-    fun padDpadLeft(slot: Int): Boolean = nativePadDpadLeft(slot)
-    fun padDpadRight(slot: Int): Boolean = nativePadDpadRight(slot)
-    fun padLX(slot: Int): Float = nativePadLX(slot)
-    fun padLY(slot: Int): Float = nativePadLY(slot)
-    fun padRX(slot: Int): Float = nativePadRX(slot)
-    fun padRY(slot: Int): Float = nativePadRY(slot)
+    private fun ensureLibraryLoaded(): Boolean {
+        if (libraryLoaded) return true
+        if (permanentlyUnavailable) return false
+        return try {
+            System.loadLibrary("nsprotocol")
+            libraryLoaded = true
+            true
+        } catch (t: Throwable) {
+            lastError = t.javaClass.simpleName + ": " + (t.message ?: "native load failed")
+            permanentlyUnavailable = true
+            false
+        }
+    }
 
-    fun padHasMotion(slot: Int): Boolean = nativePadHasMotion(slot)
-    fun padMotion(slot: Int): ShortArray? = nativePadMotion(slot)
+    fun init(): Boolean {
+        if (initialized) return true
+        if (!ensureLibraryLoaded()) return false
+        return try {
+            initialized = nativeInit()
+            if (!initialized && lastError.isEmpty()) lastError = "SDL nativeInit returned false"
+            initialized
+        } catch (t: Throwable) {
+            lastError = t.javaClass.simpleName + ": " + (t.message ?: "native init failed")
+            permanentlyUnavailable = true
+            initialized = false
+            false
+        }
+    }
 
-    fun padRumble(slot: Int, low: Int, high: Int, durationMs: Int = 50) =
-        nativePadRumble(slot, low, high, durationMs)
-    fun padStopRumble(slot: Int) = nativePadStopRumble(slot)
+    fun quit() {
+        if (!initialized) return
+        try { nativeQuit() } catch (_: Throwable) {}
+        initialized = false
+    }
 
-    fun phoneSensorsOpen(): Boolean = nativePhoneSensorsOpen()
-    fun phoneSensorsClose() = nativePhoneSensorsClose()
-    fun phoneSensorsRead(): ShortArray? = nativePhoneSensorsRead()
+    fun poll() {
+        if (!initialized) return
+        try { nativePoll() } catch (_: Throwable) {}
+    }
 
-    fun phoneHapticOpen(): Boolean = nativePhoneHapticOpen()
-    fun phoneHapticClose() = nativePhoneHapticClose()
-    fun phoneHapticRumble(low: Int, high: Int) = nativePhoneHapticRumble(low, high)
+    fun padConnected(slot: Int): Boolean = if (initialized) safeBool { nativePadConnected(slot) } else false
+    fun padButtons(slot: Int): Int = if (initialized) safeInt { nativePadButtons(slot) } else 0
+    fun padDpadUp(slot: Int): Boolean = if (initialized) safeBool { nativePadDpadUp(slot) } else false
+    fun padDpadDown(slot: Int): Boolean = if (initialized) safeBool { nativePadDpadDown(slot) } else false
+    fun padDpadLeft(slot: Int): Boolean = if (initialized) safeBool { nativePadDpadLeft(slot) } else false
+    fun padDpadRight(slot: Int): Boolean = if (initialized) safeBool { nativePadDpadRight(slot) } else false
+    fun padLX(slot: Int): Float = if (initialized) safeFloat { nativePadLX(slot) } else 0.0f
+    fun padLY(slot: Int): Float = if (initialized) safeFloat { nativePadLY(slot) } else 0.0f
+    fun padRX(slot: Int): Float = if (initialized) safeFloat { nativePadRX(slot) } else 0.0f
+    fun padRY(slot: Int): Float = if (initialized) safeFloat { nativePadRY(slot) } else 0.0f
+
+    fun padHasMotion(slot: Int): Boolean = if (initialized) safeBool { nativePadHasMotion(slot) } else false
+    fun padMotion(slot: Int): ShortArray? = if (initialized) safeShortArray { nativePadMotion(slot) } else null
+
+    fun padRumble(slot: Int, low: Int, high: Int, durationMs: Int = 50) {
+        if (initialized) safeUnit { nativePadRumble(slot, low, high, durationMs) }
+    }
+
+    fun padStopRumble(slot: Int) {
+        if (initialized) safeUnit { nativePadStopRumble(slot) }
+    }
+
+    fun phoneSensorsOpen(): Boolean = if (initialized) safeBool { nativePhoneSensorsOpen() } else false
+    fun phoneSensorsClose() { if (initialized) safeUnit { nativePhoneSensorsClose() } }
+    fun phoneSensorsRead(): ShortArray? = if (initialized) safeShortArray { nativePhoneSensorsRead() } else null
+
+    fun phoneHapticOpen(): Boolean = if (initialized) safeBool { nativePhoneHapticOpen() } else false
+    fun phoneHapticClose() { if (initialized) safeUnit { nativePhoneHapticClose() } }
+    fun phoneHapticRumble(low: Int, high: Int) { if (initialized) safeUnit { nativePhoneHapticRumble(low, high) } }
+
+    private inline fun safeUnit(block: () -> Unit) {
+        try { block() } catch (t: Throwable) { noteRuntimeError(t) }
+    }
+
+    private inline fun safeBool(block: () -> Boolean): Boolean {
+        return try { block() } catch (t: Throwable) { noteRuntimeError(t); false }
+    }
+
+    private inline fun safeInt(block: () -> Int): Int {
+        return try { block() } catch (t: Throwable) { noteRuntimeError(t); 0 }
+    }
+
+    private inline fun safeFloat(block: () -> Float): Float {
+        return try { block() } catch (t: Throwable) { noteRuntimeError(t); 0.0f }
+    }
+
+    private inline fun safeShortArray(block: () -> ShortArray?): ShortArray? {
+        return try { block() } catch (t: Throwable) { noteRuntimeError(t); null }
+    }
+
+    private fun noteRuntimeError(t: Throwable) {
+        lastError = t.javaClass.simpleName + ": " + (t.message ?: "native call failed")
+    }
 
     // ─── Native declarations ──────────────────────────────
 

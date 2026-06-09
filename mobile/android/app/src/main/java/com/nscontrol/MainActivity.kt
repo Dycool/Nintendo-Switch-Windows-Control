@@ -109,10 +109,6 @@ class MainActivity : AppCompatActivity() {
             getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
 
-        // Initialize SDL3 gamepad/sensor/haptic subsystem once on app start.
-        if (!SDLController.init()) {
-            statusText.text = "SDL init failed"
-        }
     }
 
     private fun onConnect() {
@@ -225,6 +221,16 @@ class MainActivity : AppCompatActivity() {
         return "$wsScheme://$safeHost$portText$path$query"
     }
 
+    private fun ensureSdlReady(): Boolean {
+        return SDLController.init()
+    }
+
+    private inline fun withSdl(block: () -> Unit) {
+        if (!SDLController.isReady()) return
+        try { block() } catch (_: Throwable) {}
+    }
+
+
     // ═══════════════════════════════
     //  Send loop (~250 Hz)
     // ═══════════════════════════════
@@ -239,8 +245,13 @@ class MainActivity : AppCompatActivity() {
                 // Android SensorManager/Vibrator are used as the reliable phone path;
                 // SDL remains available for controller sensors and as a fallback.
                 startAndroidPhoneSensors()
-                SDLController.phoneSensorsOpen()
-                SDLController.phoneHapticOpen()
+                if (controllerClientActive()) {
+                    ensureSdlReady()
+                }
+                if (SDLController.isReady()) {
+                    SDLController.phoneSensorsOpen()
+                    SDLController.phoneHapticOpen()
+                }
                 while (sending && controlClientActive && senderToken.get() == token) {
                     sendFrame()
                     Thread.sleep(4)
@@ -261,8 +272,10 @@ class MainActivity : AppCompatActivity() {
                 if (senderToken.get() == token) {
                     sending = false
                     stopAndroidPhoneSensors()
-                    SDLController.phoneHapticClose()
-                    SDLController.phoneSensorsClose()
+                    withSdl {
+                        SDLController.phoneHapticClose()
+                        SDLController.phoneSensorsClose()
+                    }
                 }
             }
         }.start()
@@ -286,10 +299,12 @@ class MainActivity : AppCompatActivity() {
         synchronized(sendLock) {
             val socket = socketOverride ?: ws ?: return
 
-            // Poll SDL3 for latest gamepad/sensor state before reading.
-            SDLController.poll()
+            // Poll SDL3 only in physical-controller mode. Touch mode uses Android
+            // SensorManager/Vibrator and should not load native SDL at startup.
+            val sdlReady = !forceNeutral && controllerClientActive() && ensureSdlReady()
+            if (sdlReady) SDLController.poll()
 
-            val anyController = !forceNeutral && controllerClientActive() &&
+            val anyController = sdlReady &&
                 (0 until Protocol.PAD_COUNT).any { SDLController.padConnected(it) }
             val touchActive = !forceNeutral && touchClientActive()
             val flags = flagsOverride ?: if (!anyController && touchActive) Protocol.FLAG_SINGLE_PAD else 0
@@ -350,6 +365,7 @@ class MainActivity : AppCompatActivity() {
         // activity/sensor quirks and uses the same scale + axis map as the PC SDL3 client.
         androidPhoneMotionBytes()?.let { return it }
 
+        if (!SDLController.isReady()) return null
         val m = SDLController.phoneSensorsRead() ?: return null
         return Protocol.motionFromValues(m[0], m[1], m[2], m[3], m[4], m[5], hasMotion = true)
     }
@@ -439,14 +455,14 @@ class MainActivity : AppCompatActivity() {
         if (low == 0 && high == 0) {
             // Stop rumble on the active output type only. Touch mode must not
             // keep physical SDL controllers associated with server slots.
-            if (controllerClientActive() && subpad >= 0 && subpad < Protocol.PAD_COUNT) {
+            if (controllerClientActive() && subpad >= 0 && subpad < Protocol.PAD_COUNT && SDLController.isReady()) {
                 if (SDLController.padConnected(subpad)) SDLController.padStopRumble(subpad)
             }
             if (touchClientActive() && subpad == 0) phoneRumble(0, 0)
             return
         }
 
-        if (controllerClientActive() && subpad >= 0 && subpad < Protocol.PAD_COUNT && SDLController.padConnected(subpad)) {
+        if (controllerClientActive() && subpad >= 0 && subpad < Protocol.PAD_COUNT && ensureSdlReady() && SDLController.padConnected(subpad)) {
             SDLController.padRumble(subpad, low, high, 50)
             return
         }
@@ -493,7 +509,7 @@ class MainActivity : AppCompatActivity() {
             val v = vibrator
             if (low == 0 && high == 0) {
                 v?.cancel()
-                SDLController.phoneHapticRumble(0, 0)
+                withSdl { SDLController.phoneHapticRumble(0, 0) }
                 return
             }
             val strength = maxOf(low, high).coerceIn(0, 255)
@@ -505,7 +521,7 @@ class MainActivity : AppCompatActivity() {
                 v?.vibrate(45L)
             }
         } catch (_: Throwable) {
-            SDLController.phoneHapticRumble(low, high)
+            withSdl { SDLController.phoneHapticRumble(low, high) }
         }
     }
 
@@ -640,7 +656,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         disconnect()
-        SDLController.quit()
+        withSdl { SDLController.quit() }
         super.onDestroy()
     }
 
@@ -670,8 +686,10 @@ class MainActivity : AppCompatActivity() {
         ws = null
 
         // Stop all rumble before closing.
-        for (i in 0 until Protocol.PAD_COUNT) {
-            if (SDLController.padConnected(i)) SDLController.padStopRumble(i)
+        if (SDLController.isReady()) {
+            for (i in 0 until Protocol.PAD_COUNT) {
+                if (SDLController.padConnected(i)) SDLController.padStopRumble(i)
+            }
         }
         phoneRumble(0, 0)
 
