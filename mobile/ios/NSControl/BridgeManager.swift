@@ -282,8 +282,8 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
             bytes.withUnsafeMutableBytes { raw in
                 guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
                 ns_motion_from_apple(base,
-                    Float(motion.gravity.x), Float(motion.gravity.y), Float(motion.gravity.z),
-                    Float(motion.rotationRate.x), Float(motion.rotationRate.y), Float(motion.rotationRate.z))
+                    Float(motion.gravity.x), -Float(motion.gravity.y), Float(motion.gravity.z),
+                    Float(motion.rotationRate.x), -Float(motion.rotationRate.y), Float(motion.rotationRate.z))
             }
             self.phoneMotionLock.lock()
             self.nativePhoneMotionSamples.append(bytes)
@@ -440,8 +440,8 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
             sample.withUnsafeMutableBytes { raw in
                 guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
                 ns_motion_from_apple(base,
-                                     Float(motion.gravity.x), Float(motion.gravity.y), Float(motion.gravity.z),
-                                     Float(motion.rotationRate.x), Float(motion.rotationRate.y), Float(motion.rotationRate.z))
+                                     Float(motion.gravity.x), -Float(motion.gravity.y), Float(motion.gravity.z),
+                                     Float(motion.rotationRate.x), -Float(motion.rotationRate.y), Float(motion.rotationRate.z))
             }
             if slot < controllerMotionSamples.count {
                 controllerMotionSamples[slot].append(sample)
