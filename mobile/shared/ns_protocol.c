@@ -3,6 +3,17 @@
 #include <math.h>
 #include <string.h>
 
+static int s_remap_input[3] = {0, 2, 1};
+static int s_remap_sign[3] = {-1, -1, 1};
+
+void ns_set_motion_remap(int output_axis, int input_axis, int sign) {
+    if (output_axis < 0 || output_axis > 2) return;
+    if (input_axis < 0 || input_axis > 2) input_axis = output_axis;
+    if (sign != -1 && sign != 1) sign = 1;
+    s_remap_input[output_axis] = input_axis;
+    s_remap_sign[output_axis] = sign;
+}
+
 static void ns_write_u16le(uint8_t* p, uint16_t v) {
     p[0] = (uint8_t)(v & 0xFFu);
     p[1] = (uint8_t)((v >> 8) & 0xFFu);
@@ -150,16 +161,18 @@ void ns_motion_from_android(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
                             float gyro_x,
                             float gyro_y,
                             float gyro_z) {
-    const float accel_scale = ns_accel_scale_android();
-    const float gyro_scale = ns_gyro_scale();
+    const float a[3] = {accel_x, accel_y, accel_z};
+    const float g[3] = {gyro_x, gyro_y, gyro_z};
+    const float as = ns_accel_scale_android();
+    const float gs = ns_gyro_scale();
     ns_motion_write_values(out_motion,
-                           ns_clamp_motion(-accel_x * accel_scale),
-                           ns_clamp_motion(-accel_z * accel_scale),
-                           ns_clamp_motion( accel_y * accel_scale),
-                           ns_gyro_deadzone(ns_clamp_motion(-gyro_x * gyro_scale)),
-                           ns_gyro_deadzone(ns_clamp_motion(-gyro_z * gyro_scale)),
-                           ns_gyro_deadzone(ns_clamp_motion( gyro_y * gyro_scale)),
-                           1);
+        ns_clamp_motion(s_remap_sign[0] * a[s_remap_input[0]] * as),
+        ns_clamp_motion(s_remap_sign[1] * a[s_remap_input[1]] * as),
+        ns_clamp_motion(s_remap_sign[2] * a[s_remap_input[2]] * as),
+        ns_gyro_deadzone(ns_clamp_motion(s_remap_sign[0] * g[s_remap_input[0]] * gs)),
+        ns_gyro_deadzone(ns_clamp_motion(s_remap_sign[1] * g[s_remap_input[1]] * gs)),
+        ns_gyro_deadzone(ns_clamp_motion(s_remap_sign[2] * g[s_remap_input[2]] * gs)),
+        1);
 }
 
 void ns_motion_from_apple(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
@@ -169,16 +182,18 @@ void ns_motion_from_apple(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
                           float rotation_x,
                           float rotation_y,
                           float rotation_z) {
-    const float accel_scale = ns_accel_scale_apple();
-    const float gyro_scale = ns_gyro_scale();
+    const float a[3] = {gravity_x, gravity_y, gravity_z};
+    const float g[3] = {rotation_x, rotation_y, rotation_z};
+    const float as = ns_accel_scale_apple();
+    const float gs = ns_gyro_scale();
     ns_motion_write_values(out_motion,
-                           ns_clamp_motion(-gravity_x * accel_scale),
-                           ns_clamp_motion(-gravity_z * accel_scale),
-                           ns_clamp_motion( gravity_y * accel_scale),
-                           ns_gyro_deadzone(ns_clamp_motion(-rotation_x * gyro_scale)),
-                           ns_gyro_deadzone(ns_clamp_motion(-rotation_z * gyro_scale)),
-                           ns_gyro_deadzone(ns_clamp_motion( rotation_y * gyro_scale)),
-                           1);
+        ns_clamp_motion(s_remap_sign[0] * a[s_remap_input[0]] * as),
+        ns_clamp_motion(s_remap_sign[1] * a[s_remap_input[1]] * as),
+        ns_clamp_motion(s_remap_sign[2] * a[s_remap_input[2]] * as),
+        ns_gyro_deadzone(ns_clamp_motion(s_remap_sign[0] * g[s_remap_input[0]] * gs)),
+        ns_gyro_deadzone(ns_clamp_motion(s_remap_sign[1] * g[s_remap_input[1]] * gs)),
+        ns_gyro_deadzone(ns_clamp_motion(s_remap_sign[2] * g[s_remap_input[2]] * gs)),
+        1);
 }
 
 void ns_pad_write_neutral(uint8_t out_pad[NS_PROTOCOL_EXT_PAD_SIZE]) {

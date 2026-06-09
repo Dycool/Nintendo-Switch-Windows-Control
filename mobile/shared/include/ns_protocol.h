@@ -67,6 +67,8 @@ int16_t ns_clamp_motion(float v);
 int16_t ns_gyro_deadzone(int16_t v);
 uint16_t ns_normalize_system_shortcuts(uint16_t buttons);
 
+void ns_set_motion_remap(int output_axis, int input_axis, int sign);
+
 void ns_hid_write_neutral(uint8_t out_hid[NS_PROTOCOL_HID_SIZE]);
 void ns_hid_write(uint8_t out_hid[NS_PROTOCOL_HID_SIZE],
                   uint16_t buttons,
