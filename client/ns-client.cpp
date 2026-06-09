@@ -1857,6 +1857,12 @@ static QIcon app_icon() {
     if (loaded) return cached;
     loaded = true;
 
+    QIcon embedded(":/icon.png");
+    if (!embedded.isNull()) {
+        cached = embedded;
+        return cached;
+    }
+
     const std::string exe_dir = executable_dir();
 
     std::vector<std::string> candidates = {
@@ -1876,7 +1882,10 @@ static QIcon app_icon() {
 
     for (const std::string& p : candidates) {
         QIcon icon(std_to_q(p));
-        if (!icon.isNull()) { cached = icon; return cached; }
+        if (!icon.isNull()) {
+            cached = icon;
+            return cached;
+        }
     }
 
     return {};

@@ -13,6 +13,7 @@ set(NS_CLIENT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/ns-client.cpp")
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
 add_executable(ns-client WIN32 MACOSX_BUNDLE "${NS_CLIENT_SOURCE}")
+set(CMAKE_AUTORCC ON)
 target_compile_definitions(ns-client PRIVATE
     SDL_MAIN_HANDLED
     NS_CLIENT_SOURCE_DIR="${CMAKE_CURRENT_LIST_DIR}"
@@ -23,8 +24,12 @@ if(WIN32 AND TARGET Qt6::EntryPoint)
     target_link_libraries(ns-client PRIVATE Qt6::EntryPoint)
 endif()
 
+target_sources(ns-client PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/resources.qrc")
+
 if(WIN32)
-    target_sources(ns-client PRIVATE "${CMAKE_CURRENT_LIST_DIR}/ns-gui.rc")
+    target_sources(ns-client PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/ns-gui.rc"
+    )
     target_compile_definitions(ns-client PRIVATE
         WIN32_LEAN_AND_MEAN
         NOMINMAX
@@ -33,14 +38,6 @@ if(WIN32)
         _UNICODE
     )
     target_link_libraries(ns-client PRIVATE ws2_32 winmm)
-    add_custom_command(TARGET ns-client POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/icon.png"
-            "$<TARGET_FILE_DIR:ns-client>/icon.png"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/icon.ico"
-            "$<TARGET_FILE_DIR:ns-client>/icon.ico"
-    )
 endif()
 
 if(APPLE)
