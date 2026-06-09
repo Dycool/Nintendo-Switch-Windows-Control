@@ -421,8 +421,8 @@ class MainActivity : AppCompatActivity() {
     private fun pushMotionSampleLocked() {
         if (!hasLatestPhoneGyro || (!hasLatestPhoneGravity && !hasLatestPhoneAccel)) return
 
-        val accel = if (hasLatestPhoneGravity) latestPhoneGravity else latestPhoneAccel
-        val g = latestPhoneGyro
+        val accel = if (hasLatestPhoneGravity) remapSensorForDisplay(latestPhoneGravity) else remapSensorForDisplay(latestPhoneAccel)
+        val g = remapSensorForDisplay(latestPhoneGyro)
         val sample = NativeProtocol.nativePhoneMotion(accel[0], accel[1], accel[2], g[0], g[1], g[2])
 
         latestMotionSamples[0] = latestMotionSamples[1]
