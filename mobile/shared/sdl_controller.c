@@ -140,6 +140,9 @@ static void read_pad_motion(SDL_Gamepad* pad, SdlPadMotion* out) {
     int has_accel = SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, accel, 3);
     int has_gyro = SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3);
     if (has_accel || has_gyro) {
+        // Match the PC SDL3 client: if gyro is available but accel is not,
+        // still report a sane gravity vector instead of az=0.
+        if (!has_accel && has_gyro) accel[1] = ns_standard_gravity();
         out->has_motion = 1;
         convert_motion(accel, gyro, &out->ax, &out->ay, &out->az,
                        &out->gx, &out->gy, &out->gz);
@@ -332,6 +335,8 @@ SdlPadMotion sdl_controller_phone_sensors_read(void) {
     int has_gyro  = C.phone_gyro  ? SDL_GetSensorData(C.phone_gyro, gyro, 3) : 0;
 
     if (has_accel || has_gyro) {
+        // Same fallback as the PC client: gyro-only should keep gravity neutral.
+        if (!has_accel && has_gyro) accel[1] = ns_standard_gravity();
         m.has_motion = 1;
         convert_motion(accel, gyro, &m.ax, &m.ay, &m.az, &m.gx, &m.gy, &m.gz);
     }

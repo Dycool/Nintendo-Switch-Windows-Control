@@ -1,6 +1,6 @@
 name: Build Mobile Apps
 
-on:
+"on":
   push:
     paths:
       - 'mobile/**'
@@ -15,10 +15,10 @@ jobs:
   build-android:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Set up Java 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: zulu
           java-version: '17'
@@ -26,44 +26,57 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Set up Gradle 8.5
-        uses: gradle/actions/setup-gradle@v6
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.5'
 
       - name: Install Android native build tools
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
           yes | sdkmanager --licenses
           sdkmanager --install "cmake;3.22.1" "ndk;26.3.11579264"
 
       - name: Checkout SDL3
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: libsdl-org/SDL
           ref: release-3.4.10
           path: SDL3
           fetch-depth: 1
 
-      - name: Build SDL3 for Android
+      - name: Build and install SDL3 for Android
+        env:
+          SDL3_INSTALL_ROOT: ${{ github.workspace }}/_cache/sdl3-android
         run: |
+          set -euo pipefail
+          ANDROID_NDK="${ANDROID_HOME}/ndk/26.3.11579264"
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            echo "::group::Build SDL3 for ${abi}"
-            cmake -S SDL3 -B "SDL3/build/${abi}" \
-              -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/26.3.11579264/build/cmake/android.toolchain.cmake" \
+            echo "::group::SDL3 ${abi}"
+            cmake -S SDL3 -B "SDL3/build/android-${abi}" -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK}/build/cmake/android.toolchain.cmake" \
               -DANDROID_ABI="${abi}" \
-              -DANDROID_PLATFORM=24 \
-              -DSDL_STATIC=ON \
+              -DANDROID_PLATFORM=26 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX="${SDL3_INSTALL_ROOT}/${abi}" \
               -DSDL_SHARED=OFF \
-              -DSDL_TEST=OFF \
-              -DSDL_X11=OFF \
-              -DSDL_WAYLAND=OFF
-            cmake --build "SDL3/build/${abi}" -- -j"$(nproc)"
+              -DSDL_STATIC=ON \
+              -DSDL_TEST_LIBRARY=OFF \
+              -DSDL_TESTS=OFF \
+              -DSDL_EXAMPLES=OFF \
+              -DSDL_INSTALL=ON
+            cmake --build "SDL3/build/android-${abi}" --config Release --parallel 2
+            cmake --install "SDL3/build/android-${abi}" --config Release
+            test -d "${SDL3_INSTALL_ROOT}/${abi}/lib/cmake/SDL3"
             echo "::endgroup::"
           done
 
       - name: Build debug APK
         working-directory: mobile/android
-        run: gradle :app:assembleDebug --no-daemon
+        env:
+          SDL3_ANDROID_ROOT: ${{ github.workspace }}/_cache/sdl3-android
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
 
       - name: Stage Android APK
         run: |
@@ -71,7 +84,7 @@ jobs:
           cp mobile/android/app/build/outputs/apk/debug/app-debug.apk _artifact/NS-mobile.apk
 
       - name: Upload Android APK
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: ns-mobile-android-apk
           path: _artifact/NS-mobile.apk
@@ -80,7 +93,7 @@ jobs:
   build-ios:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
@@ -89,7 +102,7 @@ jobs:
         run: brew install xcodegen
 
       - name: Checkout SDL3
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: libsdl-org/SDL
           ref: release-3.4.10
@@ -103,9 +116,12 @@ jobs:
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_BUILD_TYPE=Release \
             -DSDL_STATIC=ON \
             -DSDL_SHARED=OFF \
-            -DSDL_TEST=OFF
+            -DSDL_TEST_LIBRARY=OFF \
+            -DSDL_TESTS=OFF \
+            -DSDL_EXAMPLES=OFF
           cmake --build SDL3/build/ios --config Release -j"$(sysctl -n hw.logicalcpu)"
 
       - name: Copy SDL3 library to iOS project
@@ -160,7 +176,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent Payload _artifact/NS-mobile.ipa
 
       - name: Upload iOS IPA
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: ns-mobile-ios-ipa
           path: _artifact/NS-mobile.ipa

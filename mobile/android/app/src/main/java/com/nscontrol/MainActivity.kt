@@ -3,6 +3,14 @@ package com.nscontrol
 import android.os.Bundle
 import android.os.Build
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.view.*
 import android.webkit.*
 import android.widget.*
@@ -25,8 +33,37 @@ class MainActivity : AppCompatActivity() {
     private var ws: WebSocket? = null
     private val client = OkHttpClient.Builder().build()
     private val seq = AtomicInteger(0)
+    private val senderToken = AtomicInteger(0)
     @Volatile private var sending = false
     private val sendLock = Any()
+
+    private lateinit var sensorManager: SensorManager
+    private var accelSensor: Sensor? = null
+    private var gyroSensor: Sensor? = null
+    private var vibrator: Vibrator? = null
+    @Volatile private var androidPhoneSensorsActive = false
+    private val phoneSensorLock = Any()
+    private val latestPhoneAccel = FloatArray(3)
+    private val latestPhoneGyro = FloatArray(3)
+    private var hasLatestPhoneAccel = false
+    private var hasLatestPhoneGyro = false
+    private val phoneSensorListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            synchronized(phoneSensorLock) {
+                when (event.sensor.type) {
+                    Sensor.TYPE_ACCELEROMETER -> {
+                        for (i in 0 until minOf(3, event.values.size)) latestPhoneAccel[i] = event.values[i]
+                        hasLatestPhoneAccel = true
+                    }
+                    Sensor.TYPE_GYROSCOPE -> {
+                        for (i in 0 until minOf(3, event.values.size)) latestPhoneGyro[i] = event.values[i]
+                        hasLatestPhoneGyro = true
+                    }
+                }
+            }
+        }
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
+    }
 
     @Volatile private var touchHid: ByteArray? = null
     @Volatile private var touchFrame: ByteArray? = null
@@ -60,6 +97,16 @@ class MainActivity : AppCompatActivity() {
         setContentView(connectView)
         getPreferences(MODE_PRIVATE).getString("host", "")?.let {
             hostInput.setText(it); hostInput.setSelection(it.length)
+        }
+
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        accelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        vibrator = if (Build.VERSION.SDK_INT >= 31) {
+            (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
         }
 
         // Initialize SDL3 gamepad/sensor/haptic subsystem once on app start.
@@ -184,20 +231,23 @@ class MainActivity : AppCompatActivity() {
 
     private fun startSending() {
         if (sending) return
+        val token = senderToken.incrementAndGet()
         sending = true
         Thread {
             try {
                 // Open phone sensors/haptics once for the session.
-                // The SDL layer handles the actual open/close.
-                if (SDLController.phoneSensorsOpen()) {
-                    SDLController.phoneHapticOpen()
-                }
-                while (sending && controlClientActive) {
+                // Android SensorManager/Vibrator are used as the reliable phone path;
+                // SDL remains available for controller sensors and as a fallback.
+                startAndroidPhoneSensors()
+                SDLController.phoneSensorsOpen()
+                SDLController.phoneHapticOpen()
+                while (sending && controlClientActive && senderToken.get() == token) {
                     sendFrame()
                     Thread.sleep(4)
                 }
             } catch (t: Throwable) {
                 runOnUiThread {
+                    if (senderToken.get() != token) return@runOnUiThread
                     statusText.text = "Input sender failed"
                     sending = false
                     controlClientActive = false
@@ -208,9 +258,12 @@ class MainActivity : AppCompatActivity() {
                     ws = null
                 }
             } finally {
-                sending = false
-                SDLController.phoneHapticClose()
-                SDLController.phoneSensorsClose()
+                if (senderToken.get() == token) {
+                    sending = false
+                    stopAndroidPhoneSensors()
+                    SDLController.phoneHapticClose()
+                    SDLController.phoneSensorsClose()
+                }
             }
         }.start()
     }
@@ -293,14 +346,54 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun phoneMotionBytes(): ByteArray? {
+        // Prefer Android's own phone sensors for touch controls. This avoids SDL Android
+        // activity/sensor quirks and uses the same scale + axis map as the PC SDL3 client.
+        androidPhoneMotionBytes()?.let { return it }
+
         val m = SDLController.phoneSensorsRead() ?: return null
-        // Phone sensors are in device coordinates; remap to the current display orientation.
-        val remapped = remapMotionForDisplay(m)
+        return Protocol.motionFromValues(m[0], m[1], m[2], m[3], m[4], m[5], hasMotion = true)
+    }
+
+    private fun androidPhoneMotionBytes(): ByteArray? {
+        val accel = FloatArray(3)
+        val gyro = FloatArray(3)
+        val hasAccel: Boolean
+        val hasGyro: Boolean
+        synchronized(phoneSensorLock) {
+            hasAccel = hasLatestPhoneAccel
+            hasGyro = hasLatestPhoneGyro
+            if (!hasAccel && !hasGyro) return null
+            for (i in 0 until 3) {
+                accel[i] = latestPhoneAccel[i]
+                gyro[i] = latestPhoneGyro[i]
+            }
+        }
+
+        // Match the PC SDL3 conversion exactly:
+        // accel m/s² -> Switch units using 4096 / gravity
+        // gyro rad/s -> deg/s * 16.384
+        // axes: ax=-x, ay=-z, az=+y and gx=-x, gy=-z, gz=+y
+        if (!hasAccel && hasGyro) accel[1] = Protocol.STANDARD_GRAVITY
+        val accelScale = 4096.0f / Protocol.STANDARD_GRAVITY
+        val gyroScale = 57.29577951308232f * 16.384f
         return Protocol.motionFromValues(
-            remapped[0], remapped[1], remapped[2],
-            remapped[3], remapped[4], remapped[5],
+            clampMotionShort(-accel[0] * accelScale),
+            clampMotionShort(-accel[2] * accelScale),
+            clampMotionShort( accel[1] * accelScale),
+            gyroDeadzoneShort(clampMotionShort(-gyro[0] * gyroScale)),
+            gyroDeadzoneShort(clampMotionShort(-gyro[2] * gyroScale)),
+            gyroDeadzoneShort(clampMotionShort( gyro[1] * gyroScale)),
             hasMotion = true
         )
+    }
+
+    private fun clampMotionShort(v: Float): Short {
+        val rounded = kotlin.math.round(v).toInt().coerceIn(-32768, 32767)
+        return rounded.toShort()
+    }
+
+    private fun gyroDeadzoneShort(v: Short): Short {
+        return if (kotlin.math.abs(v.toInt()) <= 32) 0 else v
     }
 
     private fun remapMotionForDisplay(m: ShortArray): ShortArray {
@@ -349,7 +442,7 @@ class MainActivity : AppCompatActivity() {
             if (controllerClientActive() && subpad >= 0 && subpad < Protocol.PAD_COUNT) {
                 if (SDLController.padConnected(subpad)) SDLController.padStopRumble(subpad)
             }
-            if (touchClientActive() && subpad == 0) SDLController.phoneHapticRumble(0, 0)
+            if (touchClientActive() && subpad == 0) phoneRumble(0, 0)
             return
         }
 
@@ -360,7 +453,7 @@ class MainActivity : AppCompatActivity() {
 
         // Touch Controls is touch-only: server rumble becomes phone haptics,
         // never SDL controller rumble.
-        if (touchClientActive()) SDLController.phoneHapticRumble(low, high)
+        if (touchClientActive()) phoneRumble(low, high)
     }
 
     private fun touchClientActive(): Boolean {
@@ -369,6 +462,51 @@ class MainActivity : AppCompatActivity() {
 
     private fun controllerClientActive(): Boolean {
         return controlClientActive && currentPage == Page.MAIN_MENU
+    }
+
+    private fun startAndroidPhoneSensors() {
+        if (androidPhoneSensorsActive) return
+        synchronized(phoneSensorLock) {
+            hasLatestPhoneAccel = false
+            hasLatestPhoneGyro = false
+            latestPhoneAccel.fill(0.0f)
+            latestPhoneGyro.fill(0.0f)
+        }
+        var opened = false
+        accelSensor?.let { opened = sensorManager.registerListener(phoneSensorListener, it, SensorManager.SENSOR_DELAY_GAME) || opened }
+        gyroSensor?.let { opened = sensorManager.registerListener(phoneSensorListener, it, SensorManager.SENSOR_DELAY_GAME) || opened }
+        androidPhoneSensorsActive = opened
+    }
+
+    private fun stopAndroidPhoneSensors() {
+        if (!androidPhoneSensorsActive) return
+        try { sensorManager.unregisterListener(phoneSensorListener) } catch (_: Throwable) {}
+        androidPhoneSensorsActive = false
+        synchronized(phoneSensorLock) {
+            hasLatestPhoneAccel = false
+            hasLatestPhoneGyro = false
+        }
+    }
+
+    private fun phoneRumble(low: Int, high: Int) {
+        try {
+            val v = vibrator
+            if (low == 0 && high == 0) {
+                v?.cancel()
+                SDLController.phoneHapticRumble(0, 0)
+                return
+            }
+            val strength = maxOf(low, high).coerceIn(0, 255)
+            if (Build.VERSION.SDK_INT >= 26) {
+                val effect = VibrationEffect.createOneShot(45L, strength.coerceAtLeast(32))
+                v?.vibrate(effect)
+            } else {
+                @Suppress("DEPRECATION")
+                v?.vibrate(45L)
+            }
+        } catch (_: Throwable) {
+            SDLController.phoneHapticRumble(low, high)
+        }
     }
 
     // ═══════════════════════════════
@@ -522,6 +660,7 @@ class MainActivity : AppCompatActivity() {
     private fun deactivateControlClient() {
         if (!controlClientActive && ws == null && !sending) return
         val closingWs = ws
+        senderToken.incrementAndGet()
         sending = false
         controlClientActive = false
         touchHid = null
@@ -534,7 +673,7 @@ class MainActivity : AppCompatActivity() {
         for (i in 0 until Protocol.PAD_COUNT) {
             if (SDLController.padConnected(i)) SDLController.padStopRumble(i)
         }
-        SDLController.phoneHapticRumble(0, 0)
+        phoneRumble(0, 0)
 
         if (closingWs != null) {
             Thread {

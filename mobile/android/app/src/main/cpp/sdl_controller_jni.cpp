@@ -6,6 +6,10 @@
 
 static JavaVM* g_jvm = NULL;
 
+#ifdef __ANDROID__
+extern "C" void Android_InitJNI(JavaVM* vm, JNIEnv* env);
+#endif
+
 // ─── JNI_OnLoad ────────────────────────────────────────────
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -19,9 +23,7 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_nscontrol_SDLController_nativeInit(JNIEnv*, jclass) {
 #ifdef __ANDROID__
     // SDL3 on Android needs a JavaVM to be set before SDL_Init() for JNI access.
-    // Android_InitJNI is defined in SDL3's src/core/android/SDL_android.c and
-    // linked from the SDL3 static library.
-    extern void Android_InitJNI(JavaVM* vm, JNIEnv* env);
+    // Android_InitJNI is defined in SDL3's Android core and linked from SDL3 static.
     if (g_jvm) {
         JNIEnv* env = NULL;
         g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6);

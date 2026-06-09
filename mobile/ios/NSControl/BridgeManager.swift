@@ -1,4 +1,6 @@
 import Foundation
+import CoreMotion
+import UIKit
 
 private let kSinglePad: UInt8     = UInt8(NS_FLAG_SINGLE_PAD)
 private let kFrameSize            = Int(NS_PROTOCOL_WEB_FRAME_SIZE)
@@ -46,9 +48,15 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     private var connected = false
     private var activeHost: String? = nil
     private var mode: BridgeClientMode = .controllers
+    private var sessionToken: UInt64 = 0
     private let queue = DispatchQueue(label: "bridge", qos: .userInitiated)
     private var touchPad = Data(count: kPadSize)
     private var lastTouchPadAt = Date.distantPast
+
+    private let motionManager = CMMotionManager()
+    private let phoneMotionLock = NSLock()
+    private var nativePhoneMotionBytes: Data? = nil
+    private var lastPhoneHapticAt: TimeInterval = 0
 
     private func nextSeq() -> UInt32 {
         seqLock.lock()
@@ -81,11 +89,13 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         disconnect()
         activeHost = key
         mode = newMode
+        sessionToken &+= 1
         var req = URLRequest(url: url)
         req.timeoutInterval = 10
         ws = session.webSocketTask(with: req)
         ws?.resume()
-        readRumble()
+        let token = sessionToken
+        readRumble(token: token)
         DispatchQueue.main.async { self.onStatus?("Connecting...") }
     }
 
@@ -114,6 +124,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
     func disconnect() {
         let hadClient = ws != nil || connected || activeHost != nil
+        sessionToken &+= 1
         if ws != nil {
             for _ in 0..<3 { sendResetFrame() }
         }
@@ -127,9 +138,10 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         lastTouchPadAt = Date.distantPast
         objc_sync_exit(self)
 
-        // Stop all rumble
+        // Stop all rumble and phone-only I/O.
         for i in 0..<4 { sdl.padStopRumble(i) }
-        sdl.phoneHapticRumble(low: 0, high: 0)
+        phoneHapticRumble(low: 0, high: 0)
+        stopNativePhoneMotion()
         sdl.phoneHapticClose()
         sdl.phoneSensorsClose()
 
@@ -141,9 +153,12 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
                     didOpenWithProtocol protocol: String?) {
         connected = true
         DispatchQueue.main.async { self.onStatus?("Connected") }
-        // Open phone sensors + haptics once per session
-        if sdl.phoneSensorsOpen() { sdl.phoneHapticOpen() }
-        startSendLoop()
+        // Open phone sensors + haptics once per session. CoreMotion/UIKit are the
+        // reliable phone path; SDL remains as a fallback and for controller I/O.
+        startNativePhoneMotion()
+        if sdl.phoneSensorsOpen() { _ = sdl.phoneHapticOpen() }
+        let token = sessionToken
+        startSendLoop(token: token)
     }
 
     func urlSession(_ session: URLSession,
@@ -189,10 +204,10 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Send loop
 
-    private func startSendLoop() {
+    private func startSendLoop(token: UInt64) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            while self.connected {
+            while self.connected && self.sessionToken == token {
                 self.sendFrame()
                 Thread.sleep(forTimeInterval: 0.004)
             }
@@ -214,7 +229,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         sdl.poll()
 
         var frame = Data(count: kFrameSize)
-        let touchActive = mode == .touchControls && touchModeActive()
+        let touchActive = mode == .touchControls && connected
         let anyController = mode == .controllers && (0..<4).contains { sdl.padConnected($0) }
         let flags: UInt8 = touchActive ? kSinglePad : UInt8(0)
         let timestampUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
@@ -250,7 +265,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func touchModeActive() -> Bool {
-        connected && Date().timeIntervalSince(lastTouchPadAt) < 2.0
+        connected && mode == .touchControls
     }
 
     // MARK: - Pad helpers
@@ -313,6 +328,13 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func mergePhoneMotion(into pad: inout Data) {
+        // Prefer CoreMotion for Touch Controls: same scale/axis mapping as the
+        // PC SDL3 client via ns_motion_from_apple(). SDL is kept as fallback.
+        if let motionBytes = latestNativePhoneMotionBytes() {
+            mergeMotionBytes(motionBytes, into: &pad)
+            return
+        }
+
         let motion = sdl.phoneSensorsRead()
         guard motion.has_motion else { return }
         var motionBytes = Data(count: kMotionSize)
@@ -326,11 +348,47 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         mergeMotionBytes(motionBytes, into: &pad)
     }
 
+    private func startNativePhoneMotion() {
+        guard motionManager.isDeviceMotionAvailable else { return }
+        motionManager.deviceMotionUpdateInterval = 1.0 / 250.0
+        motionManager.startDeviceMotionUpdates(to: OperationQueue()) { [weak self] motion, _ in
+            guard let self = self, let motion = motion else { return }
+            var bytes = Data(count: kMotionSize)
+            bytes.withUnsafeMutableBytes { raw in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+                ns_motion_from_apple(base,
+                                     Float(motion.gravity.x),
+                                     Float(motion.gravity.y),
+                                     Float(motion.gravity.z),
+                                     Float(motion.rotationRate.x),
+                                     Float(motion.rotationRate.y),
+                                     Float(motion.rotationRate.z))
+            }
+            self.phoneMotionLock.lock()
+            self.nativePhoneMotionBytes = bytes
+            self.phoneMotionLock.unlock()
+        }
+    }
+
+    private func stopNativePhoneMotion() {
+        if motionManager.isDeviceMotionActive { motionManager.stopDeviceMotionUpdates() }
+        phoneMotionLock.lock()
+        nativePhoneMotionBytes = nil
+        phoneMotionLock.unlock()
+    }
+
+    private func latestNativePhoneMotionBytes() -> Data? {
+        phoneMotionLock.lock()
+        let out = nativePhoneMotionBytes
+        phoneMotionLock.unlock()
+        return out
+    }
+
     // MARK: - Rumble
 
-    private func readRumble() {
+    private func readRumble(token: UInt64) {
         ws?.receive { [weak self] result in
-            guard let self = self else { return }
+            guard let self = self, self.sessionToken == token else { return }
             switch result {
             case .success(let msg):
                 if case .data(let d) = msg, d.count >= 8 {
@@ -342,9 +400,9 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
                         self.routeRumble(subpad: subpad, low: low, high: high)
                     }
                 }
-                self.readRumble()
+                self.readRumble(token: token)
             case .failure:
-                self.disconnect()
+                if self.sessionToken == token { self.disconnect() }
             }
         }
     }
@@ -356,7 +414,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
             if mode == .controllers, subpad >= 0 && subpad < 4, sdl.padConnected(subpad) {
                 sdl.padStopRumble(subpad)
             }
-            if mode == .touchControls && subpad == 0 { sdl.phoneHapticRumble(low: 0, high: 0) }
+            if mode == .touchControls && subpad == 0 { phoneHapticRumble(low: 0, high: 0) }
             return
         }
 
@@ -367,6 +425,26 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
         // Touch Controls is touch-only: server rumble becomes phone haptics,
         // never SDL controller rumble.
-        if mode == .touchControls && touchModeActive() { sdl.phoneHapticRumble(low: low, high: high) }
+        if mode == .touchControls && touchModeActive() { phoneHapticRumble(low: low, high: high) }
+    }
+
+    private func phoneHapticRumble(low: UInt8, high: UInt8) {
+        if low == 0 && high == 0 {
+            sdl.phoneHapticRumble(low: 0, high: 0)
+            return
+        }
+
+        // UIKit haptics are the reliable iPhone path. Throttle because console
+        // rumble packets can arrive very frequently. SDL haptics remain fallback.
+        let now = Date().timeIntervalSinceReferenceDate
+        if now - lastPhoneHapticAt < 0.045 { return }
+        lastPhoneHapticAt = now
+        let intensity = max(0.15, min(1.0, CGFloat(max(low, high)) / 255.0))
+        DispatchQueue.main.async {
+            let generator = UIImpactFeedbackGenerator(style: .medium)
+            generator.prepare()
+            generator.impactOccurred(intensity: intensity)
+        }
+        sdl.phoneHapticRumble(low: low, high: high)
     }
 }
