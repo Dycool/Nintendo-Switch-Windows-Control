@@ -14,7 +14,7 @@ This project was built from scratch in **C++** and uses **UDP** for low latency.
 
 **Web App & Mobile Touch Controls** - The server includes an embedded web interface with a desktop control panel and touch-optimized mobile gamepad, no client install needed.
 
-**Gyroscope and Rumble** - PC clients with gyro-capable controllers (DS4, DualSense, compatible USB motion pads) can send motion data to the target console and receive rumble feedback. Requires the default **modern 64-byte** server mode.
+**Gyroscope and Rumble** - PC clients with gyro-capable controllers (DS4, DualSense, compatible USB motion pads) and mobile app clients can send motion data to the console and receive rumble feedback.
 
 > **Pre-compiled Binaries Available!**
 > You can download ready-to-use GUI/CLI clients and the Raspberry Pi server directly from the **[Releases](https://github.com/Dycool/NS-PC-Control/releases)** page.
@@ -30,7 +30,6 @@ https://github.com/user-attachments/assets/aef8eb25-dd14-4335-a3f7-b1953800f856
 **1. Raspberry Pi (Server):**
 * Download `ns-pc-control-raspberry-pi.zip` to your Pi.
 * Start the backend: `sudo chrt -f 99 ./ns-backend`
-  (The server handles USB gadget setup automatically - no separate script needed.)
 
 **2. PC / Mobile (Client):**
 * **Desktop** — Download the zip for your OS (Windows, Mac, or Linux), launch `ns-client`, enter your Pi's IP.
@@ -56,7 +55,6 @@ The Raspberry Pi server can emulate **two different controller profiles**, selec
 | **Latency** | **Fastest** | Slightly larger packets |
 | **Gyro** | **No** | **Yes** |
 | **Rumble** | **No** | **Yes** (bidirectional, console to PC) |
-| **Macros** | **Yes** | **Yes** |
 
 Default mode is modern 64-byte. Use `-legacy` when you want the 8-byte mode:
 
