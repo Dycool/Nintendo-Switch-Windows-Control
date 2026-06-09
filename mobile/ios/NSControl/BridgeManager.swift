@@ -85,10 +85,6 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Connection
 
-    func isRunning(mode: BridgeClientMode) -> Bool {
-        return connected && currentMode == mode && ws != nil
-    }
-
     func connect(host: String, port: UInt16 = 8080, mode: BridgeClientMode = .touchControls) {
         guard let url = normalizeWebSocketURL(host, defaultPort: port) else {
             DispatchQueue.main.async { self.onStatus?("Invalid server address") }

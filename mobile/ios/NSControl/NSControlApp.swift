@@ -225,11 +225,7 @@ struct WebViewContainer: UIViewRepresentable {
                 BridgeManager.shared.bridgeTouchState(buttons: buttons, hat: hat, lx: lx, ly: ly, rx: rx, ry: ry)
             case "hubStart":
                 guard self.parent.page == .mainMenu else { return }
-                if BridgeManager.shared.isRunning(mode: .controllerHub) {
-                    BridgeManager.shared.disconnect()
-                } else {
-                    BridgeManager.shared.connect(host: self.parent.host, mode: .controllerHub)
-                }
+                BridgeManager.shared.connect(host: self.parent.host, mode: .controllerHub)
             case "hubStop":
                 BridgeManager.shared.disconnect()
             case "hubRefresh":
@@ -292,9 +288,19 @@ struct WebViewContainer: UIViewRepresentable {
             if (connect) {
                 connect.style.display = 'inline-block';
                 connect.textContent = 'Connect';
+                connect.dataset.nsHubRunning = '0';
                 connect.onclick = function(ev){
                     if (ev) ev.preventDefault();
-                    if (window.NSBridge && NSBridge.onHubStart) NSBridge.onHubStart();
+                    var running = connect.dataset.nsHubRunning === '1';
+                    if (running) {
+                        if (window.NSBridge && NSBridge.onHubStop) NSBridge.onHubStop();
+                        connect.dataset.nsHubRunning = '0';
+                        connect.textContent = 'Connect';
+                    } else {
+                        if (window.NSBridge && NSBridge.onHubStart) NSBridge.onHubStart();
+                        connect.dataset.nsHubRunning = '1';
+                        connect.textContent = 'Disconnect';
+                    }
                     return false;
                 };
             }
