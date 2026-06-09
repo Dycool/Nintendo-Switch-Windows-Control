@@ -6,6 +6,7 @@ object Protocol {
     const val FRAME_SIZE = 116
     const val HID_SIZE = 8
     const val MOTION_SIZE = 16
+    const val PAD_COUNT = 4
     const val FLAG_RESET = 0x01
     const val FLAG_SINGLE_PAD = 0x04
 
@@ -42,6 +43,7 @@ object Protocol {
     private external fun nativeStandardGravity(): Float
 
     external fun neutralHid(): ByteArray
+    external fun neutralMotion(): ByteArray
 
     external fun controllerHid(
         buttons: Int,
@@ -65,6 +67,12 @@ object Protocol {
         gyroZ: Float
     ): ByteArray
 
+    external fun motionFromValues(
+        ax: Short, ay: Short, az: Short,
+        gx: Short, gy: Short, gz: Short,
+        hasMotion: Boolean
+    ): ByteArray
+
     external fun buildFrame(
         seq: Int,
         flags: Int,
@@ -72,6 +80,10 @@ object Protocol {
         pad0Hid: ByteArray?,
         pad0Motion: ByteArray?
     ): ByteArray
+
+    external fun initFrame(flags: Int, seq: Int, timestampUs: Long): ByteArray
+    external fun setFrameHid(frame: ByteArray, padIndex: Int, hid: ByteArray)
+    external fun setFrameMotion(frame: ByteArray, padIndex: Int, motion: ByteArray)
 
     external fun extractPad0HidFromWebFrame(src: ByteArray): ByteArray?
 }

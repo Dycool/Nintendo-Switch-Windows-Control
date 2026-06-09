@@ -24,6 +24,8 @@ targets:
         buildPhase: resources
       - ../shared/ns_protocol.c
       - ../shared/ns_protocol.h
+      - ../shared/sdl_controller.c
+      - ../shared/sdl_controller.h
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nscontrol.app
@@ -32,9 +34,19 @@ targets:
         INFOPLIST_FILE: NSControl/Info.plist
         SWIFT_OBJC_BRIDGING_HEADER: NSControl/ProtocolBridge.h
         HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/../shared"
+        LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/SDL3/lib"
+        OTHER_LINKER_FLAGS: "-lSDL3"
         DEVELOPMENT_TEAM: ""
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: ""
         PROVISIONING_PROFILE_SPECIFIER: ""
     info:
       path: NSControl/Info.plist
+    preBuildScripts:
+      - name: "Build SDL3 (if not present)"
+        script: |
+          if [ ! -f "${SRCROOT}/SDL3/lib/libSDL3.a" ]; then
+            echo "warning: SDL3 static library not found at ${SRCROOT}/SDL3/lib/libSDL3.a"
+            echo "warning: Build SDL3 first: cd ${SRCROOT}/SDL3 && xcodebuild ..."
+          fi
+        basedOnDependencyAnalysis: false

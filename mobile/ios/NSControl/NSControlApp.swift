@@ -205,7 +205,7 @@ struct WebViewContainer: UIViewRepresentable {
             case "close":
                 BridgeManager.shared.disconnect()
             case "binary":
-                guard let arr = dict["data"] as? [Int], arr.count >= 44 else { return }
+                guard let arr = dict["data"] as? [Int], arr.count >= NS_PROTOCOL_WEB_FRAME_SIZE else { return }
                 // Legacy fallback: extract pad 0 bytes (24 bytes at offset 20 in the 116-byte frame).
                 let padData = Data(arr[20..<44].map { UInt8($0) })
                 BridgeManager.shared.bridgeTouchPad(padData)

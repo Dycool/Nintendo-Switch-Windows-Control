@@ -128,3 +128,52 @@ Java_com_nscontrol_Protocol_extractPad0HidFromWebFrame(JNIEnv* env, jclass, jbyt
     if (!ok) return nullptr;
     return byte_array(env, hid, sizeof(hid));
 }
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_nscontrol_Protocol_motionFromValues(JNIEnv* env, jclass,
+                                              jshort ax, jshort ay, jshort az,
+                                              jshort gx, jshort gy, jshort gz,
+                                              jboolean has_motion) {
+    uint8_t motion[NS_PROTOCOL_MOTION_SIZE];
+    ns_motion_write_values(motion, ax, ay, az, gx, gy, gz, has_motion == JNI_TRUE);
+    return byte_array(env, motion, sizeof(motion));
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_nscontrol_Protocol_neutralMotion(JNIEnv* env, jclass) {
+    uint8_t motion[NS_PROTOCOL_MOTION_SIZE];
+    ns_motion_write_values(motion, 0, 0, 0, 0, 0, 0, 0);
+    return byte_array(env, motion, sizeof(motion));
+}
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_nscontrol_Protocol_initFrame(JNIEnv* env, jclass,
+                                       jint flags, jint seq, jlong timestamp_us) {
+    uint8_t frame[NS_PROTOCOL_WEB_FRAME_SIZE];
+    ns_web_frame_init(frame, (uint8_t)flags, (uint32_t)seq, (uint64_t)timestamp_us);
+    return byte_array(env, frame, sizeof(frame));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_nscontrol_Protocol_setFrameHid(JNIEnv* env, jclass,
+                                         jbyteArray frame, jint pad_index, jbyteArray hid) {
+    if (!frame || !hid) return;
+    jbyte f[NS_PROTOCOL_WEB_FRAME_SIZE];
+    jbyte h[NS_PROTOCOL_HID_SIZE];
+    env->GetByteArrayRegion(frame, 0, NS_PROTOCOL_WEB_FRAME_SIZE, f);
+    env->GetByteArrayRegion(hid, 0, NS_PROTOCOL_HID_SIZE, h);
+    ns_web_frame_set_hid((uint8_t*)f, pad_index, (const uint8_t*)h);
+    env->SetByteArrayRegion(frame, 0, NS_PROTOCOL_WEB_FRAME_SIZE, f);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_nscontrol_Protocol_setFrameMotion(JNIEnv* env, jclass,
+                                            jbyteArray frame, jint pad_index, jbyteArray motion) {
+    if (!frame || !motion) return;
+    jbyte f[NS_PROTOCOL_WEB_FRAME_SIZE];
+    jbyte m[NS_PROTOCOL_MOTION_SIZE];
+    env->GetByteArrayRegion(frame, 0, NS_PROTOCOL_WEB_FRAME_SIZE, f);
+    env->GetByteArrayRegion(motion, 0, NS_PROTOCOL_MOTION_SIZE, m);
+    ns_web_frame_set_motion((uint8_t*)f, pad_index, (const uint8_t*)m);
+    env->SetByteArrayRegion(frame, 0, NS_PROTOCOL_WEB_FRAME_SIZE, f);
+}

@@ -24,6 +24,8 @@
     <string>1</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <key>NSMotionUsageDescription</key>
+    <string>Device motion data is used to emulate Nintendo Switch gyroscope controls.</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>
