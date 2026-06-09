@@ -5,6 +5,11 @@ private let kFrameSize            = Int(NS_PROTOCOL_WEB_FRAME_SIZE)
 private let kPadSize              = Int(NS_PROTOCOL_EXT_PAD_SIZE)
 private let kMotionSize           = Int(NS_PROTOCOL_MOTION_SIZE)
 
+enum BridgeClientMode {
+    case controllers
+    case touchControls
+}
+
 private func normalizeSystemShortcuts(_ buttonsIn: UInt16) -> UInt16 {
     var buttons = buttonsIn
     let captureCombo = (buttons & UInt16(NS_BTN_MINUS)) != 0 && (buttons & UInt16(NS_BTN_PLUS)) != 0
@@ -40,6 +45,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     private let seqLock = NSLock()
     private var connected = false
     private var activeHost: String? = nil
+    private var mode: BridgeClientMode = .controllers
     private let queue = DispatchQueue(label: "bridge", qos: .userInitiated)
     private var touchPad = Data(count: kPadSize)
     private var lastTouchPadAt = Date.distantPast
@@ -65,17 +71,45 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Connection
 
-    func connect(host: String, port: UInt16 = 8080) {
-        if activeHost == host && ws != nil { return }
+    func connect(host: String, port: UInt16 = 8080, mode newMode: BridgeClientMode = .controllers) {
+        guard let url = normalizeWebSocketURL(host, defaultPort: port) else {
+            DispatchQueue.main.async { self.onStatus?("Invalid server address") }
+            return
+        }
+        let key = url.absoluteString
+        if activeHost == key && ws != nil { return }
         disconnect()
-        guard let url = URL(string: "ws://\(host):\(port)/") else { return }
-        activeHost = host
+        activeHost = key
+        mode = newMode
         var req = URLRequest(url: url)
         req.timeoutInterval = 10
         ws = session.webSocketTask(with: req)
         ws?.resume()
         readRumble()
         DispatchQueue.main.async { self.onStatus?("Connecting...") }
+    }
+
+    private func normalizeWebSocketURL(_ raw: String, defaultPort: UInt16 = 8080) -> URL? {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+
+        let hadScheme = text.range(of: "://") != nil
+        if !hadScheme { text = "ws://\(text)" }
+        guard var components = URLComponents(string: text) else { return nil }
+
+        let inputScheme = components.scheme?.lowercased() ?? "ws"
+        switch inputScheme {
+        case "https", "wss": components.scheme = "wss"
+        case "http", "ws": components.scheme = "ws"
+        default: components.scheme = "ws"
+        }
+
+        guard components.host?.isEmpty == false else { return nil }
+        if components.path.isEmpty { components.path = "/" }
+        if components.port == nil && (!hadScheme || components.scheme == "ws") {
+            components.port = Int(defaultPort)
+        }
+        return components.url
     }
 
     func disconnect() {
@@ -87,6 +121,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         ws = nil
         activeHost = nil
         connected = false
+        mode = .controllers
         objc_sync_enter(self)
         touchPad = Data(count: kPadSize)
         lastTouchPadAt = Date.distantPast
@@ -122,7 +157,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
     /// Kept as fallback for older bundled pages.
     func bridgeTouchPad(_ data: Data) {
-        guard connected else { return }
+        guard connected && mode == .touchControls else { return }
         objc_sync_enter(self)
         if data.count >= kPadSize {
             touchPad = Data(data.prefix(kPadSize))
@@ -132,7 +167,7 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
     }
 
     func bridgeTouchState(buttons: UInt16, hat: UInt8, lx: UInt8, ly: UInt8, rx: UInt8, ry: UInt8) {
-        guard connected else { return }
+        guard connected && mode == .touchControls else { return }
         var hid = Data(count: Int(NS_PROTOCOL_HID_SIZE))
         hid.withUnsafeMutableBytes { raw in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
@@ -179,9 +214,9 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         sdl.poll()
 
         var frame = Data(count: kFrameSize)
-        let touchActive = touchModeActive()
-        let anyController = (0..<4).contains { sdl.padConnected($0) }
-        let flags: UInt8 = (!anyController && touchActive) ? kSinglePad : UInt8(0)
+        let touchActive = mode == .touchControls && touchModeActive()
+        let anyController = mode == .controllers && (0..<4).contains { sdl.padConnected($0) }
+        let flags: UInt8 = touchActive ? kSinglePad : UInt8(0)
         let timestampUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
         let frameSeq = nextSeq()
 
@@ -192,12 +227,12 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
 
         for p in 0..<4 {
             var pad = self.neutralPad()
-            if sdl.padConnected(p) {
+            if mode == .controllers && sdl.padConnected(p) {
                 self.mergeSDLInput(p, into: &pad)
                 if !self.mergeSDLMotion(p, into: &pad) {
                     self.mergePhoneMotion(into: &pad)
                 }
-            } else if p == 0 && touchActive {
+            } else if mode == .touchControls && p == 0 && touchActive {
                 objc_sync_enter(self)
                 pad = self.touchPad
                 objc_sync_exit(self)
@@ -318,19 +353,20 @@ final class BridgeManager: NSObject, URLSessionWebSocketDelegate {
         guard connected else { return }
 
         if low == 0 && high == 0 {
-            if subpad >= 0 && subpad < 4, sdl.padConnected(subpad) {
+            if mode == .controllers, subpad >= 0 && subpad < 4, sdl.padConnected(subpad) {
                 sdl.padStopRumble(subpad)
             }
-            if subpad == 0 { sdl.phoneHapticRumble(low: 0, high: 0) }
+            if mode == .touchControls && subpad == 0 { sdl.phoneHapticRumble(low: 0, high: 0) }
             return
         }
 
-        if subpad >= 0 && subpad < 4, sdl.padConnected(subpad) {
+        if mode == .controllers, subpad >= 0 && subpad < 4, sdl.padConnected(subpad) {
             sdl.padRumble(subpad, low: low, high: high)
             return
         }
 
-        // Fall back to phone haptics for touch controls.
-        if touchModeActive() { sdl.phoneHapticRumble(low: low, high: high) }
+        // Touch Controls is touch-only: server rumble becomes phone haptics,
+        // never SDL controller rumble.
+        if mode == .touchControls && touchModeActive() { sdl.phoneHapticRumble(low: low, high: high) }
     }
 }

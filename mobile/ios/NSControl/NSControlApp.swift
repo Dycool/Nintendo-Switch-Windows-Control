@@ -120,11 +120,14 @@ struct WebViewContainer: UIViewRepresentable {
     func updateUIView(_ wv: WKWebView, context: Context) {
         guard let target = Self.localURL(for: page) else { return }
 
-        // Editor is layout-only, so it must never keep a control WebSocket bound.
-        // Main menu and Touch Controls can both bind only after their own Connect
-        // button creates the fake WebSocket.
-        if page == .editor {
-            BridgeManager.shared.disconnect()
+        // Page transitions into Touch Controls or Editor must release all 4
+        // controller slots first. Touch Controls later starts a fresh touch-only
+        // session when its own Connect button creates the fake WebSocket.
+        if context.coordinator.lastPage != page {
+            if page == .touchControls || page == .editor {
+                BridgeManager.shared.disconnect()
+            }
+            context.coordinator.lastPage = page
         }
 
         guard wv.url != target else { return }
@@ -179,6 +182,7 @@ struct WebViewContainer: UIViewRepresentable {
 
     class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         let parent: WebViewContainer
+        var lastPage: ContentView.Page? = nil
         init(parent: WebViewContainer) { self.parent = parent }
 
         private func intValue(_ value: Any?, _ fallback: Int) -> Int {
@@ -198,7 +202,8 @@ struct WebViewContainer: UIViewRepresentable {
                 // Touch Controls Connect is for the on-screen controls. Merely opening
                 // pages still does not bind a player.
                 guard self.parent.page == .touchControls || self.parent.page == .mainMenu else { return }
-                BridgeManager.shared.connect(host: self.parent.host)
+                let mode: BridgeClientMode = self.parent.page == .touchControls ? .touchControls : .controllers
+                BridgeManager.shared.connect(host: self.parent.host, mode: mode)
             case "back":
                 BridgeManager.shared.disconnect()
                 DispatchQueue.main.async { self.parent.page = .mainMenu }
@@ -229,6 +234,7 @@ struct WebViewContainer: UIViewRepresentable {
             if let url = nav.request.url, nav.targetFrame?.isMainFrame == true {
                 let last = url.lastPathComponent.lowercased()
                 if url.path == "/mobile" || last == "mobile.html" {
+                    BridgeManager.shared.disconnect()
                     DispatchQueue.main.async { self.parent.page = .touchControls }
                     decisionHandler(.cancel); return
                 }

@@ -38,7 +38,7 @@ static float axis_to_float(int16_t v) {
 }
 
 static int16_t gyro_deadzone_i16(int16_t v) {
-    if (v > -8 && v < 8) return 0;
+    if (v >= -32 && v <= 32) return 0;
     return v;
 }
 

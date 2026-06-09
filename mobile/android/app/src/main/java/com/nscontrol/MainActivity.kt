@@ -12,6 +12,7 @@ import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.util.concurrent.atomic.AtomicInteger
+import java.net.URI
 
 class MainActivity : AppCompatActivity() {
     private lateinit var connectView: View
@@ -86,8 +87,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun connectWs(): Boolean {
         return try {
-            val cleanHost = normalizeHostForWs(host)
-            val req = Request.Builder().url("ws://$cleanHost:8080/").build()
+            val wsUrl = normalizeWsUrl(host)
+            val req = Request.Builder().url(wsUrl).build()
             ws = client.newWebSocket(req, object : WebSocketListener() {
                 override fun onOpen(w: WebSocket, r: Response) {
                     runOnUiThread {
@@ -142,12 +143,39 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun normalizeHostForWs(raw: String): String {
-        var h = raw.trim()
-        h = h.removePrefix("http://").removePrefix("https://").removePrefix("ws://").removePrefix("wss://")
-        h = h.substringBefore('/').trim()
-        if (h.endsWith(":8080")) h = h.removeSuffix(":8080")
-        return h
+    private fun normalizeWsUrl(raw: String): String {
+        var text = raw.trim()
+        if (text.isEmpty()) throw IllegalArgumentException("Empty host")
+
+        val hadScheme = text.contains("://")
+        if (!hadScheme) text = "ws://$text"
+
+        val uri = URI(text)
+        val inputScheme = (uri.scheme ?: "ws").lowercase()
+        val wsScheme = when (inputScheme) {
+            "https", "wss" -> "wss"
+            "http", "ws" -> "ws"
+            else -> "ws"
+        }
+
+        val authority = uri.rawAuthority ?: throw IllegalArgumentException("Missing host")
+        val hostPart = uri.host ?: authority
+            .substringAfter('@')
+            .let { a -> if (a.startsWith("[")) a.substringBefore(']') + "]" else a.substringBeforeLast(':', a) }
+            .trim()
+        if (hostPart.isEmpty()) throw IllegalArgumentException("Missing host")
+
+        val safeHost = if (hostPart.contains(':') && !hostPart.startsWith("[")) "[$hostPart]" else hostPart
+        val explicitPort = uri.port
+        val needsBackendDefaultPort = explicitPort < 0 && (!hadScheme || wsScheme == "ws")
+        val portText = when {
+            explicitPort >= 0 -> ":$explicitPort"
+            needsBackendDefaultPort -> ":8080"
+            else -> ""
+        }
+        val path = uri.rawPath?.takeIf { it.isNotEmpty() } ?: "/"
+        val query = uri.rawQuery?.let { "?$it" } ?: ""
+        return "$wsScheme://$safeHost$portText$path$query"
     }
 
     // ═══════════════════════════════
@@ -208,55 +236,64 @@ class MainActivity : AppCompatActivity() {
             // Poll SDL3 for latest gamepad/sensor state before reading.
             SDLController.poll()
 
-            val hasController = !forceNeutral && controllerClientActive() && SDLController.padConnected(0)
+            val anyController = !forceNeutral && controllerClientActive() &&
+                (0 until Protocol.PAD_COUNT).any { SDLController.padConnected(it) }
             val touchActive = !forceNeutral && touchClientActive()
-            val flags = flagsOverride ?: if (!hasController && touchActive) Protocol.FLAG_SINGLE_PAD else 0
+            val flags = flagsOverride ?: if (!anyController && touchActive) Protocol.FLAG_SINGLE_PAD else 0
             val timestampUs = System.currentTimeMillis() * 1000L
 
-            val pad0Hid: ByteArray? = when {
-                forceNeutral -> null
-                hasController -> Protocol.controllerHid(
-                    SDLController.padButtons(0),
-                    SDLController.padDpadUp(0),
-                    SDLController.padDpadDown(0),
-                    SDLController.padDpadLeft(0),
-                    SDLController.padDpadRight(0),
-                    SDLController.padLX(0),
-                    SDLController.padLY(0),
-                    SDLController.padRX(0),
-                    SDLController.padRY(0),
-                    true
-                )
-                touchActive -> touchHid ?: touchFrame?.let { Protocol.extractPad0HidFromWebFrame(it) } ?: Protocol.neutralHid()
-                else -> null
+            val frame = Protocol.initFrame(flags, seq.getAndIncrement(), timestampUs)
+
+            if (!forceNeutral) {
+                if (anyController) {
+                    for (pad in 0 until Protocol.PAD_COUNT) {
+                        if (!SDLController.padConnected(pad)) continue
+                        Protocol.setFrameHid(frame, pad, controllerHidForPad(pad))
+                        controllerMotionBytes(pad)?.let { Protocol.setFrameMotion(frame, pad, it) }
+                    }
+                } else if (touchActive) {
+                    val hid = touchHid
+                        ?: touchFrame?.let { Protocol.extractPad0HidFromWebFrame(it) }
+                        ?: Protocol.neutralHid()
+                    Protocol.setFrameHid(frame, 0, hid)
+                    phoneMotionBytes()?.let { Protocol.setFrameMotion(frame, 0, it) }
+                }
             }
 
-            val pad0Motion: ByteArray? = if (!forceNeutral && (hasController || touchActive)) {
-                currentMotionBytes(hasController)
-            } else {
-                null
+            if (!socket.send(frame.toByteString())) {
+                throw IllegalStateException("WebSocket send queue rejected frame")
             }
-
-            val frame = Protocol.buildFrame(
-                seq.getAndIncrement(),
-                flags,
-                timestampUs,
-                pad0Hid,
-                pad0Motion
-            )
-            socket.send(frame.toByteString())
         }
     }
 
-    private fun currentMotionBytes(hasController: Boolean): ByteArray {
-        // Prefer the physical controller's IMU when connected and producing motion.
-        if (hasController && SDLController.padHasMotion(0)) {
-            val m = SDLController.padMotion(0) ?: return Protocol.neutralMotion()
+    private fun controllerHidForPad(pad: Int): ByteArray = Protocol.controllerHid(
+        SDLController.padButtons(pad),
+        SDLController.padDpadUp(pad),
+        SDLController.padDpadDown(pad),
+        SDLController.padDpadLeft(pad),
+        SDLController.padDpadRight(pad),
+        SDLController.padLX(pad),
+        SDLController.padLY(pad),
+        SDLController.padRX(pad),
+        SDLController.padRY(pad),
+        true
+    )
+
+    private fun controllerMotionBytes(pad: Int): ByteArray? {
+        // This path is already converted in shared SDL C using the same axis map
+        // and scale as the PC SDL3 client: ax=-x, ay=-z, az=+y and gx=-x, gy=-z, gz=+y.
+        if (SDLController.padHasMotion(pad)) {
+            val m = SDLController.padMotion(pad) ?: return null
             return Protocol.motionFromValues(m[0], m[1], m[2], m[3], m[4], m[5], hasMotion = true)
         }
-        // Fall back to phone sensors (touch mode, or controller without IMU).
-        val m = SDLController.phoneSensorsRead()
-            ?: return Protocol.neutralMotion()
+
+        // Preserve the old single-controller fallback: a controller without IMU
+        // can still use the phone gyro, but do not copy phone motion onto pads 2-4.
+        return if (pad == 0) phoneMotionBytes() else null
+    }
+
+    private fun phoneMotionBytes(): ByteArray? {
+        val m = SDLController.phoneSensorsRead() ?: return null
         // Phone sensors are in device coordinates; remap to the current display orientation.
         val remapped = remapMotionForDisplay(m)
         return Protocol.motionFromValues(
@@ -307,20 +344,22 @@ class MainActivity : AppCompatActivity() {
 
     private fun routeRumble(subpad: Int, low: Int, high: Int) {
         if (low == 0 && high == 0) {
-            // Stop rumble on the requested subpad and phone haptics.
-            if (subpad >= 0 && subpad < Protocol.PAD_COUNT) {
+            // Stop rumble on the active output type only. Touch mode must not
+            // keep physical SDL controllers associated with server slots.
+            if (controllerClientActive() && subpad >= 0 && subpad < Protocol.PAD_COUNT) {
                 if (SDLController.padConnected(subpad)) SDLController.padStopRumble(subpad)
             }
-            if (subpad == 0) SDLController.phoneHapticRumble(0, 0)
+            if (touchClientActive() && subpad == 0) SDLController.phoneHapticRumble(0, 0)
             return
         }
 
-        if (subpad >= 0 && subpad < Protocol.PAD_COUNT && SDLController.padConnected(subpad)) {
+        if (controllerClientActive() && subpad >= 0 && subpad < Protocol.PAD_COUNT && SDLController.padConnected(subpad)) {
             SDLController.padRumble(subpad, low, high, 50)
             return
         }
 
-        // No physical controller — fall back to phone haptics for touch controls.
+        // Touch Controls is touch-only: server rumble becomes phone haptics,
+        // never SDL controller rumble.
         if (touchClientActive()) SDLController.phoneHapticRumble(low, high)
     }
 
@@ -384,7 +423,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun enterPage(page: Page) {
         currentPage = page
-        if (page != Page.TOUCH_CONTROLS) deactivateControlClient()
+        // Switching away from the main controller page must release every
+        // controller slot on the server. Touch Controls starts a fresh
+        // touch-only session when its own Connect button is pressed; Editor
+        // never owns a controller session at all.
+        if (page == Page.TOUCH_CONTROLS || page == Page.EDITOR) deactivateControlClient()
         loadUrl(pageUrl(page))
     }
 

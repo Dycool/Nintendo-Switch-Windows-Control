@@ -55,6 +55,10 @@ int16_t ns_clamp_motion(float v) {
     return (int16_t)lroundf(v);
 }
 
+static int16_t ns_gyro_deadzone_i16(int16_t v) {
+    return (v >= -32 && v <= 32) ? 0 : v;
+}
+
 void ns_hid_write_neutral(uint8_t out_hid[NS_PROTOCOL_HID_SIZE]) {
     if (!out_hid) return;
     memset(out_hid, 0, NS_PROTOCOL_HID_SIZE);
@@ -136,9 +140,9 @@ void ns_motion_from_android(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
                            ns_clamp_motion(-accel_x * accel_scale),
                            ns_clamp_motion(-accel_z * accel_scale),
                            ns_clamp_motion( accel_y * accel_scale),
-                           ns_clamp_motion(-gyro_x * gyro_scale),
-                           ns_clamp_motion(-gyro_z * gyro_scale),
-                           ns_clamp_motion( gyro_y * gyro_scale),
+                           ns_gyro_deadzone_i16(ns_clamp_motion(-gyro_x * gyro_scale)),
+                           ns_gyro_deadzone_i16(ns_clamp_motion(-gyro_z * gyro_scale)),
+                           ns_gyro_deadzone_i16(ns_clamp_motion( gyro_y * gyro_scale)),
                            1);
 }
 
@@ -155,9 +159,9 @@ void ns_motion_from_apple(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
                            ns_clamp_motion(-gravity_x * accel_scale),
                            ns_clamp_motion(-gravity_z * accel_scale),
                            ns_clamp_motion( gravity_y * accel_scale),
-                           ns_clamp_motion(-rotation_x * gyro_scale),
-                           ns_clamp_motion(-rotation_z * gyro_scale),
-                           ns_clamp_motion( rotation_y * gyro_scale),
+                           ns_gyro_deadzone_i16(ns_clamp_motion(-rotation_x * gyro_scale)),
+                           ns_gyro_deadzone_i16(ns_clamp_motion(-rotation_z * gyro_scale)),
+                           ns_gyro_deadzone_i16(ns_clamp_motion( rotation_y * gyro_scale)),
                            1);
 }
 
