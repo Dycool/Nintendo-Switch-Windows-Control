@@ -325,6 +325,16 @@ jobs:
           cd - >/dev/null
 
           macdeployqt "$APP" -verbose=1
+
+          # The app bundle contains the main binary plus Qt frameworks/plugins.
+          # Without a code signature macOS Gatekeeper can report the downloaded
+          # artifact as "damaged" or "corrupted". This ad-hoc signature is enough
+          # for GitHub Actions test artifacts; public distribution still needs a
+          # Developer ID signature + notarization.
+          xattr -cr "$APP" || true
+          codesign --force --deep --timestamp=none --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
           touch "$APP"
           ditto -c -k --sequesterRsrc --keepParent "$APP" client/artifacts/macos/ns-client-macos.app.zip
 
