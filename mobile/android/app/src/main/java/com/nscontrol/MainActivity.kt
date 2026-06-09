@@ -11,6 +11,7 @@ import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.util.Log
 import android.view.Surface
 import android.view.View
 import android.view.WindowManager
@@ -37,6 +38,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity() {
+    companion object { private const val TAG = "NSMobile" }
     private lateinit var connectView: View
     private lateinit var webView: WebView
     private lateinit var hostInput: EditText
@@ -76,6 +78,11 @@ class MainActivity : AppCompatActivity() {
     private enum class Page { MAIN_MENU, TOUCH_CONTROLS, EDITOR }
     private var currentPage = Page.MAIN_MENU
     private val pageStack = mutableListOf<Page>()
+
+    private var rumbleLow = 0
+    private var rumbleHigh = 0
+    private var rumbleUntilMs = 0L
+    private var rumbleLastSetMs = 0L
 
     private val phoneSensorListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent) {
@@ -177,13 +184,18 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 override fun onMessage(w: WebSocket, bytes: ByteString) {
-                    if (bytes.size < 8) return
+                    // Server -> mobile rumble is the classic 8-byte ns::RumblePacket:
+                    // magic 'NSVR', subpad, low_freq, high_freq, duration_10ms.
+                    // Do not wait for/use PrecisionRumblePacket here; the current ns-client
+                    // path consumes classic NSVR packets too, and the server sends classic rumble.
+                    if (bytes.size != Protocol.RUMBLE_PACKET_SIZE) return
                     val magic = readU32LE(bytes, 0)
-                    if (magic != 0x4E535652 && magic != 0x4E535648) return // NSVR / NSVH
+                    if (magic != Protocol.RUMBLE_MAGIC) return
                     val subpad = bytes[4].toInt() and 0xFF
                     val low = bytes[5].toInt() and 0xFF
                     val high = bytes[6].toInt() and 0xFF
                     val duration10Ms = bytes[7].toInt() and 0xFF
+                    Log.d(TAG, "rumble packet subpad=$subpad low=$low high=$high duration10ms=$duration10Ms")
                     runOnUiThread { routeRumble(subpad, low, high, duration10Ms) }
                 }
             })
@@ -392,28 +404,54 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun routeRumble(subpad: Int, low: Int, high: Int, duration10Ms: Int) {
-        // Native mobile v1 owns only one logical pad. Accept any subpad here so
-        // a temporary server-side pad remap cannot make phone haptics disappear.
-        if (touchClientActive()) phoneRumble(low, high, duration10Ms)
+        // Native mobile v1 owns one logical pad. Accept any subpad so server-side
+        // remaps cannot make phone haptics disappear.
+        if (!controlClientActive) return
+        phoneRumble(low, high, duration10Ms)
     }
 
     private fun phoneRumble(low: Int, high: Int, duration10Ms: Int = 0) {
         try {
             val v = vibrator ?: return
-            if (low == 0 && high == 0) {
+            val neutral = (low == 0 && high == 0) || duration10Ms == 0
+            val now = SystemClock.uptimeMillis()
+            if (neutral) {
+                rumbleLow = 0
+                rumbleHigh = 0
+                rumbleUntilMs = 0L
+                rumbleLastSetMs = now
                 v.cancel()
+                Log.d(TAG, "rumble stop")
                 return
             }
-            val strength = maxOf(low, high).coerceIn(0, 255)
-            val durationMs = maxOf(35L, (duration10Ms.coerceIn(1, 20) * 10L))
+
+            // Match the desktop ns-client behavior: classic NSVR duration is in
+            // 10ms units, but tiny Pro rumble pulses are too short to feel on a
+            // phone if we vibrate for only 30-40ms. Keep a 250ms minimum haptic
+            // window while still refreshing it when packets keep arriving.
+            val durationMs = maxOf(250L, duration10Ms.coerceIn(1, 255) * 10L)
+            val strength = maxOf(low, high).coerceIn(1, 255)
+            if (rumbleLow == low && rumbleHigh == high && now - rumbleLastSetMs < 100L) {
+                rumbleUntilMs = now + durationMs
+                return
+            }
+
+            rumbleLow = low
+            rumbleHigh = high
+            rumbleUntilMs = now + durationMs
+            rumbleLastSetMs = now
+
             if (Build.VERSION.SDK_INT >= 26) {
-                val amp = if (v.hasAmplitudeControl()) strength.coerceAtLeast(48) else VibrationEffect.DEFAULT_AMPLITUDE
+                val amp = if (v.hasAmplitudeControl()) strength.coerceAtLeast(64) else VibrationEffect.DEFAULT_AMPLITUDE
                 v.vibrate(VibrationEffect.createOneShot(durationMs, amp))
             } else {
                 @Suppress("DEPRECATION")
                 v.vibrate(durationMs)
             }
-        } catch (_: Throwable) {}
+            Log.d(TAG, "rumble start low=$low high=$high durationMs=$durationMs")
+        } catch (t: Throwable) {
+            Log.w(TAG, "phone rumble failed", t)
+        }
     }
 
     private fun touchClientActive(): Boolean = controlClientActive && currentPage == Page.TOUCH_CONTROLS

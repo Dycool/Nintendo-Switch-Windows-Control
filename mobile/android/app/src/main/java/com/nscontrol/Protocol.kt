@@ -16,8 +16,11 @@ object Protocol {
     private const val MAGIC = 0x4E535743
     private const val VERSION = 6
 
+    const val RUMBLE_PACKET_SIZE = 8
+    const val RUMBLE_MAGIC = 0x4E535652 // 'NSVR'
+
     const val FLAG_RESET = 0x01
-    const val FLAG_DISCONNECT = 0x02
+    const val FLAG_DISCONNECT = 0x08
     const val FLAG_SINGLE_PAD = 0x04
 
     private const val PAD_PRESENT = 0x01
