@@ -819,6 +819,19 @@ static std::string path_join(const std::string& a, const std::string& b) {
     return a + sep + b;
 }
 
+static std::string executable_dir() {
+#ifdef _WIN32
+    char buf[MAX_PATH]{};
+    DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        std::string path(buf);
+        size_t slash = path.find_last_of("\\/");
+        if (slash != std::string::npos) return path.substr(0, slash);
+    }
+#endif
+    return ".";
+}
+
 static void make_dir_if_needed(const std::string& dir) {
 #ifdef _WIN32
     CreateDirectoryA(dir.c_str(), nullptr);
@@ -1819,8 +1832,23 @@ static QString key_name_from_qkey(QKeyEvent* event) {
 }
 
 static QIcon app_icon() {
-    QIcon icon(std_to_q(path_join(NS_CLIENT_SOURCE_DIR, "icon.png")));
-    if (!icon.isNull()) return icon;
+    static QIcon cached;
+    static bool loaded = false;
+    if (loaded) return cached;
+    loaded = true;
+
+    static const std::string candidates[] = {
+        path_join(executable_dir(), "icon.ico"),
+        path_join(executable_dir(), "icon.png"),
+        path_join(NS_CLIENT_SOURCE_DIR, "icon.ico"),
+        path_join(NS_CLIENT_SOURCE_DIR, "icon.png")
+    };
+
+    for (const std::string& p : candidates) {
+        QIcon icon(std_to_q(p));
+        if (!icon.isNull()) { cached = icon; return cached; }
+    }
+
     return {};
 }
 
@@ -1938,6 +1966,7 @@ protected:
                     editBindings[keys[listeningIndex].first] = name;
                 } else {
                     refresh();
+                    valueLabels[listeningIndex]->setText("...");
                     return;
                 }
             }
