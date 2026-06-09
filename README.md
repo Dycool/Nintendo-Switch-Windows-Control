@@ -32,10 +32,10 @@ https://github.com/user-attachments/assets/aef8eb25-dd14-4335-a3f7-b1953800f856
 * Start the backend: `sudo chrt -f 99 ./ns-backend`
   (The server handles USB gadget setup automatically - no separate script needed.)
 
-**2. PC (Client):**
-* Download the appropriate zip for your OS (Windows, Mac, or Linux).
-* Launch the `ns-gui` application.
-* Enter your Raspberry Pi's IP address and connect your controller(s).
+**2. PC / Mobile (Client):**
+* **Desktop** — Download the zip for your OS (Windows, Mac, or Linux), launch `ns-client`, enter your Pi's IP.
+* **Android** — Download `NS-mobile.apk` from the release and install it.
+* **iOS** — Download `NS-mobile.ipa` from the release (sideload via AltStore or similar).
 * **Up to 4 controllers** are supported simultaneously on a single PC.
 
 **3. Web App (Optional):**
