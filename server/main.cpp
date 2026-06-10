@@ -3148,10 +3148,10 @@ static void web_server_thread(int web_port, uint16_t udp_port, WebServerMode mod
                                    req_match(c->http_buf, "GET /index.html ")) {
                             body = (const char*)index_html;
                             body_len = index_html_len - 1;
-                        } else if (req_match(c->http_buf, "GET /mobile ")) {
+                        } else if (req_match(c->http_buf, "GET /mobile.html ")) {
                             body = (const char*)mobile_html;
                             body_len = mobile_html_len - 1;
-                        } else if (req_match(c->http_buf, "GET /editor ")) {
+                        } else if (req_match(c->http_buf, "GET /editor.html ")) {
                             body = (const char*)editor_html;
                             body_len = editor_html_len - 1;
                         } else {
