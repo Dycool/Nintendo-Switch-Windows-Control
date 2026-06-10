@@ -270,6 +270,14 @@ struct WebViewContainer: UIViewRepresentable {
             case "hubRefresh":
                 // Discovery is handled by GameController; keep this as a harmless UI hook.
                 break
+            case "setMotionRemap":
+                if let remap = dict["remap"] as? [[String: Any]], remap.count == 3 {
+                    let a0 = remap[0]; let a1 = remap[1]; let a2 = remap[2]
+                    ns_set_motion_remap(
+                        intValue(a0["axis"], 1), intValue(a0["sign"], 1),
+                        intValue(a1["axis"], 2), intValue(a1["sign"], -1),
+                        intValue(a2["axis"], 0), intValue(a2["sign"], 1))
+                }
             case "openTouch":
                 BridgeManager.shared.disconnect()
                 DispatchQueue.main.async {

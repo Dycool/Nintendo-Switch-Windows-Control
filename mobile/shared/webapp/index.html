@@ -554,5 +554,96 @@ document.getElementById('btnSetupBindings').onclick = () => {
     setupQueue = Object.keys(currentBindings); isSetupMode = true; startNextSetupBind();
 };
 </script>
+<!-- DEBUG iOS only: remove later -->
+<div id="dbgBtn" style="display:none;position:fixed;bottom:8px;left:8px;z-index:99999;width:28px;height:28px;background:rgba(255,255,255,0.12);color:#888;border:1px solid rgba(255,255,255,0.2);border-radius:4px;align-items:center;justify-content:center;cursor:pointer;font-size:13px;font-family:sans-serif;font-weight:bold;">D</div>
+<div id="dbgPanel" style="display:none;position:fixed;bottom:40px;left:8px;z-index:99999;background:#1a1a1a;color:#ccc;border:1px solid #444;border-radius:6px;padding:10px;font-size:12px;font-family:monospace;min-width:260px;">
+  <div style="font-weight:bold;margin-bottom:6px;color:#fff;">Debug Motion</div>
+  <div style="margin-bottom:3px;"><span style="width:52px;display:inline-block;">ax+gx:</span><select id="dbgIn0" style="background:#333;color:#ccc;border:1px solid #555;font-size:11px;width:40px;"><option value="0">X</option><option value="1">Y</option><option value="2">Z</option></select><select id="dbgSign0" style="background:#333;color:#ccc;border:1px solid #555;font-size:11px;margin-left:4px;width:44px;"><option value="1">+1</option><option value="-1">-1</option></select></div>
+  <div style="margin-bottom:3px;"><span style="width:52px;display:inline-block;">ay+gy:</span><select id="dbgIn1" style="background:#333;color:#ccc;border:1px solid #555;font-size:11px;width:40px;"><option value="0">X</option><option value="1">Y</option><option value="2">Z</option></select><select id="dbgSign1" style="background:#333;color:#ccc;border:1px solid #555;font-size:11px;margin-left:4px;width:44px;"><option value="1">+1</option><option value="-1">-1</option></select></div>
+  <div style="margin-bottom:6px;"><span style="width:52px;display:inline-block;">az+gz:</span><select id="dbgIn2" style="background:#333;color:#ccc;border:1px solid #555;font-size:11px;width:40px;"><option value="0">X</option><option value="1">Y</option><option value="2">Z</option></select><select id="dbgSign2" style="background:#333;color:#ccc;border:1px solid #555;font-size:11px;margin-left:4px;width:44px;"><option value="1">+1</option><option value="-1">-1</option></select></div>
+  <div style="display:flex;gap:6px;margin-bottom:6px;">
+    <button id="dbgReset" style="background:#444;color:#ccc;border:1px solid #666;padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;">Reset</button>
+    <button id="dbgClose" style="background:#444;color:#ccc;border:1px solid #666;padding:3px 8px;border-radius:3px;font-size:11px;cursor:pointer;">Close</button>
+  </div>
+  <div style="border-top:1px solid #444;padding-top:6px;">
+    <div style="font-size:11px;margin-bottom:4px;">Auto-cycle (48 combos, 5s each)</div>
+    <div style="display:flex;gap:4px;align-items:center;">
+      <button id="dbgCycle" style="background:#2a6;color:#fff;border:none;padding:3px 10px;border-radius:3px;font-size:11px;cursor:pointer;">Cycle</button>
+      <button id="dbgStop" style="background:#a33;color:#fff;border:none;padding:3px 10px;border-radius:3px;font-size:11px;cursor:pointer;">Stop</button>
+      <span id="dbgIdx" style="color:#888;font-size:10px;margin-left:4px;">0/48</span>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+var isIOS = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.nsBridge);
+if(!isIOS)return;
+document.getElementById('dbgBtn').style.display='flex';
+
+var perms = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+var combos = [];
+for(var p=0;p<perms.length;p++)for(var s=0;s<8;s++){
+  combos.push({inp:perms[p],sg:[s&1?-1:1,s&2?-1:1,s&4?-1:1]});
+}
+var idx = 0, timer = null, running = false;
+
+var d = [{axis:1,sign:1},{axis:2,sign:-1},{axis:0,sign:1}];
+var c = [{axis:d[0].axis,sign:d[0].sign},{axis:d[1].axis,sign:d[1].sign},{axis:d[2].axis,sign:d[2].sign}];
+
+function syncUI(){
+  for(var i=0;i<3;i++){
+    var ie=document.getElementById('dbgIn'+i);if(ie)ie.value=c[i].axis;
+    var se=document.getElementById('dbgSign'+i);if(se)se.value=c[i].sign;
+  }
+}
+
+function sendRemap(){
+  if(window.NSBridge&&typeof NSBridge.setMotionRemap==='function'){
+    NSBridge.setMotionRemap(c[0].axis,c[0].sign,c[1].axis,c[1].sign,c[2].axis,c[2].sign);
+  }else if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.nsBridge){
+    window.webkit.messageHandlers.nsBridge.postMessage({type:'setMotionRemap',remap:[{axis:c[0].axis,sign:c[0].sign},{axis:c[1].axis,sign:c[1].sign},{axis:c[2].axis,sign:c[2].sign}]});
+  }
+}
+
+function applyCombo(n){
+  idx=n%combos.length;
+  var co=combos[idx];
+  for(var i=0;i<3;i++){c[i].axis=co.inp[i];c[i].sign=co.sg[i];}
+  syncUI();sendRemap();
+  document.getElementById('dbgIdx').textContent=(idx+1)+'/'+combos.length;
+}
+
+function cycleStep(){
+  if(!running)return;
+  applyCombo(idx+1);
+}
+
+document.getElementById('dbgCycle').onclick=function(){
+  if(running)return;
+  running=true;
+  applyCombo(0);
+  timer=setInterval(cycleStep,5000);
+};
+document.getElementById('dbgStop').onclick=function(){
+  running=false;
+  if(timer){clearInterval(timer);timer=null;}
+};
+
+var btn=document.getElementById('dbgBtn'),panel=document.getElementById('dbgPanel');
+btn.onclick=function(){panel.style.display=(panel.style.display==='none'?'block':'none');};
+document.getElementById('dbgClose').onclick=function(){panel.style.display='none';};
+document.getElementById('dbgReset').onclick=function(){
+  if(running){running=false;if(timer){clearInterval(timer);timer=null;}}
+  c=[{axis:d[0].axis,sign:d[0].sign},{axis:d[1].axis,sign:d[1].sign},{axis:d[2].axis,sign:d[2].sign}];
+  syncUI();sendRemap();
+  document.getElementById('dbgIdx').textContent='0/48';
+};
+for(var i=0;i<3;i++){(function(idx){
+  var ie=document.getElementById('dbgIn'+idx);if(ie)ie.onchange=function(){if(!running){c[idx].axis=parseInt(this.value);sendRemap();}};
+  var se=document.getElementById('dbgSign'+idx);if(se)se.onchange=function(){if(!running){c[idx].sign=parseInt(this.value);sendRemap();}};
+})(i);}
+syncUI();
+})();
+</script>
 </body>
 </html>
