@@ -518,8 +518,8 @@ private:
         if (d.accel_enabled) {
             float accel[3] = {0, 0, 0};
             if (SDL_GetGamepadSensorData(pad, SDL_SENSOR_ACCEL, accel, 3)) {
-                sample.ax = clamp_motion_i16(-accel[0] * ACCEL_SCALE);
-                sample.ay = clamp_motion_i16(-accel[2] * ACCEL_SCALE);
+                sample.ax = clamp_motion_i16(-accel[2] * ACCEL_SCALE);
+                sample.ay = clamp_motion_i16(-accel[0] * ACCEL_SCALE);
                 sample.az = clamp_motion_i16(accel[1] * ACCEL_SCALE);
                 has_motion = true;
             } else {
@@ -532,8 +532,8 @@ private:
         if (d.gyro_enabled) {
             float gyro[3] = {0, 0, 0};
             if (SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3)) {
-                const float gx = -gyro[0];
-                const float gy = -gyro[2];
+                const float gx = -gyro[2];
+                const float gy = -gyro[0];
                 const float gz =  gyro[1];
                 sample.gx = gyro_deadzone_i16(clamp_motion_i16(gx * GYRO_SCALE));
                 sample.gy = gyro_deadzone_i16(clamp_motion_i16(gy * GYRO_SCALE));
