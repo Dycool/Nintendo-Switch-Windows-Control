@@ -2210,7 +2210,10 @@ private:
 
     void clearRows() {
         while (QLayoutItem* item = rows->takeAt(0)) {
-            if (QWidget* w = item->widget()) w->deleteLater();
+            if (QWidget* w = item->widget()) {
+                w->hide();       
+                w->deleteLater();
+            }
             delete item;
         }
     }
