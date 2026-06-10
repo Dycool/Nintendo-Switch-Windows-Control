@@ -390,15 +390,6 @@ public:
         stop_all_rumble_locked();
     }
 
-    void set_gyro_enabled_all(bool enabled) {
-        std::lock_guard<std::mutex> lk(mtx);
-        for (auto& d : devices) {
-            if (d.pad && SDL_GamepadHasSensor(d.pad, SDL_SENSOR_GYRO)) {
-                d.gyro_enabled = SDL_SetGamepadSensorEnabled(d.pad, SDL_SENSOR_GYRO, enabled);
-            }
-        }
-    }
-
 private:
     struct Device {
         SDL_Gamepad* pad = nullptr;
@@ -1019,32 +1010,6 @@ static int load_saved_keyboard_mode() {
 static void save_keyboard_mode(int mode) {
     auto kv = read_kv_file(settings_path());
     kv["KeyboardMode"] = std::to_string(mode);
-    write_kv_file(settings_path(), kv);
-}
-
-static bool load_saved_gyro_enabled() {
-    auto kv = read_kv_file(settings_path());
-    auto it = kv.find("GyroEnabled");
-    if (it == kv.end()) return true;
-    return it->second != "0";
-}
-
-static void save_gyro_enabled(bool enabled) {
-    auto kv = read_kv_file(settings_path());
-    kv["GyroEnabled"] = enabled ? "1" : "0";
-    write_kv_file(settings_path(), kv);
-}
-
-static bool load_saved_rumble_enabled() {
-    auto kv = read_kv_file(settings_path());
-    auto it = kv.find("RumbleEnabled");
-    if (it == kv.end()) return true;
-    return it->second != "0";
-}
-
-static void save_rumble_enabled(bool enabled) {
-    auto kv = read_kv_file(settings_path());
-    kv["RumbleEnabled"] = enabled ? "1" : "0";
     write_kv_file(settings_path(), kv);
 }
 
@@ -2465,65 +2430,32 @@ public:
         grid->addWidget(keyboardCombo, 2, 1, 1, 2);
         grid->addWidget(bindingsBtn, 2, 3);
 
-        auto* gyroLabel = new QLabel("Gyro:", this);
-        gyroLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        gyroCombo = new QComboBox(this);
-        gyroCombo->addItem("OFF");
-        gyroCombo->addItem("ON");
-        bool savedGyro = load_saved_gyro_enabled();
-        g_gyroEnabled.store(savedGyro);
-        gyroCombo->setCurrentIndex(savedGyro ? 1 : 0);
-        grid->addWidget(gyroLabel, 3, 0);
-        grid->addWidget(gyroCombo, 3, 1, 1, 2);
-
-        auto* rumbleLabel = new QLabel("Rumble:", this);
-        rumbleLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        rumbleCombo = new QComboBox(this);
-        rumbleCombo->addItem("OFF");
-        rumbleCombo->addItem("ON");
-        bool savedRumble = load_saved_rumble_enabled();
-        g_rumbleEnabled.store(savedRumble);
-        rumbleCombo->setCurrentIndex(savedRumble ? 1 : 0);
-        grid->addWidget(rumbleLabel, 4, 0);
-        grid->addWidget(rumbleCombo, 4, 1, 1, 2);
-
         macrosBtn = new QPushButton("Macros...", this);
-        grid->addWidget(macrosBtn, 5, 1, 1, 2);
+        grid->addWidget(macrosBtn, 3, 1, 1, 2);
 
         connectBtn = new QPushButton("Connect", this);
         quitBtn = new QPushButton("Quit", this);
-        grid->addWidget(connectBtn, 6, 1);
-        grid->addWidget(quitBtn, 6, 3);
+        grid->addWidget(connectBtn, 4, 1);
+        grid->addWidget(quitBtn, 4, 3);
 
         auto* sep = new QFrame(this);
         sep->setFrameShape(QFrame::HLine);
         sep->setFrameShadow(QFrame::Sunken);
-        grid->addWidget(sep, 7, 0, 1, 4);
+        grid->addWidget(sep, 5, 0, 1, 4);
 
         statusLabel = new QLabel("Ready", this);
-        grid->addWidget(statusLabel, 8, 0, 1, 4);
+        grid->addWidget(statusLabel, 6, 0, 1, 4);
 
         for (int i = 0; i < 4; ++i) {
             padLabels[i] = new QLabel(std_to_q("P" + std::to_string(i + 1) + ": Not connected"), this);
             padLabels[i]->setIndent(10);
-            grid->addWidget(padLabels[i], 9 + i, 0, 1, 4);
+            grid->addWidget(padLabels[i], 7 + i, 0, 1, 4);
         }
 
         connect(keyboardCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
             g_keyboardMode.store(idx);
             save_keyboard_mode(idx);
             bindingsBtn->setEnabled(idx != KB_OFF && !g_connected.load());
-        });
-        connect(gyroCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
-            bool on = (idx != 0);
-            g_gyroEnabled.store(on);
-            g_sdlInput.set_gyro_enabled_all(on);
-            save_gyro_enabled(on);
-        });
-        connect(rumbleCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
-            bool on = (idx != 0);
-            g_rumbleEnabled.store(on);
-            save_rumble_enabled(on);
         });
         connect(bindingsBtn, &QPushButton::clicked, this, [this] {
             BindingsDialog dlg(this);
@@ -2570,8 +2502,6 @@ private:
     QLabel* title = nullptr;
     QLineEdit* ipEdit = nullptr;
     QComboBox* keyboardCombo = nullptr;
-    QComboBox* gyroCombo = nullptr;
-    QComboBox* rumbleCombo = nullptr;
     QPushButton* bindingsBtn = nullptr;
     QPushButton* macrosBtn = nullptr;
     QPushButton* connectBtn = nullptr;
