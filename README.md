@@ -4,7 +4,7 @@
 
 # NS PC Control
 
-**Control your console from a PC (Windows, Linux, macOS) or through your browser/phone with low latency using a Raspberry Pi.**
+**Control your switch or switch 2 console from a PC (Windows, Linux, macOS) or through your browser/phone with low latency using a Raspberry Pi.**
 
 This project was built from scratch in **C++** and uses **UDP** for low latency. It is designed for playing console games with your PC controller while avoiding the typical lag of Bluetooth or heavy script-based solutions.
 
