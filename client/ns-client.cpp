@@ -193,7 +193,7 @@ static void send_udp_disconnect_packet(SOCKET sock, const sockaddr_in& dest,
     }
     ExtendedUdpPacket pkt{};
     pkt.magic = ns::PROTO_MAGIC;
-    pkt.version = ns::WEB_PROTO_VERSION;
+    pkt.version = ns::WEB_PROTO_VERSION_3;
     pkt.flags = ns::FLAG_RESET | ns::FLAG_DISCONNECT;
     pkt.seq = seq;
     pkt.timestamp_us = ns::now_us();
