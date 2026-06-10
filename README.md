@@ -14,7 +14,7 @@ This project was built from scratch in **C++** and uses **UDP** for low latency.
 
 **Web App & Mobile Touch Controls** - The server includes an embedded web interface with a desktop control panel and touch-optimized mobile gamepad, no client install needed.
 
-**Gyroscope and Rumble** - PC clients with gyro-capable controllers (DS4, DualSense, compatible USB motion pads) and mobile app clients can send motion data to the console and receive rumble feedback.
+**Gyroscope (Experimental) and Rumble** - PC clients with gyro-capable controllers (DS4, DualSense, compatible USB motion pads) and mobile app clients can send motion data to the console and receive rumble feedback.
 
 > **Pre-compiled Binaries Available!**
 > You can download ready-to-use GUI/CLI clients and the Raspberry Pi server directly from the **[Releases](https://github.com/Dycool/NS-PC-Control/releases)** page.

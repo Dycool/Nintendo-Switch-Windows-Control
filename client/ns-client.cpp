@@ -42,6 +42,7 @@ static int closesocket(SOCKET s) { return close(s); }
 #include <SDL3/SDL_main.h>
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QCloseEvent>
 #include <QDialog>
@@ -49,6 +50,7 @@ static int closesocket(SOCKET s) { return close(s); }
 #include <QFontDatabase>
 #include <QFrame>
 #include <QGridLayout>
+#include <QHBoxLayout>
 #include <QIcon>
 #include <QInputDialog>
 #include <QKeyEvent>
@@ -280,6 +282,9 @@ static int16_t gyro_deadzone_i16(int16_t v) {
     constexpr int16_t GYRO_DEADZONE = 32;
     return std::abs((int)v) <= GYRO_DEADZONE ? 0 : v;
 }
+
+static bool g_gyroEnabled = true;
+static bool g_rumbleEnabled = true;
 
 class SDLInputManager {
 public:
@@ -521,11 +526,11 @@ private:
             sample.az = 4096;
         }
 
-        if (d.gyro_enabled) {
+        if (d.gyro_enabled && g_gyroEnabled) {
             float gyro[3] = {0, 0, 0};
             if (SDL_GetGamepadSensorData(pad, SDL_SENSOR_GYRO, gyro, 3)) {
-                const float gx = -gyro[2];
-                const float gy = -gyro[0];
+                const float gx = -gyro[0];
+                const float gy = -gyro[2];
                 const float gz =  gyro[1];
                 sample.gx = gyro_deadzone_i16(clamp_motion_i16(gx * GYRO_SCALE));
                 sample.gy = gyro_deadzone_i16(clamp_motion_i16(gy * GYRO_SCALE));
@@ -717,8 +722,10 @@ private:
     void set_output(int slot, uint8_t low, uint8_t high, int pad_idx) {
         if (states[slot].last_controller != -1 && states[slot].last_controller != pad_idx)
             g_sdlInput.set_rumble(states[slot].last_controller, 0, 0, 0);
-        if (pad_idx >= 0)
+        if (pad_idx >= 0 && g_rumbleEnabled)
             g_sdlInput.set_rumble(pad_idx, low, high, (low || high) ? 250 : 0);
+        else if (pad_idx >= 0)
+            g_sdlInput.set_rumble(pad_idx, 0, 0, 0);
         states[slot].last_controller = pad_idx;
     }
 };
@@ -1007,6 +1014,21 @@ static int load_saved_keyboard_mode() {
 static void save_keyboard_mode(int mode) {
     auto kv = read_kv_file(settings_path());
     kv["KeyboardMode"] = std::to_string(mode);
+    write_kv_file(settings_path(), kv);
+}
+
+static void load_toggles() {
+    auto kv = read_kv_file(settings_path());
+    auto g = kv.find("GyroEnabled");
+    if (g != kv.end()) g_gyroEnabled = g->second != "0";
+    auto r = kv.find("RumbleEnabled");
+    if (r != kv.end()) g_rumbleEnabled = r->second != "0";
+}
+
+static void save_toggles() {
+    auto kv = read_kv_file(settings_path());
+    kv["GyroEnabled"] = g_gyroEnabled ? "1" : "0";
+    kv["RumbleEnabled"] = g_rumbleEnabled ? "1" : "0";
     write_kv_file(settings_path(), kv);
 }
 
@@ -2391,6 +2413,7 @@ public:
     explicit MainWindow() {
         setWindowTitle("NS PC Control");
         setWindowIcon(app_icon());
+        load_toggles();
         setFixedSize(platformWidth(), platformHeight());
         auto* grid = new QGridLayout(this);
         grid->setContentsMargins(16, 12, 16, 14);
@@ -2443,6 +2466,13 @@ public:
         statusLabel = new QLabel("Ready", this);
         grid->addWidget(statusLabel, 6, 0, 1, 4);
 
+        gyroCheck = new QCheckBox("Gyro", this);
+        gyroCheck->setChecked(g_gyroEnabled);
+        grid->addWidget(gyroCheck, 3, 0);
+        rumbleCheck = new QCheckBox("Rumble", this);
+        rumbleCheck->setChecked(g_rumbleEnabled);
+        grid->addWidget(rumbleCheck, 3, 3);
+
         for (int i = 0; i < 4; ++i) {
             padLabels[i] = new QLabel(std_to_q("P" + std::to_string(i + 1) + ": Not connected"), this);
             padLabels[i]->setIndent(10);
@@ -2458,6 +2488,15 @@ public:
             BindingsDialog dlg(this);
             dlg.exec();
         });
+        connect(gyroCheck, &QCheckBox::toggled, this, [](bool checked) {
+            g_gyroEnabled = checked;
+            save_toggles();
+        });
+        connect(rumbleCheck, &QCheckBox::toggled, this, [](bool checked) {
+            g_rumbleEnabled = checked;
+            save_toggles();
+        });
+
         connect(macrosBtn, &QPushButton::clicked, this, [this] {
             load_macro_entries();
             auto* dlg = new MacroDialog(this);
@@ -2505,6 +2544,8 @@ private:
     QPushButton* quitBtn = nullptr;
     QLabel* statusLabel = nullptr;
     QLabel* padLabels[4]{};
+    QCheckBox* gyroCheck = nullptr;
+    QCheckBox* rumbleCheck = nullptr;
     QTimer* timer = nullptr;
 
     static int platformWidth() {
@@ -2519,11 +2560,11 @@ private:
 
     static int platformHeight() {
 #ifdef _WIN32
-        return 345;
+        return 400;
 #elif defined(__APPLE__)
-        return 345;
+        return 400;
 #else
-        return 320;
+        return 375;
 #endif
     }
 
