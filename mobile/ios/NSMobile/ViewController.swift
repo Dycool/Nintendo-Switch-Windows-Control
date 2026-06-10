@@ -365,12 +365,11 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
             logoView.widthAnchor.constraint(equalToConstant: 96),
             stack.centerYAnchor.constraint(equalTo: connectView.centerYAnchor),
             stack.centerXAnchor.constraint(equalTo: connectView.centerXAnchor),
-            stack.leadingAnchor.constraint(greaterThanOrEqualTo: connectView.safeAreaLayoutGuide.leadingAnchor, constant: 32),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: connectView.safeAreaLayoutGuide.trailingAnchor, constant: -32),
-            stack.widthAnchor.constraint(lessThanOrEqualToConstant: 400),
+            stack.widthAnchor.constraint(equalTo: connectView.safeAreaLayoutGuide.widthAnchor, constant: -64),
             hostField.heightAnchor.constraint(equalToConstant: 56),
             connectButton.heightAnchor.constraint(equalToConstant: 56)
         ])
+        stack.widthAnchor.constraint(lessThanOrEqualToConstant: 400).isActive = true
     }
 
     private func setupWebView() {
