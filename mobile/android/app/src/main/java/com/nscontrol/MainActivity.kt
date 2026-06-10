@@ -427,8 +427,16 @@ class MainActivity : AppCompatActivity() {
         if (!hasLatestPhoneGyro || (!hasLatestPhoneGravity && !hasLatestPhoneAccel)) return
 
         val accel = if (hasLatestPhoneGravity) latestPhoneGravity else latestPhoneAccel
-        val g = latestPhoneGyro
-        val sample = NativeProtocol.nativePhoneMotion(accel[0], accel[1], accel[2], g[0], g[1], g[2])
+
+        // Touch/phone gyro: must follow the screen orientation.
+        // Android sensor axes stay in device/natural coordinates, so landscape needs this.
+        val a = remapSensorForDisplay(accel)
+        val g = remapSensorForDisplay(latestPhoneGyro)
+
+        val sample = NativeProtocol.nativePhoneMotion(
+            a[0], a[1], a[2],
+            g[0], g[1], g[2]
+        )
 
         latestMotionSamples[0] = latestMotionSamples[1]
         latestMotionSamples[1] = latestMotionSamples[2]
