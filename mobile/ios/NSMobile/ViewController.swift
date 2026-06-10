@@ -441,7 +441,9 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
         if landscape {
             UIDevice.current.setValue(UIInterfaceOrientation.landscapeRight.rawValue, forKey: "orientation")
         }
-        setNeedsUpdateOfSupportedInterfaceOrientations()
+        if #available(iOS 16.0, *) {
+            setNeedsUpdateOfSupportedInterfaceOrientations()
+        }
     }
 
     private func setFullscreen(_ fullscreen: Bool) {
@@ -1025,7 +1027,7 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
         guard let haptics = pad.controller?.haptics else { return }
         do {
             pad.stopRumble()
-            let engine = try haptics.createEngine(withLocality: .default)
+            guard let engine = try? haptics.createEngine(withLocality: .default) else { return }
             try engine.start()
             let strength = Float(max(low, high)) / 255.0
             let intensity = CHHapticEventParameter(parameterID: .hapticIntensity, value: max(0.05, strength))
