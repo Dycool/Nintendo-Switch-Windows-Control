@@ -68,22 +68,6 @@ struct ContentView: View {
         .animation(.easeInOut, value: page)
         .onAppear { lockOrientation(page) }
     }
-}
-
-func lockOrientation(_ page: ContentView.Page) {
-    DispatchQueue.main.async {
-        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
-        let mask: UIInterfaceOrientationMask = page == .mainMenu ? .all : .portrait
-        if #available(iOS 17.0, *) {
-            scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
-        } else if #available(iOS 16.0, *) {
-            scene.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
-        }
-        if mask != .all {
-            UIDevice.current.setValue(UIDeviceOrientation.portrait.rawValue, forKey: "orientation")
-        }
-    }
-}
 
     var connectionView: some View {
         VStack(spacing: 24) {
@@ -123,6 +107,21 @@ func lockOrientation(_ page: ContentView.Page) {
         .padding(32)
         .onAppear {
             BridgeManager.shared.onStatus = { s in DispatchQueue.main.async { status = s } }
+        }
+    }
+}
+
+func lockOrientation(_ page: ContentView.Page) {
+    DispatchQueue.main.async {
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
+        let mask: UIInterfaceOrientationMask = page == .mainMenu ? .all : .portrait
+        if #available(iOS 17.0, *) {
+            scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
+        } else if #available(iOS 16.0, *) {
+            scene.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        }
+        if mask != .all {
+            UIDevice.current.setValue(UIDeviceOrientation.portrait.rawValue, forKey: "orientation")
         }
     }
 }
