@@ -115,7 +115,7 @@ void ns_motion_from_apple(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
                           float rotation_y,
                           float rotation_z);
 
-// Dynamic remap for ns_motion_from_apple. Default: (+y, -z, +x).
+// Dynamic remap for ns_motion_from_apple. Default: (-z, -x, +y).
 // Each axis: input=0(X)/1(Y)/2(Z), sign=+1 or -1.
 void ns_set_motion_remap(int ax_input, int ax_sign,
                          int ay_input, int ay_sign,

@@ -1002,10 +1002,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun pushPhysicalMotionSampleLocked(slot: Int) {
         if (!physicalHasGyro[slot] || (!physicalHasGravity[slot] && !physicalHasAccel[slot])) return
-        val accel = if (physicalHasGravity[slot]) physicalGravity[slot] else physicalAccel[slot]
-        val a = remapSensorForDisplay(accel)
-        val g = remapSensorForDisplay(physicalGyro[slot])
+
+        val a = if (physicalHasGravity[slot]) physicalGravity[slot] else physicalAccel[slot]
+        val g = physicalGyro[slot]
+
         val sample = NativeProtocol.nativePhoneMotion(a[0], a[1], a[2], g[0], g[1], g[2])
+
         val pad = physicalPads[slot]
         pad.motionSamples[0] = pad.motionSamples[1]
         pad.motionSamples[1] = pad.motionSamples[2]

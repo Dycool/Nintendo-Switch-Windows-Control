@@ -146,7 +146,7 @@ void ns_motion_write_values(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
 static struct {
     int input;
     int sign;
-} gAndroidRemap[3] = {{1, 1}, {2, -1}, {0, 1}};  // defaults: (+y, -z, +x)
+} gAndroidRemap[3] = {{2, -1}, {0, -1}, {1, 1}};  // defaults: (-z, -x, +y)
 
 static float pick_value(float x, float y, float z, int input) {
     switch (input) {
@@ -181,7 +181,7 @@ void ns_motion_from_android(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
 static struct {
     int input;  // 0=X, 1=Y, 2=Z
     int sign;   // +1 or -1
-} gRemap[3] = {{1, 1}, {2, -1}, {0, 1}};  // defaults: (+y, -z, +x)
+} gRemap[3] = {{2, -1}, {0, -1}, {1, 1}};  // defaults: (-z, -x, +y)
 
 void ns_set_motion_remap(int ax_input, int ax_sign,
                          int ay_input, int ay_sign,
