@@ -347,7 +347,8 @@ document.getElementById('statusDot').onclick = () => { if(ws) ws.close(); };
     <div style="font-size:11px;margin-bottom:4px;">Auto-cycle (48 combos, 5s each)</div>
     <div style="display:flex;gap:4px;align-items:center;">
       <button id="dbgCycle" style="background:#2a6;color:#fff;border:none;padding:3px 10px;border-radius:3px;font-size:11px;cursor:pointer;">Cycle</button>
-      <button id="dbgStop" style="background:#a33;color:#fff;border:none;padding:3px 10px;border-radius:3px;font-size:11px;cursor:pointer;">Stop</button>
+      <button id="dbgPause" style="background:#a33;color:#fff;border:none;padding:3px 10px;border-radius:3px;font-size:11px;cursor:pointer;">Pause</button>
+      <button id="dbgResume" style="background:#36a;color:#fff;border:none;padding:3px 10px;border-radius:3px;font-size:11px;cursor:pointer;">Keep Going</button>
       <span id="dbgIdx" style="color:#888;font-size:10px;margin-left:4px;">0/48</span>
     </div>
   </div>
@@ -403,9 +404,14 @@ document.getElementById('dbgCycle').onclick=function(){
   applyCombo(0);
   timer=setInterval(cycleStep,5000);
 };
-document.getElementById('dbgStop').onclick=function(){
+document.getElementById('dbgPause').onclick=function(){
   running=false;
   if(timer){clearInterval(timer);timer=null;}
+};
+document.getElementById('dbgResume').onclick=function(){
+  if(running||timer)return;
+  running=true;
+  timer=setInterval(cycleStep,5000);
 };
 
 var btn=document.getElementById('dbgBtn'),panel=document.getElementById('dbgPanel');
