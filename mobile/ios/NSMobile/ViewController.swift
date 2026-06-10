@@ -351,10 +351,12 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
 
         let stack = UIStackView(arrangedSubviews: [logoView, titleLabel, subtitleLabel, hostField, connectButton, statusLabel])
         stack.axis = .vertical
-        stack.spacing = 12
-        stack.setCustomSpacing(4, after: logoView)
-        stack.setCustomSpacing(24, after: subtitleLabel)
+        stack.spacing = 0
+        stack.setCustomSpacing(16, after: logoView)
+        stack.setCustomSpacing(8, after: titleLabel)
+        stack.setCustomSpacing(40, after: subtitleLabel)
         stack.setCustomSpacing(20, after: hostField)
+        stack.setCustomSpacing(16, after: connectButton)
         stack.translatesAutoresizingMaskIntoConstraints = false
         connectView.addSubview(stack)
 
