@@ -17,8 +17,7 @@ mobile/android/app/build/
 mobile/android/local.properties
 *.apk
 
-# iOS (xcodegen generates .xcodeproj)
-mobile/ios/*.xcodeproj
+# iOS
 mobile/ios/build/
 
 # macOS
