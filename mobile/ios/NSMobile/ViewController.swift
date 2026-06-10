@@ -240,6 +240,7 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
     private let stateQueue = DispatchQueue(label: "ns.mobile.ios.state")
     private var senderToken = 0
 
+    private var currentOrientation: UIInterfaceOrientation = .landscapeRight
     private var currentPage: Page = .mainMenu
     private var pageStack: [Page] = []
     private var activeClientMode: ClientMode = .none
@@ -285,6 +286,7 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
             switch state {
             case .ready, .failed, .cancelled, .waiting:
                 connection.cancel()
+                connection.stateUpdateHandler = nil
             default:
                 break
             }
@@ -294,6 +296,7 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        currentOrientation = view.window?.windowScene?.interfaceOrientation ?? .landscapeRight
         connectView.frame = view.bounds
         webView?.frame = view.bounds
     }
@@ -844,9 +847,7 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
     }
 
     private func pushPhoneMotionSample(_ motion: CMDeviceMotion) {
-        let orientation = DispatchQueue.main.sync { [weak self] in
-            self?.view.window?.windowScene?.interfaceOrientation ?? .landscapeRight
-        }
+        let orientation = currentOrientation
         let g0 = motion.gravity
         let r0 = motion.rotationRate
         let g = remapForInterfaceOrientation(x: Float(g0.x), y: Float(g0.y), z: Float(g0.z), orientation: orientation)

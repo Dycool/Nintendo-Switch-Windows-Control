@@ -15,7 +15,6 @@
 		A00000000000000000000006 /* CoreMotion.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A00000000000000000000016 /* CoreMotion.framework */; };
 		A00000000000000000000007 /* GameController.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A00000000000000000000017 /* GameController.framework */; };
 		A00000000000000000000008 /* CoreHaptics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A00000000000000000000018 /* CoreHaptics.framework */; };
-		A0000000000000000000000A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001B /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -149,7 +148,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				A00000000000000000000004 /* ns_mobile in Resources */,
-				A0000000000000000000000A /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
