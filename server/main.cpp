@@ -36,9 +36,9 @@
 #include <miniupnpc/upnperrors.h>
 #include <stdexcept>
 #include <limits>
+#endif
 
 #include "webapp_embed.h"
-#endif
 
 using namespace ns;
 using Clock = std::chrono::steady_clock;
@@ -2284,6 +2284,565 @@ static void base64_encode(const uint8_t *in, size_t len, char *out) {
         *out++ = (i+2 < len) ? B64[v & 0x3F] : '=';
     }
     *out = '\0';
+}
+
+
+// ── Minimal SHA-1 (for WebSocket handshake) ───────────────────────────────────
+struct Sha1Ctx {
+    uint32_t state[5];
+    uint64_t count;
+    uint8_t  buffer[64];
+};
+
+static void sha1_transform(uint32_t state[5], const uint8_t block[64]) {
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++)
+        w[i] = (block[i*4]<<24) | (block[i*4+1]<<16) | (block[i*4+2]<<8) | block[i*4+3];
+    for (int i = 16; i < 80; i++) {
+        uint32_t t = w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16];
+        w[i] = (t << 1) | (t >> 31);
+    }
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20)       { f = (b & c) | (~b & d);       k = 0x5A827999; }
+        else if (i < 40)  { f = b ^ c ^ d;                k = 0x6ED9EBA1; }
+        else if (i < 60)  { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+        else              { f = b ^ c ^ d;                k = 0xCA62C1D6; }
+        uint32_t temp = ((a << 5) | (a >> 27)) + f + e + k + w[i];
+        e = d; d = c; c = (b << 30) | (b >> 2); b = a; a = temp;
+    }
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d; state[4] += e;
+}
+
+static void sha1_init(Sha1Ctx *ctx) {
+    ctx->state[0] = 0x67452301; ctx->state[1] = 0xEFCDAB89;
+    ctx->state[2] = 0x98BADCFE; ctx->state[3] = 0x10325476;
+    ctx->state[4] = 0xC3D2E1F0; ctx->count = 0;
+}
+
+static void sha1_update(Sha1Ctx *ctx, const uint8_t *data, size_t len) {
+    size_t idx = ctx->count & 63;
+    ctx->count += len;
+    while (len--) {
+        ctx->buffer[idx++] = *data++;
+        if (idx == 64) { sha1_transform(ctx->state, ctx->buffer); idx = 0; }
+    }
+}
+
+static void sha1_final(Sha1Ctx *ctx, uint8_t digest[20]) {
+    uint64_t bits = ctx->count * 8;
+    size_t idx = ctx->count & 63;
+    size_t pad = (idx < 56) ? (56 - idx) : (120 - idx);
+    uint8_t padding[64];
+    memset(padding, 0, pad);
+    padding[0] = 0x80;
+    sha1_update(ctx, padding, pad);
+    uint8_t len_bytes[8];
+    for (int i = 0; i < 8; i++) len_bytes[7-i] = (bits >> (i*8)) & 0xFF;
+    sha1_update(ctx, len_bytes, 8);
+    for (int i = 0; i < 5; i++) {
+        digest[i*4]   = (ctx->state[i] >> 24) & 0xFF;
+        digest[i*4+1] = (ctx->state[i] >> 16) & 0xFF;
+        digest[i*4+2] = (ctx->state[i] >> 8) & 0xFF;
+        digest[i*4+3] = ctx->state[i] & 0xFF;
+    }
+}
+
+
+// ── Single-threaded WebSocket/HTTP client state ─────────────────────────────
+static constexpr int MAX_WS_CLIENTS = 32;
+
+struct WebClient {
+    int fd = -1;
+
+    uint8_t buf[65536];
+    size_t fill = 0;
+
+    enum State : uint8_t {
+        READ_HTTP,
+        WRITE_RESP,
+        WS_ACTIVE,
+        CLOSED
+    } state = CLOSED;
+
+    char http_buf[8192];
+    size_t http_len = 0;
+    uint64_t connect_time = 0;
+    uint32_t ip = 0;
+
+    int      ws_slot = -1;
+    uint32_t ws_seq = 0;
+    bool     ws_first = true;
+    uint64_t ws_last_rx = 0;
+    uint32_t last_rumble_seq[4] = {};
+
+    uint8_t *wbuf = nullptr;
+    size_t   wlen = 0;
+    size_t   woff = 0;
+    State    after_write = CLOSED;
+};
+
+static void legacy_multi_to_extended(const MultiReport& in, ExtendedMultiReport& out) {
+    out.reset();
+    out.p1.input = in.p1;
+    out.p2.input = in.p2;
+    out.p3.input = in.p3;
+    out.p4.input = in.p4;
+}
+
+struct NS_LOCAL_PACKED ExtendedUdpPacket {
+    uint32_t magic;
+    uint8_t  version;
+    uint8_t  flags;
+    uint16_t reserved;
+    uint32_t seq;
+    uint64_t timestamp_us;
+    ExtendedMultiReport report;
+    uint8_t  hmac[HMAC_TAG_SIZE];
+};
+
+struct NS_LOCAL_PACKED ExtendedUdpPacket3 {
+    uint32_t magic;
+    uint8_t  version;
+    uint8_t  flags;
+    uint16_t reserved;
+    uint32_t seq;
+    uint64_t timestamp_us;
+    ExtendedMultiReport3 report;
+    uint8_t  hmac[HMAC_TAG_SIZE];
+};
+
+static constexpr size_t EXT_UDP_PACKET_AUTH_SIZE  = 20 + sizeof(ExtendedMultiReport);
+static constexpr size_t EXT_UDP_PACKET_SIZE       = EXT_UDP_PACKET_AUTH_SIZE + HMAC_TAG_SIZE;
+static constexpr size_t EXT3_UDP_PACKET_AUTH_SIZE = 20 + sizeof(ExtendedMultiReport3);
+static constexpr size_t EXT3_UDP_PACKET_SIZE      = EXT3_UDP_PACKET_AUTH_SIZE + HMAC_TAG_SIZE;
+static constexpr size_t UDP_RX_MAX_PACKET_SIZE    =
+    sizeof(ExtendedUdpPacket3) > sizeof(Packet) ? sizeof(ExtendedUdpPacket3) : sizeof(Packet);
+static_assert(sizeof(ExtendedUdpPacket) == EXT_UDP_PACKET_SIZE,
+              "ExtendedUdpPacket size must match its wire format");
+static_assert(sizeof(ExtendedUdpPacket3) == EXT3_UDP_PACKET_SIZE,
+              "ExtendedUdpPacket3 size must match its wire format");
+
+static bool extended_udp_packet_ok(const ExtendedUdpPacket& p) {
+    return p.magic == PROTO_MAGIC &&
+           (p.version == WEB_PROTO_VERSION || p.version == PROTO_VERSION);
+}
+
+static bool extended_udp3_packet_ok(const ExtendedUdpPacket3& p) {
+    return p.magic == PROTO_MAGIC && p.version == WEB_PROTO_VERSION_3;
+}
+
+static bool extended_report_pad_present(const ExtendedMultiReport& report, int subpad) {
+    if (subpad < 0 || subpad >= 4) return false;
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(&report);
+    return (raw[subpad * sizeof(ExtendedHIDReport) + 7] & 0x01) != 0;
+}
+
+static bool extended3_report_pad_present(const ExtendedMultiReport3& report, int subpad) {
+    if (subpad < 0 || subpad >= 4) return false;
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(&report);
+    return (raw[subpad * sizeof(ExtendedHIDReport3) + 7] & 0x01) != 0;
+}
+
+static void extended3_to_extended_latest(const ExtendedHIDReport3& in, ExtendedHIDReport& out) {
+    out.reset();
+    out.input = in.input;
+    out.has_motion = in.has_motion;
+    if (in.has_motion) out.motion = in.motion[2];
+}
+
+static void clear_udp_rumble_state(ClientSession& c) {
+    c.udp_rumble_enabled = false;
+    for (int s = 0; s < 4; ++s)
+        c.udp_last_rumble_seq[s] = c.rumble_seq[s];
+}
+
+static void reset_udp_client_session_locked(ClientSession& c) {
+    c.active = false;
+    c.first_pkt = true;
+    c.expected_seq = 0;
+    c.last_rx_us = 0;
+    c.report.reset();
+    clear_all_motion(c);
+    c.uses_pad_presence = false;
+    clear_udp_rumble_state(c);
+    for (int s = 0; s < 4; ++s) {
+        c.pad_present[s] = false;
+        c.pad_last_present_us[s] = 0;
+    }
+}
+
+static void enable_udp_rumble_state(ClientSession& c) {
+    if (!c.udp_rumble_enabled) {
+        c.udp_rumble_enabled = true;
+        for (int s = 0; s < 4; ++s)
+            c.udp_last_rumble_seq[s] = c.rumble_seq[s];
+    }
+}
+
+static void flush_rumble_to_udp(int sock, int client_idx) {
+    if (sock < 0 || client_idx < 0 || client_idx >= MAX_CLIENTS) return;
+    sockaddr_in dest{};
+    RumblePacket pending[4]{};
+    bool has[4]{};
+    {
+        std::lock_guard<std::mutex> lk(g_mtx[client_idx]);
+        ClientSession& c = g_clients[client_idx];
+        if (!c.active || !c.udp_rumble_enabled) return;
+        dest = c.addr;
+        for (int s = 0; s < 4; ++s) {
+            uint32_t seq = c.rumble_seq[s];
+            if (seq != c.udp_last_rumble_seq[s]) {
+                pending[s] = c.rumble[s];
+                c.udp_last_rumble_seq[s] = seq;
+                has[s] = true;
+            }
+        }
+    }
+    for (int s = 0; s < 4; ++s) {
+        if (!has[s]) continue;
+        ssize_t sent = sendto(sock, &pending[s], sizeof(RumblePacket), 0,
+                              reinterpret_cast<const sockaddr*>(&dest), sizeof(dest));
+        if (g_verbose && sent != (ssize_t)sizeof(RumblePacket))
+            std::fprintf(stderr, "[udp] failed to send rumble packet: %s\n", std::strerror(errno));
+    }
+}
+
+static bool send_ws_binary_frame(WebClient* c, const uint8_t* payload, size_t len) {
+    if (!c || c->state != WebClient::WS_ACTIVE || c->fd < 0) return false;
+    if (c->wbuf != nullptr) return false;
+    if (len >= 126) return false;
+
+    const size_t hdr = 2;
+    const size_t total = hdr + len;
+    uint8_t small_frame[2 + sizeof(RumblePacket)] = {};
+    if (total > sizeof(small_frame)) return false;
+
+    small_frame[0] = 0x82;
+    small_frame[1] = (uint8_t)len;
+    memcpy(small_frame + hdr, payload, len);
+
+    ssize_t w = write(c->fd, small_frame, total);
+    if (w == (ssize_t)total) return true;
+
+    size_t written = 0;
+    if (w < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+    } else if (w > 0) {
+        written = (size_t)w;
+    }
+
+    c->wbuf = (uint8_t*)malloc(total);
+    if (!c->wbuf) return false;
+    memcpy(c->wbuf, small_frame, total);
+    c->wlen = total;
+    c->woff = written;
+    c->after_write = WebClient::WS_ACTIVE;
+    return true;
+}
+
+static void flush_rumble_to_ws(WebClient* c) {
+    if (!c || c->state != WebClient::WS_ACTIVE || c->ws_slot < 0) return;
+
+    RumblePacket pending[4]{};
+    uint32_t seqs[4]{};
+    bool has[4]{};
+
+    {
+        std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
+        for (int s = 0; s < 4; ++s) {
+            uint32_t seq = g_clients[c->ws_slot].rumble_seq[s];
+            if (seq != c->last_rumble_seq[s]) {
+                pending[s] = g_clients[c->ws_slot].rumble[s];
+                seqs[s] = seq;
+                has[s] = true;
+            }
+        }
+    }
+
+    for (int s = 0; s < 4; ++s) {
+        if (!has[s]) continue;
+        if (send_ws_binary_frame(c, (const uint8_t*)&pending[s], sizeof(RumblePacket))) {
+            c->last_rumble_seq[s] = seqs[s];
+        }
+    }
+}
+
+
+// ── Process one complete WebSocket frame from client buffer ──────────────────
+// Returns bytes consumed, or 0 if need more data.  Sets c->state = CLOSED on close/error.
+static size_t process_ws_frame(WebClient *c) {
+    uint8_t *buf = c->buf;
+    size_t len  = c->fill;
+    if (len < 2) return 0;
+
+    int      opcode  = buf[0] & 0x0F;
+    bool     masked  = buf[1] & 0x80;
+    uint64_t flen    = buf[1] & 0x7F;
+    size_t   hdr_sz  = 2;
+
+    if (flen == 126) {
+        if (len < 4) return 0;
+        flen   = ((uint64_t)buf[2] << 8) | buf[3];
+        hdr_sz = 4;
+    } else if (flen == 127) {
+        if (len < 10) return 0;
+        flen = 0;
+        for (int i = 0; i < 8; i++) flen = (flen << 8) | buf[2 + i];
+        hdr_sz = 10;
+    }
+
+    uint8_t mask[4] = {0};
+    if (masked) {
+        if (len < hdr_sz + 4) return 0;
+        memcpy(mask, buf + hdr_sz, 4);
+        hdr_sz += 4;
+    }
+
+    if (len < hdr_sz + flen) return 0;
+
+    uint8_t *payload = buf + hdr_sz;
+    size_t   total   = hdr_sz + flen;
+
+    if (opcode == 9) {
+        if (masked)
+            for (uint64_t i = 0; i < flen; i++) payload[i] ^= mask[i & 3];
+        uint8_t pong[2] = {0x8A, 0x00};
+        ssize_t _u = write(c->fd, pong, 2); (void)_u;
+        return total;
+    }
+    if (opcode == 8) {
+        uint8_t close_frame[] = {0x88, 0x00};
+        ssize_t _u = write(c->fd, close_frame, 2); (void)_u;
+        c->state = WebClient::CLOSED;
+        return total;
+    }
+
+    if (opcode == 1) {
+        if (masked)
+            for (uint64_t i = 0; i < flen; i++) payload[i] ^= mask[i & 3];
+        std::string text(reinterpret_cast<char*>(payload), (size_t)flen);
+        const std::string prefix = "MACRO_RUN:";
+        if (text.rfind(prefix, 0) == 0) {
+            uint64_t now = now_us();
+            if (c->ws_slot < 0) {
+                for (int i = 0; i < MAX_CLIENTS; ++i) {
+                    std::lock_guard<std::mutex> lk(g_mtx[i]);
+                    if (!g_clients[i].active) {
+                        c->ws_slot = i;
+                        g_clients[i].active = true;
+                        g_clients[i].first_pkt = true;
+                        g_clients[i].report.reset();
+                        clear_all_motion(g_clients[i]);
+                        g_clients[i].uses_pad_presence = true;
+                        clear_udp_rumble_state(g_clients[i]);
+                        for (int s = 0; s < 4; ++s) { g_clients[i].pad_present[s] = false; g_clients[i].pad_last_present_us[s] = 0; }
+                        g_clients[i].last_rx_us = now;
+                        break;
+                    }
+                }
+            }
+            if (c->ws_slot >= 0) {
+                {
+                    std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
+                    g_clients[c->ws_slot].active = true;
+                    g_clients[c->ws_slot].uses_pad_presence = true;
+                    g_clients[c->ws_slot].pad_present[0] = true;
+                    g_clients[c->ws_slot].pad_last_present_us[0] = now;
+                    g_clients[c->ws_slot].last_rx_us = now;
+                }
+                server_macro_start(c->ws_slot, 0, text.substr(prefix.size()));
+            }
+        }
+        return total;
+    }
+    if (opcode == 0) {
+        c->state = WebClient::CLOSED;
+        return total;
+    }
+    if (opcode != 2) return total;
+
+    if (masked)
+        for (uint64_t i = 0; i < flen; i++) payload[i] ^= mask[i & 3];
+
+    if (flen >= ns::macro::CHUNK_HEADER_SIZE) {
+        uint32_t maybe_macro_magic = 0;
+        memcpy(&maybe_macro_magic, payload, 4);
+        if (maybe_macro_magic == ns::macro::UDP_CHUNK_MAGIC) {
+            uint64_t now = now_us();
+            if (c->ws_slot < 0) {
+                for (int i = 0; i < MAX_CLIENTS; ++i) {
+                    std::lock_guard<std::mutex> lk(g_mtx[i]);
+                    if (!g_clients[i].active) {
+                        c->ws_slot = i;
+                        g_clients[i].active = true;
+                        g_clients[i].first_pkt = true;
+                        g_clients[i].report.reset();
+                        clear_all_motion(g_clients[i]);
+                        g_clients[i].uses_pad_presence = true;
+                        g_clients[i].last_rx_us = now;
+                        break;
+                    }
+                }
+            }
+            if (c->ws_slot >= 0) {
+                std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
+                g_clients[c->ws_slot].active = true;
+                g_clients[c->ws_slot].uses_pad_presence = true;
+                g_clients[c->ws_slot].pad_present[0] = true;
+                g_clients[c->ws_slot].pad_last_present_us[0] = now;
+                g_clients[c->ws_slot].last_rx_us = now;
+            }
+            if (c->ws_slot >= 0) server_macro_handle_ws_chunk_packet(c->ws_slot, payload, (size_t)flen);
+            return total;
+        }
+    }
+
+    if (flen != PACKET_SIZE && flen != WEB_PACKET_SIZE && flen != WEB_PACKET3_SIZE) {
+        c->state = WebClient::CLOSED;
+        return total;
+    }
+
+    uint32_t magic; memcpy(&magic, payload, 4);
+    if (magic != PROTO_MAGIC) return total;
+    uint8_t ver; memcpy(&ver, payload + 4, 1);
+    uint8_t flags; memcpy(&flags, payload + 5, 1);
+    bool is_reset = (flags & FLAG_RESET);
+    uint32_t seq; memcpy(&seq, payload + 8, 4);
+
+    ExtendedMultiReport report;
+    ExtendedMultiReport3 report3;
+    report.reset();
+    report3.reset();
+    bool is_report3 = false;
+    bool pad_present[4] = {};
+
+    if (ver == PROTO_VERSION && flen == PACKET_SIZE) {
+        MultiReport legacy;
+        memcpy(&legacy, payload + 20, sizeof(MultiReport));
+        legacy_multi_to_extended(legacy, report);
+        pad_present[0] = !extended_is_neutral(report.p1);
+        pad_present[1] = !extended_is_neutral(report.p2);
+        pad_present[2] = !extended_is_neutral(report.p3);
+        pad_present[3] = !extended_is_neutral(report.p4);
+    } else if ((ver == WEB_PROTO_VERSION || ver == PROTO_VERSION) && flen == WEB_PACKET_SIZE) {
+        memcpy(&report, payload + 20, sizeof(ExtendedMultiReport));
+        for (int s = 0; s < 4; ++s)
+            pad_present[s] = (payload[20 + s * sizeof(ExtendedHIDReport) + 7] & 0x01) != 0;
+        if (flags & FLAG_SINGLE_PAD) {
+            report.p2.reset(); report.p3.reset(); report.p4.reset();
+            pad_present[0] = true;
+            pad_present[1] = false; pad_present[2] = false; pad_present[3] = false;
+        }
+    } else if (ver == WEB_PROTO_VERSION_3 && flen == WEB_PACKET3_SIZE) {
+        is_report3 = true;
+        memcpy(&report3, payload + 20, sizeof(ExtendedMultiReport3));
+        const ExtendedHIDReport3* src3[4] = { &report3.p1, &report3.p2, &report3.p3, &report3.p4 };
+        ExtendedHIDReport* dst1[4] = { &report.p1, &report.p2, &report.p3, &report.p4 };
+        for (int s = 0; s < 4; ++s) {
+            pad_present[s] = (payload[20 + s * sizeof(ExtendedHIDReport3) + 7] & 0x01) != 0;
+            extended3_to_extended_latest(*src3[s], *dst1[s]);
+        }
+        if (flags & FLAG_SINGLE_PAD) {
+            report.p2.reset(); report.p3.reset(); report.p4.reset();
+            report3.p2.reset(); report3.p3.reset(); report3.p4.reset();
+            pad_present[0] = true;
+            pad_present[1] = false; pad_present[2] = false; pad_present[3] = false;
+        }
+    } else {
+        return total;
+    }
+
+    if (!c->ws_first && !is_reset && (int32_t)(seq - c->ws_seq) < 0) return total;
+    c->ws_first = false;
+    c->ws_seq = seq + 1;
+
+    uint64_t now = now_us();
+
+    if (c->ws_slot >= 0) {
+        std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
+        if (!g_clients[c->ws_slot].active)
+            c->ws_slot = -1;
+    }
+    if (c->ws_slot < 0) {
+        for (int i = 0; i < MAX_CLIENTS; ++i) {
+            std::lock_guard<std::mutex> lk(g_mtx[i]);
+            if (!g_clients[i].active) {
+                c->ws_slot = i;
+                g_clients[i].active = true;
+                g_clients[i].first_pkt = true;
+                g_clients[i].report.reset();
+                clear_all_motion(g_clients[i]);
+                g_clients[i].uses_pad_presence = true;
+                clear_udp_rumble_state(g_clients[i]);
+                for (int s = 0; s < 4; ++s) {
+                    g_clients[i].pad_present[s] = false;
+                    g_clients[i].pad_last_present_us[s] = 0;
+                }
+                g_clients[i].last_rx_us = now;
+                for (int s = 0; s < 4; ++s)
+                    c->last_rumble_seq[s] = g_clients[i].rumble_seq[s];
+                break;
+            }
+        }
+    }
+    if (c->ws_slot >= 0) {
+        std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
+
+        ExtendedHIDReport* dst_pads[4] = {
+            &g_clients[c->ws_slot].report.p1,
+            &g_clients[c->ws_slot].report.p2,
+            &g_clients[c->ws_slot].report.p3,
+            &g_clients[c->ws_slot].report.p4,
+        };
+        const ExtendedHIDReport* src_pads[4] = {
+            &report.p1, &report.p2, &report.p3, &report.p4,
+        };
+        const ExtendedHIDReport3* src_pads3[4] = {
+            &report3.p1, &report3.p2, &report3.p3, &report3.p4,
+        };
+
+        if (is_reset) {
+            g_clients[c->ws_slot].report.reset();
+            clear_all_motion(g_clients[c->ws_slot]);
+            for (int s = 0; s < 4; ++s) {
+                g_clients[c->ws_slot].pad_present[s] = false;
+                g_clients[c->ws_slot].pad_last_present_us[s] = 0;
+            }
+        } else {
+            for (int s = 0; s < 4; ++s) {
+                if (pad_present[s]) {
+                    *dst_pads[s] = *src_pads[s];
+                    if (is_report3) {
+                        if (src_pads3[s]->has_motion)
+                            set_motion_samples(g_clients[c->ws_slot], s, src_pads3[s]->motion);
+                        else
+                            clear_motion(g_clients[c->ws_slot], s);
+                    } else {
+                        if (src_pads[s]->has_motion)
+                            set_motion(g_clients[c->ws_slot], s, src_pads[s]->motion);
+                        else
+                            clear_motion(g_clients[c->ws_slot], s);
+                    }
+                    g_clients[c->ws_slot].pad_present[s] = true;
+                    g_clients[c->ws_slot].pad_last_present_us[s] = now;
+                } else {
+                    g_clients[c->ws_slot].pad_present[s] = false;
+                    uint64_t last_seen = g_clients[c->ws_slot].pad_last_present_us[s];
+                    if (last_seen == 0 || now - last_seen >= WEB_PAD_ABSENT_RELEASE_US) {
+                        dst_pads[s]->reset();
+                        clear_motion(g_clients[c->ws_slot], s);
+                    }
+                }
+            }
+        }
+        g_clients[c->ws_slot].last_rx_us = now;
+    }
+    c->ws_last_rx = now;
+    ++g_pkts_rx;
+
+    return total;
 }
 
 
