@@ -2,6 +2,8 @@
 
 It started with a simple observation: cloud gaming has come a long way. The fact that you can boot up a game from inside a web browser is genuinely impressive. But there's a catch — the input lag. Every button press has to travel across the network, get processed, and finally reach the console. That waiting adds up.
 
+I wanted to make Switch cloud streaming a thing. The video part? Surprisingly easy — a capture card and something like Parsec or Sunshine handles that. The hard part is the other direction: getting inputs from a computer to a Switch in a way the Switch actually understands.
+
 My goal was straightforward: build something that sends input data as fast as physically possible. Nothing fancy, just raw speed.
 
 I started researching and built support for Hori controllers first, assuming they were the only ones that supported multiple controllers over a single USB connection. Then I wanted to add gyro and rumble — features typically locked to official Pro controllers.
