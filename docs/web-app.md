@@ -53,7 +53,7 @@ constants — there are no separate HTML, CSS, or JS files to deploy. The embedd
 server:
 
 1. Listens on a configurable TCP port alongside the main UDP socket
-2. Serves static HTML/CSS/JS for all three pages on `GET /`, `GET /mobile`, and `GET /editor`
+2. Serves static HTML/CSS/JS for all three pages on `GET /`, `GET /mobile.html`, and `GET /editor.html`
 3. Upgrades WebSocket connections on the same port
 4. Treats incoming WebSocket binary frames as NS-PC-Control protocol packets, writing
    controller state into the shared backend state alongside physical controllers

@@ -14,7 +14,7 @@ This project was built from scratch in **C++** and uses **UDP** for low latency.
 
 **Web App & Mobile Touch Controls** - The server includes an embedded web interface with a desktop control panel and touch-optimized mobile gamepad, no client install needed.
 
-**Gyroscope and Rumble** - PC clients with gyro-capable controllers (DS4, DualSense, compatible USB motion pads) and mobile app clients can send motion data to the console and receive rumble feedback.
+**Gyroscope and Rumble** - PC clients with gyro-capable controllers (DS4, DualSense, compatible USB motion pads), Android devices, and iOS devices can send motion data to the console and receive rumble feedback.
 
 > **Pre-compiled Binaries Available!**
 > You can download ready-to-use GUI/CLI clients and the Raspberry Pi server directly from the **[Releases](https://github.com/Dycool/NS-PC-Control/releases)** page.
@@ -34,8 +34,8 @@ https://github.com/user-attachments/assets/aef8eb25-dd14-4335-a3f7-b1953800f856
 **2. PC / Mobile (Client):**
 * **Desktop** — Download the zip for your OS (Windows, Mac, or Linux), launch `ns-client`, enter your Pi's IP.
 * **Android** — Download `NS-mobile.apk` from the release and install it.
-* **iOS** — Download `NS-mobile.ipa` from the release (sideload via AltStore or similar).
-* **Up to 4 controllers** are supported simultaneously on a single PC.
+* **iOS** — Download `NS-mobile.ipa` from the release (sideload via AltStore or similar). Supports device gyro, rumble, touch controls, and hub mode (up to 4 physical controllers via Bluetooth).
+* **Up to 4 controllers** are supported simultaneously on a single PC or mobile device in hub mode.
 
 **3. Web App (Optional):**
 * The backend includes an embedded web server with mobile touch controls.
@@ -80,7 +80,7 @@ Any **SDL-compatible controller** connected to your PC is supported, including X
 Detailed guides and technical information are in the `docs/` folder:
 
 * **[Raspberry Pi System Setup](docs/raspberry-pi-setup.md)** - Enabling USB gadget mode and automating on boot.
-* **[Building from Source](docs/building-from-source.md)** - Compiling the client (Windows/Mac/Linux) and server from scratch.
+* **[Building from Source](docs/building-from-source.md)** - Compiling the desktop client (Windows/Mac/Linux), Android/iOS mobile apps, and server from scratch.
 * **[Controller Modes](docs/controller-modes.md)** - Legacy vs modern backend mode, gyro, rumble, and how to choose.
 * **[Macros](docs/macros.md)** - Recording and replaying button sequences for speedruns and TAS.
 * **[Architecture & Security](docs/architecture.md)** - Latency optimization tips and HMAC-SHA256 protocol details.
@@ -93,6 +93,8 @@ Detailed guides and technical information are in the `docs/` folder:
 | Component | Technology |
 |---|---|
 | **Desktop clients** | [Qt6 Widgets](https://doc.qt.io/qt-6/qtwidgets-index.html) / [SDL3 Gamepad API](https://wiki.libsdl.org/SDL3) / UDP sockets |
+| **Android client** | Kotlin + WebView / JNI C bridge / UDP sockets |
+| **iOS client** | Swift + WKWebView / C bridge / [GameController](https://developer.apple.com/documentation/gamecontroller) / [CoreMotion](https://developer.apple.com/documentation/coremotion) |
 | **Raspberry Pi server** | [Linux USB Gadget (configfs / libcomposite)](https://www.kernel.org/doc/html/latest/usb/gadget_configfs.html) / UDP sockets |
 | **Cryptography** | [HMAC-SHA256](https://datatracker.ietf.org/doc/html/rfc4868) (standalone C++ implementation) |
 | **Protocol** | Custom UDP-based protocol with magic/version/sequence number guards |

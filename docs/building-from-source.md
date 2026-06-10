@@ -117,6 +117,29 @@ Output: `mobile/android/app/build/outputs/apk/debug/app-debug.apk`
 
 ---
 
+### Mobile Client (iOS)
+
+**Prerequisites:**
+
+- macOS with Xcode 16+
+- [CocoaPods](https://cocoapods.org/) (if any pods are added)
+
+**Build:**
+
+Open the Xcode project and build:
+
+```bash
+open mobile/ios/NSMobile.xcodeproj
+```
+
+Then select your device or simulator and press **⌘B** to build. The `.app` will be available in the Xcode build products directory.
+
+> **Note:** The iOS app uses a symlink at `mobile/ios/NSMobile/ns_mobile -> ../../../webapp` to embed the web interface assets. Xcode follows the symlink automatically during the resource copy phase.
+>
+> Sideload the resulting `.app` or exported `.ipa` using AltStore, SideStore, or Xcode's direct device install.
+
+---
+
 ### Web App
 
 No build step needed — the web interface is embedded in the `ns-backend` server binary. Enable it at runtime with the `-w` flag.
