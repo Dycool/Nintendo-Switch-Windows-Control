@@ -98,6 +98,11 @@ Detailed guides and technical information are in the `docs/` folder:
 | **Protocol** | Custom UDP-based protocol with magic/version/sequence number guards |
 
 ---
+## Help Needed
+
+Gyroscope controls are a bit broken as it is hard to find the right axis and calibration for them.
+
+---
 
 ## Reporting Issues
 
