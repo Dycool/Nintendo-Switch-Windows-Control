@@ -61,7 +61,7 @@ jobs:
             -target NSMobile \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath mobile/ios/build \
+            CONFIGURATION_BUILD_DIR="$PWD/mobile/ios/build/Release-iphoneos" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -71,7 +71,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p _artifact/Payload
-          APP="$(find mobile/ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name 'NSMobile.app' -print -quit)"
+          APP="$(find mobile/ios/build/Release-iphoneos -maxdepth 1 -name 'NSMobile.app' -print -quit)"
           if [ -z "$APP" ] || [ ! -d "$APP" ]; then
             echo "NSMobile.app not found"
             find mobile/ios/build -maxdepth 5 -print || true

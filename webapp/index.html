@@ -3,7 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>NS Mobile</title>
+    <script>document.title = location.protocol === 'file:' ? 'NS Mobile' : 'NS Web Control';</script>
+    <title>NS PC Control</title>
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -97,7 +98,7 @@ window.WebSocket.CLOSED = 3;
 </script>
 </head>
 <body>
-    <h2>NS Mobile</h2>
+    <h2>NS PC Control</h2>
     <div class="row" id="kbModeContainer">
         <label>Keyboard Mode:</label>
         <select id="kbMode">
@@ -280,10 +281,6 @@ function mergeStates(s1, s2) {
 function normalizeSystemShortcuts(buttons) {
     const captureCombo = (buttons & BTN_MINUS) && (buttons & BTN_PLUS);
     const homeCombo = (buttons & BTN_LSTICK) && (buttons & BTN_RSTICK);
-    // Capture (- +) and Home (LS RS) must be exclusive. Some browsers/controllers
-    // also expose vendor HOME/CAPTURE buttons while these combos are held, so
-    // resolve the combo once, right before packing the packet. Capture wins if
-    // both shortcut combos are held accidentally.
     if (captureCombo) {
         buttons |= BTN_CAPTURE;
         buttons &= ~(BTN_MINUS | BTN_PLUS | BTN_HOME);
@@ -398,7 +395,6 @@ function wireMacroMenu() {
 }
 function buildAndSendPacket() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // Native mobile v1 is touch-only. Physical controller support is intentionally disabled here.
     if (window.NSBridge || (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.nsBridge)) return;
     const rawGamepads = navigator.getGamepads ? navigator.getGamepads() : [];
     const activePads = [];
