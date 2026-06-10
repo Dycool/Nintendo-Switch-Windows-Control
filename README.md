@@ -16,6 +16,8 @@ This project was built from scratch in **C++** and uses **UDP** for low latency.
 
 **Gyroscope and Rumble** - PC clients with gyro-capable controllers (DS4, DualSense, compatible USB motion pads), Android devices, and iOS devices can send motion data to the console and receive rumble feedback.
 
+**Supports any raspberry pi with usb gadget!**
+
 > **Pre-compiled Binaries Available!**
 > You can download ready-to-use GUI/CLI clients and the Raspberry Pi server directly from the **[Releases](https://github.com/Dycool/NS-PC-Control/releases)** page.
 >
