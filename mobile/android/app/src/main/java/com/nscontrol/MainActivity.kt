@@ -1067,7 +1067,7 @@ class MainActivity : AppCompatActivity() {
             Array(Protocol.PAD_COUNT) { i ->
                 val p = physicalPads[i]
                 if (!p.present) "P${i + 1}: Empty"
-                else "P${i + 1}: ${p.name}${if (p.hasGyro) " +gyro" else ""}"
+                else "P${i + 1}: ${p.name}${if (p.hasGyro) " + gyro" else ""}"
             }
         }
         val status = prefix ?: when (activeClientMode) {

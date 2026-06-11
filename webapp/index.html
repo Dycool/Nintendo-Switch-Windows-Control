@@ -134,6 +134,7 @@ window.WebSocket.CLOSED = 3;
                 </div>
                 <div class="footer-group">
                     <button id="btnSetupBindings">Setup Wizard</button>
+                    <button id="btnClearBindings">Clear</button>
                     <button id="btnResetBindings">Reset</button>
                 </div>
             </div>
@@ -339,7 +340,7 @@ function macroPrettyEntry(obj) { const m=macroPrettyObject(obj); if (!m.name) m.
 function persistMacros() { savedMacros = savedMacros.map(macroPrettyEntry); localStorage.setItem('nswc_macros', JSON.stringify(savedMacros)); }
 function macroEntriesExport(entries=savedMacros) { return JSON.stringify({macros:entries.map(macroPrettyEntry)}, null, 2); }
 function macroHotkeyConflicts(code, skip=-1) { code=normalizeMacroKey(code); if (!code) return false; if (Object.values(currentBindings).includes(code)) return 'keyboard binding'; const dup=savedMacros.find((m,i)=>i!==skip && normalizeMacroKey(m.hotkey)===code); return dup ? (dup.name || 'another macro') : false; }
-function refreshMacroList() { const rows=document.getElementById('macroRows'); if(!rows) return; rows.innerHTML=''; if(!savedMacros.length){ const e=document.createElement('div'); e.textContent='No macros'; e.style.cssText='text-align:center; width:250px; padding:4px;'; rows.appendChild(e); } savedMacros.forEach((m,i)=>{ const r=document.createElement('div'); r.style.cssText='display:grid; grid-template-columns:minmax(0,250px) 110px 68px 64px 64px; gap:4px; margin-bottom:4px;'; const add=(txt,fn)=>{const b=document.createElement('button'); b.textContent=txt; b.onclick=fn; r.appendChild(b);}; add(macroEntryName(m,i),()=>runMacroServerSide(m)); add(normalizeMacroKey(m.hotkey),()=>beginMacroHotkeyListen(i)); add('Rename',()=>renameMacro(i)); add('Export',()=>exportOneMacro(i)); add('Delete',()=>{savedMacros.splice(i,1); persistMacros(); refreshMacroList();}); rows.appendChild(r); }); }
+function refreshMacroList() { const rows=document.getElementById('macroRows'); if(!rows) return; rows.innerHTML=''; if(!savedMacros.length){ const e=document.createElement('div'); e.textContent='No macros'; e.style.cssText='text-align:center; width:250px; padding:4px;'; rows.appendChild(e); } savedMacros.forEach((m,i)=>{ const r=document.createElement('div'); r.style.cssText='display:grid; grid-template-columns:minmax(0,250px) 110px 68px 64px 64px; gap:4px; margin-bottom:4px;'; const add=(txt,fn)=>{const b=document.createElement('button'); b.textContent=txt; b.onclick=fn; b.style.cssText='width:100%;box-sizing:border-box;'; r.appendChild(b);}; add(macroEntryName(m,i),()=>runMacroServerSide(m)); add(formatKeyName(m.hotkey),()=>beginMacroHotkeyListen(i)); add('Rename',()=>renameMacro(i)); add('Export',()=>exportOneMacro(i)); add('Delete',()=>{savedMacros.splice(i,1); persistMacros(); refreshMacroList();}); rows.appendChild(r); }); }
 function startMacro(objOrText) { macroSteps = parseMacro(objOrText); if (!macroSteps.length) { alert('No usable macro commands. Example: WAIT 200; A 100; B 100'); return; } macroRunning = true; macroStepIndex = 0; macroState = getNeutralState(); macroStepUntil = performance.now(); }
 function updateMacroState() {
     if (!macroRunning) return null; const now = performance.now();
@@ -519,7 +520,7 @@ function startNextSetupBind() {
 }
 function remapKey(code) {
     if (!activeBindKey) return;
-    if (code === 'Escape') { isSetupMode = false; activeBindKey = null; renderBindings(); return; }
+    if (code === 'Escape') { currentBindings[activeBindKey] = 'Unbound'; if (isSetupMode) { startNextSetupBind(); } else { activeBindKey = null; renderBindings(); } return; }
     if (isSetupMode) {
         for (const existingCode of Object.values(currentBindings)) if (existingCode === code) return;
         currentBindings[activeBindKey] = code; startNextSetupBind();
@@ -541,6 +542,11 @@ document.getElementById('btnSaveBindings').onclick = () => {
 document.getElementById('btnCancelBindings').onclick = () => {
     currentBindings = { ...preEditBindings };
     isSetupMode = false; activeBindKey = null; document.getElementById('modalOverlay').style.display = 'none';
+};
+document.getElementById('btnClearBindings').onclick = () => {
+    if (isSetupMode) isSetupMode = false;
+    for (let k in currentBindings) currentBindings[k] = 'Unbound';
+    activeBindKey = null; renderBindings();
 };
 document.getElementById('btnResetBindings').onclick = () => {
     if (isSetupMode) isSetupMode = false;

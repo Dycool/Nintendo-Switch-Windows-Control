@@ -1142,7 +1142,7 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
             (0..<ProtocolWire.padCount).map { i -> String in
                 let pad = pads[i]
                 if !pad.present { return "P\(i + 1): Empty" }
-                return "P\(i + 1): \(pad.name)\(pad.hasGyro ? " +gyro" : "")"
+                return "P\(i + 1): \(pad.name)\(pad.hasGyro ? " + gyro" : "")"
             }
         }
         let status: String
