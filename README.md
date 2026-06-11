@@ -31,13 +31,15 @@ https://github.com/user-attachments/assets/aef8eb25-dd14-4335-a3f7-b1953800f856
 
 **1. Raspberry Pi (Server):**
 * Download `ns-pc-control-raspberry-pi.zip` to your Pi.
+* Enable usb gadget, check the [raspbery pi setup](docs/raspberry-pi-setup.md) for more details.
 * Start the backend: `sudo chrt -f 99 ./ns-backend`
 
 **2. PC / Mobile (Client):**
 * **Desktop** — Download the zip for your OS (Windows, Mac, or Linux), launch `ns-client`, enter your Pi's IP.
 * **Android** — Download `NS-mobile.apk` from the release and install it.
-* **iOS** — Download `NS-mobile.ipa` from the release (sideload via AltStore or similar). Supports device gyro, touch controls, and up to 4 physical controllers via Bluetooth. Rumble is available for physical Bluetooth controllers when the platform exposes haptics (touch controls do not vibrate the phone).
-* **Up to 4 controllers** are supported simultaneously on a single PC or mobile device in hub mode.
+* **iOS** — Download `NS-mobile.ipa` from the release (sideload via iloader).
+* **Up to 4 controllers** are supported simultaneously on a single client.
+> Mobile clients do not support rumble with touch controls.
 
 **3. Web App (Optional):**
 * The backend includes an embedded web server with mobile touch controls.
@@ -49,16 +51,16 @@ https://github.com/user-attachments/assets/aef8eb25-dd14-4335-a3f7-b1953800f856
 
 ## Controller Emulation Modes
 
-The Raspberry Pi server can emulate **two different controller profiles**, selected at runtime:
+The Raspberry Pi server can emulate **two different controller profiles**:
 
-| Feature | Legacy 8-byte mode | Modern 64-byte mode |
+| Feature | Hori Controllers | Pro Controllers |
 |---------|--------------------|---------------------|
 | HID report size | 8 bytes | 64 bytes |
-| **Latency** | **Fastest** | Slightly larger packets |
+| **Latency** | **Fastest** | **Fast** |
 | **Gyro** | **No** | **Yes** |
-| **Rumble** | **No** | **Yes** (bidirectional, console to PC) |
+| **Rumble** | **No** | **Yes** |
 
-Default mode is modern 64-byte. Use `-hori` when you want the 8-byte mode:
+Default mode is the pro controller. Use `-hori` if you have any issues with the other mode:
 
 ```bash
 sudo chrt -f 99 ./ns-backend -hori
@@ -68,12 +70,14 @@ sudo chrt -f 99 ./ns-backend -hori
 
 ## Controls & Shortcuts
 
-Any **SDL-compatible controller** connected to your PC is supported, including Xbox, PlayStation, and most standard PC gamepads.
+Any **SDL-compatible controller** connected to your client is supported, so basically any controller on the market.
 
 | Action  | Shortcut |
 | ------- | -------- |
 | HOME    | Press **GUIDE** button, or **L3 + R3** simultaneously |
 | CAPTURE | Press **START + BACK** simultaneously |
+
+>These shortcuts can be disabled on the PC client.
 
 ---
 
@@ -86,14 +90,14 @@ Detailed guides and technical information are in the `docs/` folder:
 * **[Controller Modes](docs/controller-modes.md)** - Legacy vs modern backend mode, gyro, rumble, and how to choose.
 * **[Macros](docs/macros.md)** - Recording and replaying button sequences for speedruns and TAS.
 * **[Architecture & Security](docs/architecture.md)** - Latency optimization tips and HMAC-SHA256 protocol details.
-* **[Web App & Mobile Controls](docs/web-app.md)** - Using the embedded web interface and mobile touch controls.
+* **[Web App & Mobile Clients](docs/web-app.md)** - Using the embedded web interface and mobile touch controls.
 * **[My vision](docs/vision.md)** - The main goal behind this project.
 
 ---
 
 ## References
 
-| Component | Technology |
+| Components | Sources |
 |---|---|
 | **Desktop clients** | [Qt6 Widgets](https://doc.qt.io/qt-6/qtwidgets-index.html) / [SDL3 Gamepad API](https://wiki.libsdl.org/SDL3) / UDP sockets |
 | **Android client** | Kotlin + WebView / JNI C bridge / UDP sockets |
@@ -101,6 +105,7 @@ Detailed guides and technical information are in the `docs/` folder:
 | **Raspberry Pi server** | [Linux USB Gadget (configfs / libcomposite)](https://www.kernel.org/doc/html/latest/usb/gadget_configfs.html) / UDP sockets |
 | **Cryptography** | [HMAC-SHA256](https://datatracker.ietf.org/doc/html/rfc4868) (standalone C++ implementation) |
 | **Protocol** | Custom UDP-based protocol with magic/version/sequence number guards |
+| **Pro controller Emulation** | [switch-auto-core](https://github.com/churunfa/switch-auto-core) by [churunfa](https://github.com/churunfa)
 
 
 ---

@@ -28,21 +28,17 @@ cmake ..
 make
 ```
 
-Default runtime mode is the modern 64-byte controller with gyro, rumble, and macros:
+4.  Run the server:
 
 ```bash
 sudo ./ns-backend
-```
-
-Use legacy 8-byte mode when you only want buttons/sticks:
-
-```bash
+# Hori mode
 sudo ./ns-backend -hori
 ```
 
 > The server automatically creates and binds the HID gadget on startup and cleans up on exit.
 
-> **Note:** To disable UPnP support, add `-DUSE_UPNP=OFF` to the cmake command.
+> **Note:** To disable UPnP support, add `-DUSE_UPNP=OFF` on the cmake command.
 
 ---
 
@@ -144,4 +140,4 @@ Then select your device or simulator and press **⌘B** to build. The `.app` wil
 
 ### Web App
 
-No build step needed — the web interface is embedded in the `ns-backend` server binary. Enable it at runtime with the `-w` flag.
+No build step needed — the web interface is embedded in the `ns-backend` server binary. Enable it with the `-w` flag.

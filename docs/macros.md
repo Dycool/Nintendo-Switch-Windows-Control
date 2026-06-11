@@ -1,8 +1,10 @@
 # Macros
 
-The Raspberry Pi server includes a built-in macro system for recording and replaying button sequences. Macros are supported in both the legacy and modern backends.
+The Raspberry Pi server includes a built-in macro system for recording and replaying button sequences.
 
 Macros are parsed and executed **on the Raspberry Pi server**, so playback continues even if the PC client disconnects mid-sequence.
+
+Macros are only available for PC clients and PC webapp clients.
 
 ---
 
@@ -41,7 +43,16 @@ Repeats the commands since the previous `LOOP` (or the start of the macro). The 
 ```
 A 50
 B 50
-LOOP 10    ; repeats A+B block 10 times
+LOOP 10 
+#repeats A+B block 10 times
+```
+
+```
+X 50
+LOOP 10
+Y 50
+LOOP 5
+# X is pressed for 500 ms and then Y is pressed for 250 ms
 ```
 
 ---
@@ -179,10 +190,6 @@ Load and upload a macro file:
 ```bash
 ns-client --cli <pi-ip> --macro mymacro.json
 ```
-
-### Web Interface
-
-The web app includes a macro editor at the `/editor` endpoint, usable from any browser on the same network.
 
 ---
 

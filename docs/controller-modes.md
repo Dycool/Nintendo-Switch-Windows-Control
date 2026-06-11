@@ -6,11 +6,9 @@ The Raspberry Pi server can emulate **two different controller profiles**. Each 
 
 ## Comparison
 
-| Feature | Legacy 8-byte mode | Modern 64-byte mode |
+| Feature | Hori Controller | Pro Controller |
 |---------|--------------------|---------------------|
 | HID report size | 8 bytes | 64 bytes |
-| USB profile | 4-port legacy gamepad | Full-report gamepad |
-| USB product ID | 8-byte report device | 64-byte report device |
 | **Buttons, D-Pad, Sticks** | Yes | Yes |
 | **Latency** | **Lowest** | Low |
 | **Gyroscope (6-axis IMU)** | **No** | **Yes** |
@@ -25,8 +23,8 @@ The Raspberry Pi server can emulate **two different controller profiles**. Each 
 ### Modern Mode
 
 - Full 64-byte report emulation with the advanced feature path enabled.
-- **Gyroscope and accelerometer** data is relayed from the PC client to the target console. Compatible with gyro-aiming games.
-- **Rumble** is bidirectional: rumble commands from the console are forwarded back to the PC client.
+- **Gyroscope and accelerometer** data is sent from the  client to the target console.
+- **Rumble**: rumble commands from the console are forwarded back to the client.
 
 ---
 
@@ -36,9 +34,10 @@ Gyro and rumble require **both** server and client support:
 
 | Side | Requirements |
 |------|--------------|
-| **Server** | Run the default **modern 64-byte mode** |
-| **PC Client** | Must use the extended UDP protocol |
-| **PC Controller** | Must support gyro (DS4, DualSense, compatible USB motion pads) or have rumble motors |
+| **Server** | Run the default **pro controller mode** |
+| **Client** | Must use the extended UDP protocol |
+| **Controller** | Must support gyro (DS4, DualSense, compatible USB motion pads) or have rumble motors |
+> Pro controllers connected to android clients cannot send gyro and recieve rumble. This is a hardware limit from android.
 
 Platform-specific gyro support:
 
@@ -47,19 +46,11 @@ Platform-specific gyro support:
 - **iOS:** Device sensors via `CMDeviceMotion` (`CMRotationRate` and `CMAcceleration`), remapped identically to the Android pipeline
 - **Browser:** Gamepad API (`pose.angularVelocity`, `pose.linearAcceleration`)
 
-> Gyro and rumble are **not available** in legacy mode.
+> Gyro and rumble are **not available** in hori controller mode.
 
 ---
 
-## Choosing a Backend
-
-### Use legacy mode when:
-- You prioritize absolute minimum latency over gyro/rumble.
+### Use hori controller mode when:
+- You dont need gyro or rumble.
 - You only need buttons, sticks, and d-pad.
-
-### Use modern mode (default) when:
-- You want gyroscope aiming or accelerometer input.
-- You want bidirectional rumble feedback.
-- You want to use server-side macros.
-- You want SPI flash calibration support.
-
+- The default Pro controller mode is not working.

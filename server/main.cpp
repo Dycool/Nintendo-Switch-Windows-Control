@@ -3340,6 +3340,8 @@ int main(int argc, char** argv) {
             puts("  -b ADDR[:PORT]  Bind UDP to an address and optional port.");
             puts("  -b PORT         Keep 0.0.0.0 with a custom UDP port.");
             puts("  -w [PORT]       Serve the browser webapp too, using this port or 8080.");
+            puts("  --upnp          Forward the UDP port via UPnP for PC clients only.");
+            puts("                  Mobile/web clients connect via WebSocket and don't need this.");
             puts("  -hori           Expose the legacy 8-byte HORI controller gadget.");
             puts("                  Default mode exposes the 64-byte motion/rumble gadget.");
             puts("");

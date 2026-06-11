@@ -26,9 +26,9 @@ Connect the Raspberry Pi to the console dock via USB:
 
 ---
 
-## Running the Server (Manual Method)
+## Running the Server
 
-The server handles USB gadget setup **automatically** on startup - no separate script needed. Just run:
+ Just run:
 
 ```bash
 sudo chrt -f 99 ./ns-backend
