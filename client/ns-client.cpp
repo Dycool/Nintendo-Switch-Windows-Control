@@ -2170,9 +2170,6 @@ public:
         setMinimumWidth(420);
 
         auto* outer = new QVBoxLayout(this);
-        auto* hint = new QLabel("These options apply to SDL3 controllers. Press Save to apply and persist them.", this);
-        hint->setWordWrap(true);
-        outer->addWidget(hint);
 
         gyroBox = new QCheckBox("Gyro / motion", this);
         rumbleBox = new QCheckBox("Rumble", this);
