@@ -102,6 +102,44 @@ private enum ProtocolWire {
         return out
     }
 
+    private static func clampMotion(_ value: Float) -> Int16 {
+        let rounded = value.rounded()
+        if rounded > Float(Int16.max) { return Int16.max }
+        if rounded < Float(Int16.min) { return Int16.min }
+        return Int16(rounded)
+    }
+
+    private static func gyroDeadzone(_ value: Int16) -> Int16 {
+        return abs(Int(value)) <= 32 ? 0 : value
+    }
+
+    static func motionFromControllerApple(accelX: Float, accelY: Float, accelZ: Float,
+                                          rotationX: Float, rotationY: Float, rotationZ: Float) -> [UInt8] {
+        // GCController.motion uses a different axis basis from the phone/CoreMotion path.
+        // Match the known-good PC SDL3 controller path at the final Switch-space packet level:
+        //   accel final: (-AppleY, +AppleX, -AppleZ)
+        //   gyro final:  (+AppleY, -AppleX, +AppleZ)
+        // Do NOT pass this through motionFromApple(), because that phone helper intentionally
+        // applies the Android/phone remap and produces a 90-degree rotated accel vector for
+        // controllers connected through iOS/iPadOS.
+        let accelScale = Float(4096.0)
+        let gyroScale = Float(57.29577951308232 * 16.384)
+
+        let ax = clampMotion(-accelY * accelScale)
+        let ay = clampMotion( accelX * accelScale)
+        let az = clampMotion(-accelZ * accelScale)
+
+        let gx = gyroDeadzone(clampMotion( rotationY * gyroScale))
+        let gy = gyroDeadzone(clampMotion(-rotationX * gyroScale))
+        let gz = gyroDeadzone(clampMotion( rotationZ * gyroScale))
+
+        var out = [UInt8](repeating: 0, count: motionSampleSize)
+        out.withUnsafeMutableBufferPointer { b in
+            ns_motion_write_values(b.baseAddress!, ax, ay, az, gx, gy, gz, 1)
+        }
+        return out
+    }
+
     static func initFrame(flags: Int, seq: UInt32, timestampUs: UInt64) -> [UInt8] {
         var out = [UInt8](repeating: 0, count: frameSize)
         out.withUnsafeMutableBufferPointer { b in
@@ -1083,15 +1121,12 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
                 }
 
                 let r = motion.rotationRate
-                // Apple GCController axes are not the same as SDL HIDAPI sensor axes.
-                // Convert to the SDL-style controller sensor axes first, then let the
-                // shared ns_motion_from_android() code apply the final Switch mapping.
-                let sample = ProtocolWire.motionFromApple(accelX: Float(accel.x),
-                                                          accelY: Float(accel.y),
-                                                          accelZ: Float(accel.z),
-                                                          rotationX: Float(r.x),
-                                                          rotationY: Float(r.z),
-                                                          rotationZ: -Float(r.y))
+                let sample = ProtocolWire.motionFromControllerApple(accelX: Float(accel.x),
+                                                                            accelY: Float(accel.y),
+                                                                            accelZ: Float(accel.z),
+                                                                            rotationX: Float(r.x),
+                                                                            rotationY: Float(r.y),
+                                                                            rotationZ: Float(r.z))
                 pad.motionSamples[0] = pad.motionSamples[1]
                 pad.motionSamples[1] = pad.motionSamples[2]
                 pad.motionSamples[2] = sample
