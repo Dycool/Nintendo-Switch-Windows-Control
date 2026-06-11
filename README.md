@@ -104,6 +104,12 @@ Detailed guides and technical information are in the `docs/` folder:
 
 ---
 
+## Researching Features...
+
+* Xbox one/ series X console support
+
+---
+
 ## Reporting Issues
 
 Found a bug or have a feature request? Open an issue at **[github.com/Dycool/NS-PC-Control/issues](https://github.com/Dycool/NS-PC-Control/issues)** with as much detail as possible (OS, controller model, reproduction steps).
