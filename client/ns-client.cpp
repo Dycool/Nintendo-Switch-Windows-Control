@@ -42,6 +42,7 @@ static int closesocket(SOCKET s) { return close(s); }
 #include <SDL3/SDL_main.h>
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QCloseEvent>
 #include <QDialog>
@@ -285,6 +286,8 @@ enum { KB_OFF = 0, KB_SINGLE = 1, KB_OVERRIDE = 2 };
 static std::atomic<int> g_keyboardMode{KB_OFF};
 static std::atomic<bool> g_gyroEnabled{true};
 static std::atomic<bool> g_rumbleEnabled{true};
+static std::atomic<bool> g_homeShortcutEnabled{true};
+static std::atomic<bool> g_captureShortcutEnabled{true};
 static std::unordered_map<std::string, std::string> g_keyBindings;
 static std::mutex g_pressedKeysMutex;
 static std::unordered_set<std::string> g_pressedKeys;
@@ -362,6 +365,35 @@ public:
     void request_rescan() {
         std::lock_guard<std::mutex> lk(mtx);
         force_scan = true;
+    }
+
+    void set_gyro_enabled(bool enabled) {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (!initialized) return;
+        for (auto& d : devices) {
+            if (!d.pad || !SDL_GamepadConnected(d.pad)) continue;
+            if (SDL_GamepadHasSensor(d.pad, SDL_SENSOR_ACCEL)) {
+                d.accel_enabled = SDL_SetGamepadSensorEnabled(d.pad, SDL_SENSOR_ACCEL, enabled);
+            } else {
+                d.accel_enabled = false;
+            }
+            if (SDL_GamepadHasSensor(d.pad, SDL_SENSOR_GYRO)) {
+                d.gyro_enabled = SDL_SetGamepadSensorEnabled(d.pad, SDL_SENSOR_GYRO, enabled);
+            } else {
+                d.gyro_enabled = false;
+            }
+            if (!enabled) {
+                d.has_motion_samples = false;
+                for (int i = 0; i < 3; ++i) d.motion_samples[i].reset();
+            }
+        }
+        if (!enabled) {
+            for (auto& st : states) {
+                st.motion.reset();
+                for (int i = 0; i < 3; ++i) st.motion_samples[i].reset();
+                st.has_motion = false;
+            }
+        }
     }
 
     void set_rumble(int sdl_slot, uint8_t low, uint8_t high, uint32_t duration_ms) {
@@ -457,12 +489,12 @@ private:
         if (button(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK)) r.buttons |= ns::BTN_RSTICK;
         if (button(pad, SDL_GAMEPAD_BUTTON_GUIDE)) r.buttons |= ns::BTN_HOME;
         if (button(pad, SDL_GAMEPAD_BUTTON_MISC1)) r.buttons |= ns::BTN_CAPTURE;
-        if (should_use_combo_shortcuts(d) &&
+        if (g_homeShortcutEnabled.load() && should_use_combo_shortcuts(d) &&
             button(pad, SDL_GAMEPAD_BUTTON_LEFT_STICK) && button(pad, SDL_GAMEPAD_BUTTON_RIGHT_STICK)) {
             r.buttons |= ns::BTN_HOME;
             r.buttons &= ~(ns::BTN_LSTICK | ns::BTN_RSTICK);
         }
-        if (should_use_combo_shortcuts(d) &&
+        if (g_captureShortcutEnabled.load() && should_use_combo_shortcuts(d) &&
             button(pad, SDL_GAMEPAD_BUTTON_BACK) && button(pad, SDL_GAMEPAD_BUTTON_START)) {
             r.buttons |= ns::BTN_CAPTURE;
             r.buttons &= ~(ns::BTN_MINUS | ns::BTN_PLUS);
@@ -508,6 +540,12 @@ private:
         SDL_Gamepad* pad = d.pad;
         for (int i = 0; i < 3; ++i) out_samples[i].reset();
         has_motion = false;
+
+        if (!g_gyroEnabled.load()) {
+            d.has_motion_samples = false;
+            for (int i = 0; i < 3; ++i) d.motion_samples[i].reset();
+            return;
+        }
 
         ns::MotionReport sample{};
         constexpr float STANDARD_GRAVITY = 9.80665f;
@@ -633,8 +671,9 @@ private:
                 d.rumble_capable = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
                 d.trigger_rumble_capable = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
             }
-            if (SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) d.accel_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
-            if (SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO)) d.gyro_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, g_gyroEnabled.load());
+            const bool motion_enabled = g_gyroEnabled.load();
+            if (SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) d.accel_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, motion_enabled);
+            if (SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO)) d.gyro_enabled = SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, motion_enabled);
             devices.push_back(d);
         }
         SDL_free(ids);
@@ -1010,6 +1049,34 @@ static int load_saved_keyboard_mode() {
 static void save_keyboard_mode(int mode) {
     auto kv = read_kv_file(settings_path());
     kv["KeyboardMode"] = std::to_string(mode);
+    write_kv_file(settings_path(), kv);
+}
+
+static bool parse_bool_setting(const std::unordered_map<std::string, std::string>& kv,
+                               const std::string& key,
+                               bool fallback) {
+    auto it = kv.find(key);
+    if (it == kv.end()) return fallback;
+    std::string v = ns::macro::upper(ns::macro::trim(it->second));
+    if (v == "1" || v == "TRUE" || v == "YES" || v == "ON") return true;
+    if (v == "0" || v == "FALSE" || v == "NO" || v == "OFF") return false;
+    return fallback;
+}
+
+static void load_saved_feature_toggles() {
+    auto kv = read_kv_file(settings_path());
+    g_gyroEnabled.store(parse_bool_setting(kv, "GyroEnabled", true));
+    g_rumbleEnabled.store(parse_bool_setting(kv, "RumbleEnabled", true));
+    g_homeShortcutEnabled.store(parse_bool_setting(kv, "HomeShortcutEnabled", true));
+    g_captureShortcutEnabled.store(parse_bool_setting(kv, "CaptureShortcutEnabled", true));
+}
+
+static void save_feature_toggles() {
+    auto kv = read_kv_file(settings_path());
+    kv["GyroEnabled"] = g_gyroEnabled.load() ? "1" : "0";
+    kv["RumbleEnabled"] = g_rumbleEnabled.load() ? "1" : "0";
+    kv["HomeShortcutEnabled"] = g_homeShortcutEnabled.load() ? "1" : "0";
+    kv["CaptureShortcutEnabled"] = g_captureShortcutEnabled.load() ? "1" : "0";
     write_kv_file(settings_path(), kv);
 }
 
@@ -1780,6 +1847,7 @@ static int cli_main(const std::vector<std::string>& original_args) {
     }
 
     load_saved_bindings();
+    load_saved_feature_toggles();
     g_keyboardMode.store(cli_keyboard_mode);
     if (cli_keyboard_mode != KB_OFF) {
         std::cout << "Keyboard mode enabled (" << (cli_keyboard_mode == KB_SINGLE ? "single" : "override") << ") - ";
@@ -2094,6 +2162,67 @@ private:
     }
 };
 
+class SettingsDialog : public QDialog {
+public:
+    explicit SettingsDialog(QWidget* parent = nullptr) : QDialog(parent) {
+        setWindowTitle("Settings");
+        setModal(true);
+        setMinimumWidth(420);
+
+        auto* outer = new QVBoxLayout(this);
+        auto* hint = new QLabel("These options apply to SDL3 controllers. Press Save to apply and persist them.", this);
+        hint->setWordWrap(true);
+        outer->addWidget(hint);
+
+        gyroBox = new QCheckBox("Gyro / motion", this);
+        rumbleBox = new QCheckBox("Rumble", this);
+        homeShortcutBox = new QCheckBox("Home shortcut (LStick + RStick)", this);
+        captureShortcutBox = new QCheckBox("Capture shortcut (Minus + Plus)", this);
+
+        gyroBox->setChecked(g_gyroEnabled.load());
+        rumbleBox->setChecked(g_rumbleEnabled.load());
+        homeShortcutBox->setChecked(g_homeShortcutEnabled.load());
+        captureShortcutBox->setChecked(g_captureShortcutEnabled.load());
+
+        outer->addWidget(gyroBox);
+        outer->addWidget(rumbleBox);
+        outer->addWidget(homeShortcutBox);
+        outer->addWidget(captureShortcutBox);
+
+        auto* buttons = new QGridLayout();
+        QPushButton* save = new QPushButton("Save", this);
+        QPushButton* cancel = new QPushButton("Cancel", this);
+        buttons->addWidget(save, 0, 2);
+        buttons->addWidget(cancel, 0, 3);
+        outer->addLayout(buttons);
+
+        connect(save, &QPushButton::clicked, this, [this] { saveSettings(); });
+        connect(cancel, &QPushButton::clicked, this, &QDialog::reject);
+    }
+
+private:
+    QCheckBox* gyroBox = nullptr;
+    QCheckBox* rumbleBox = nullptr;
+    QCheckBox* homeShortcutBox = nullptr;
+    QCheckBox* captureShortcutBox = nullptr;
+
+    void saveSettings() {
+        const bool gyro = gyroBox->isChecked();
+        const bool rumble = rumbleBox->isChecked();
+
+        g_gyroEnabled.store(gyro);
+        g_rumbleEnabled.store(rumble);
+        g_homeShortcutEnabled.store(homeShortcutBox->isChecked());
+        g_captureShortcutEnabled.store(captureShortcutBox->isChecked());
+        save_feature_toggles();
+
+        g_sdlInput.set_gyro_enabled(gyro);
+        if (!rumble) g_sdlInput.stop_all_rumble();
+
+        accept();
+    }
+};
+
 static bool validate_macro_hotkey_for_entry_qt(const std::string& hotkey, int skip_index, QWidget* parent) {
     std::string conflict;
     if (macro_hotkey_conflicts(hotkey, &conflict)) {
@@ -2395,6 +2524,7 @@ private:
 class MainWindow : public QWidget {
 public:
     explicit MainWindow() {
+        load_saved_feature_toggles();
         setWindowTitle("NS PC Control");
         setWindowIcon(app_icon());
         setFixedSize(platformWidth(), platformHeight());
@@ -2434,7 +2564,9 @@ public:
         grid->addWidget(bindingsBtn, 2, 3);
 
         macrosBtn = new QPushButton("Macros...", this);
+        settingsBtn = new QPushButton("Settings...", this);
         grid->addWidget(macrosBtn, 3, 1, 1, 2);
+        grid->addWidget(settingsBtn, 3, 3);
 
         connectBtn = new QPushButton("Connect", this);
         quitBtn = new QPushButton("Quit", this);
@@ -2470,6 +2602,11 @@ public:
             auto* dlg = new MacroDialog(this);
             dlg->setAttribute(Qt::WA_DeleteOnClose);
             dlg->show();
+        });
+        connect(settingsBtn, &QPushButton::clicked, this, [this] {
+            SettingsDialog dlg(this);
+            dlg.exec();
+            updateUi();
         });
         connect(connectBtn, &QPushButton::clicked, this, [this] { toggleConnection(); });
         connect(quitBtn, &QPushButton::clicked, qApp, &QApplication::quit);
@@ -2508,6 +2645,7 @@ private:
     QComboBox* keyboardCombo = nullptr;
     QPushButton* bindingsBtn = nullptr;
     QPushButton* macrosBtn = nullptr;
+    QPushButton* settingsBtn = nullptr;
     QPushButton* connectBtn = nullptr;
     QPushButton* quitBtn = nullptr;
     QLabel* statusLabel = nullptr;
