@@ -25,7 +25,7 @@ static void ns_write_u64le(uint8_t* p, uint64_t v) {
 
 float ns_standard_gravity(void) { return 9.80665f; }
 float ns_accel_scale_android(void) { return 4096.0f / 9.80665f; }
-float ns_accel_scale_apple(void) { return 4096.0f; }
+
 float ns_gyro_scale(void) { return 57.29577951308232f * 16.384f; }
 
 uint8_t ns_axis_to_byte(float v) {
@@ -178,39 +178,7 @@ void ns_motion_from_android(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
         1);
 }
 
-static struct {
-    int input;  // 0=X, 1=Y, 2=Z
-    int sign;   // +1 or -1
-} gRemap[3] = {{2, -1}, {0, -1}, {1, 1}};  // defaults: (-z, -x, +y)
 
-void ns_set_motion_remap(int ax_input, int ax_sign,
-                         int ay_input, int ay_sign,
-                         int az_input, int az_sign) {
-    gRemap[0].input = ax_input; gRemap[0].sign = ax_sign == -1 ? -1 : 1;
-    gRemap[1].input = ay_input; gRemap[1].sign = ay_sign == -1 ? -1 : 1;
-    gRemap[2].input = az_input; gRemap[2].sign = az_sign == -1 ? -1 : 1;
-}
-
-void ns_motion_from_apple(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
-                          float gravity_x,
-                          float gravity_y,
-                          float gravity_z,
-                          float rotation_x,
-                          float rotation_y,
-                          float rotation_z) {
-    const float accel_scale = ns_accel_scale_apple();
-    const float gyro_scale = ns_gyro_scale();
-    float g[3] = {gravity_x, gravity_y, gravity_z};
-    float r[3] = {rotation_x, rotation_y, rotation_z};
-    ns_motion_write_values(out_motion,
-        ns_clamp_motion(pick_value(g[0], g[1], g[2], gRemap[0].input) * (float)gRemap[0].sign * accel_scale),
-        ns_clamp_motion(pick_value(g[0], g[1], g[2], gRemap[1].input) * (float)gRemap[1].sign * accel_scale),
-        ns_clamp_motion(pick_value(g[0], g[1], g[2], gRemap[2].input) * (float)gRemap[2].sign * accel_scale),
-        ns_gyro_deadzone(ns_clamp_motion(pick_value(r[0], r[1], r[2], gRemap[0].input) * (float)gRemap[0].sign * gyro_scale)),
-        ns_gyro_deadzone(ns_clamp_motion(pick_value(r[0], r[1], r[2], gRemap[1].input) * (float)gRemap[1].sign * gyro_scale)),
-        ns_gyro_deadzone(ns_clamp_motion(pick_value(r[0], r[1], r[2], gRemap[2].input) * (float)gRemap[2].sign * gyro_scale)),
-        1);
-}
 
 void ns_pad_write_neutral(uint8_t out_pad[NS_PROTOCOL_EXT_PAD_SIZE]) {
     if (!out_pad) return;

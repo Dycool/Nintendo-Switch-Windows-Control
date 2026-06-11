@@ -89,9 +89,12 @@ private enum ProtocolWire {
 
     static func motionFromApple(gravityX: Float, gravityY: Float, gravityZ: Float,
                                 rotationX: Float, rotationY: Float, rotationZ: Float) -> [UInt8] {
+        // Convert gravity from G's to m/s², then use the shared android function.
+        let g = Float(9.80665)
         var out = [UInt8](repeating: 0, count: motionSampleSize)
         out.withUnsafeMutableBufferPointer { b in
-            ns_motion_from_apple(b.baseAddress!, gravityX, gravityY, gravityZ, rotationX, rotationY, rotationZ)
+            ns_motion_from_android(b.baseAddress!, gravityX * g, gravityY * g, gravityZ * g,
+                                   rotationX, rotationY, rotationZ)
         }
         return out
     }
@@ -176,7 +179,7 @@ private final class PhysicalPad {
     var motionSampleCount = 0
 
     func reset() {
-        stopRumble()
+        cleanupRumble()
         controller = nil
         name = "Empty"
         present = false
@@ -215,6 +218,10 @@ private final class PhysicalPad {
     func stopRumble() {
         try? hapticPlayer?.stop(atTime: CHHapticTimeImmediate)
         hapticPlayer = nil
+    }
+
+    func cleanupRumble() {
+        stopRumble()
         hapticEngine?.stop(completionHandler: nil)
         hapticEngine = nil
     }
@@ -1111,52 +1118,45 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
         let now = uptimeMs()
         let neutral = (low == 0 && high == 0) || duration10Ms == 0
         physicalPads.withLock { pads in
-            let pad = pads[subpad]
-            guard pad.present else { return }
+            guard subpad < pads.count, pads[subpad].present else { return }
             if neutral {
-                pad.rumbleLow = 0
-                pad.rumbleHigh = 0
-                pad.rumbleUntilMs = 0
-                pad.rumbleLastSetMs = now
-                pad.stopRumble()
+                pads[subpad].rumbleLow = 0
+                pads[subpad].rumbleHigh = 0
+                pads[subpad].rumbleUntilMs = 0
+                pads[subpad].rumbleLastSetMs = now
+                pads[subpad].stopRumble()
                 return
             }
             let duration = UInt64(max(250, min(max(duration10Ms, 1), 255) * 10))
-            if pad.rumbleLow == low && pad.rumbleHigh == high && now - pad.rumbleLastSetMs < 100 {
-                pad.rumbleUntilMs = now + duration
+            if pads[subpad].rumbleLow == low && pads[subpad].rumbleHigh == high && now - pads[subpad].rumbleLastSetMs < 100 {
+                pads[subpad].rumbleUntilMs = now + duration
                 return
             }
-            pad.rumbleLow = low
-            pad.rumbleHigh = high
-            pad.rumbleUntilMs = now + duration
-            pad.rumbleLastSetMs = now
-            playControllerHaptic(pad: pad, low: low, high: high, durationMs: duration)
+            pads[subpad].rumbleLow = low
+            pads[subpad].rumbleHigh = high
+            pads[subpad].rumbleUntilMs = now + duration
+            pads[subpad].rumbleLastSetMs = now
+            playControllerHaptic(pad: &pads[subpad], low: low, high: high, durationMs: duration)
         }
     }
 
-    private func playControllerHaptic(pad: PhysicalPad, low: Int, high: Int, durationMs: UInt64) {
+    private func playControllerHaptic(pad: inout PhysicalPad, low: Int, high: Int, durationMs: UInt64) {
         guard let haptics = pad.controller?.haptics else { return }
         do {
-            let engine: CHHapticEngine
-            if let existing = pad.hapticEngine {
-                engine = existing
-            } else {
-                let localities: [GCHapticsLocality] = [.default, .all]
-                var created: CHHapticEngine?
+            if pad.hapticEngine == nil {
+                let localities: [GCHapticsLocality] = [.default, .all, .leftHandle, .rightHandle]
                 for locality in localities {
                     if let candidate = try? haptics.createEngine(withLocality: locality) {
-                        created = candidate
+                        candidate.resetHandler = { [weak hapticEngine = candidate] in
+                            try? hapticEngine?.start()
+                        }
+                        try candidate.start()
+                        pad.hapticEngine = candidate
                         break
                     }
                 }
-                guard let created else { return }
-                created.resetHandler = { [weak pad] in
-                    try? pad?.hapticEngine?.start()
-                }
-                try created.start()
-                pad.hapticEngine = created
-                engine = created
             }
+            guard let engine = pad.hapticEngine else { return }
 
             try? pad.hapticPlayer?.stop(atTime: CHHapticTimeImmediate)
             pad.hapticPlayer = nil
@@ -1170,12 +1170,14 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
             try player.start(atTime: CHHapticTimeImmediate)
             pad.hapticPlayer = player
         } catch {
-            // Some iOS controllers expose input but no usable controller haptics.
+            if pad.hapticEngine != nil {
+                pad.hapticEngine = nil
+            }
         }
     }
 
     private func stopAllPhysicalRumble() {
-        physicalPads.withLock { pads in pads.forEach { $0.stopRumble() } }
+        physicalPads.withLock { pads in pads.forEach { $0.cleanupRumble() } }
     }
 
     private func readU32LE(_ bytes: [UInt8], _ off: Int) -> UInt32 {

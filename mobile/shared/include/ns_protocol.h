@@ -58,7 +58,6 @@ enum {
 
 float ns_standard_gravity(void);
 float ns_accel_scale_android(void);
-float ns_accel_scale_apple(void);
 float ns_gyro_scale(void);
 
 uint8_t ns_axis_to_byte(float v);
@@ -97,7 +96,7 @@ void ns_motion_write_values(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
                             int16_t gz,
                             int has_motion);
 
-// Android accelerometer is in m/s^2, so accel is divided by standard gravity.
+// All platforms: accelerometer in m/s², gyroscope in rad/s.
 void ns_motion_from_android(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
                             float accel_x,
                             float accel_y,
@@ -105,21 +104,6 @@ void ns_motion_from_android(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
                             float gyro_x,
                             float gyro_y,
                             float gyro_z);
-
-// Apple CoreMotion gravity is already in g units.
-void ns_motion_from_apple(uint8_t out_motion[NS_PROTOCOL_MOTION_SIZE],
-                          float gravity_x,
-                          float gravity_y,
-                          float gravity_z,
-                          float rotation_x,
-                          float rotation_y,
-                          float rotation_z);
-
-// Dynamic remap for ns_motion_from_apple. Default: (-z, -x, +y).
-// Each axis: input=0(X)/1(Y)/2(Z), sign=+1 or -1.
-void ns_set_motion_remap(int ax_input, int ax_sign,
-                         int ay_input, int ay_sign,
-                         int az_input, int az_sign);
 
 void ns_pad_write_neutral(uint8_t out_pad[NS_PROTOCOL_EXT_PAD_SIZE]);
 void ns_pad_set_hid(uint8_t out_pad[NS_PROTOCOL_EXT_PAD_SIZE],
