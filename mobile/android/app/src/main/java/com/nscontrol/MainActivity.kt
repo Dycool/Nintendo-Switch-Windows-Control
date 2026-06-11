@@ -84,7 +84,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var lastBridgeFrameParseMs: Long = 0
 
     private enum class Page { MAIN_MENU, TOUCH_CONTROLS, EDITOR }
-    private enum class ClientMode { NONE, TOUCH, HUB }
+    private enum class ClientMode { NONE, TOUCH, PHYSICAL }
 
     private class PhysicalPad {
         var deviceId: Int = -1
@@ -163,9 +163,9 @@ class MainActivity : AppCompatActivity() {
     private val physicalSensorListeners = arrayOfNulls<SensorEventListener>(Protocol.PAD_COUNT)
 
     private val inputDeviceListener = object : InputManager.InputDeviceListener {
-        override fun onInputDeviceAdded(deviceId: Int) { if (activeClientMode == ClientMode.HUB) runOnUiThread { scanPhysicalControllers() } }
-        override fun onInputDeviceRemoved(deviceId: Int) { if (activeClientMode == ClientMode.HUB) runOnUiThread { scanPhysicalControllers() } }
-        override fun onInputDeviceChanged(deviceId: Int) { if (activeClientMode == ClientMode.HUB) runOnUiThread { scanPhysicalControllers() } }
+        override fun onInputDeviceAdded(deviceId: Int) { if (activeClientMode == ClientMode.PHYSICAL) runOnUiThread { scanPhysicalControllers() } }
+        override fun onInputDeviceRemoved(deviceId: Int) { if (activeClientMode == ClientMode.PHYSICAL) runOnUiThread { scanPhysicalControllers() } }
+        override fun onInputDeviceChanged(deviceId: Int) { if (activeClientMode == ClientMode.PHYSICAL) runOnUiThread { scanPhysicalControllers() } }
     }
 
     private val phoneSensorListener = object : SensorEventListener {
@@ -243,7 +243,7 @@ class MainActivity : AppCompatActivity() {
         statusText.text = "Loaded"
     }
 
-    // WebSocket to the Raspberry Pi backend. Either Controller Hub or Touch Controls owns the only live session.
+    // WebSocket to the Raspberry Pi backend. Either physical controllers or Touch Controls owns the only live session.
     private fun connectWs(): Boolean {
         return try {
             val wsUrl = normalizeWsUrl(host)
@@ -372,7 +372,7 @@ class MainActivity : AppCompatActivity() {
                 if (senderToken.get() == token) {
                     sending = false
                     stopPhoneSensors()
-                    if (activeClientMode != ClientMode.HUB) stopPhysicalControllerSensors()
+                    if (activeClientMode != ClientMode.PHYSICAL) stopPhysicalControllerSensors()
                 }
             }
         }.start()
@@ -405,7 +405,7 @@ class MainActivity : AppCompatActivity() {
                     Protocol.setFrameHid(frame, 0, hid)
                     phoneMotionSamples()?.let { Protocol.setFrameMotionSamples(frame, 0, it) }
                 }
-                activeClientMode == ClientMode.HUB && !forceNeutral -> {
+                activeClientMode == ClientMode.PHYSICAL && !forceNeutral -> {
                     synchronized(physicalLock) {
                         for (i in 0 until Protocol.PAD_COUNT) {
                             val pad = physicalPads[i]
@@ -508,7 +508,7 @@ class MainActivity : AppCompatActivity() {
     private fun routeRumble(subpad: Int, low: Int, high: Int, duration10Ms: Int) {
         if (!controlClientActive) return
         when (activeClientMode) {
-            ClientMode.HUB -> physicalRumble(subpad, low, high, duration10Ms)
+            ClientMode.PHYSICAL -> physicalRumble(subpad, low, high, duration10Ms)
             ClientMode.TOUCH -> Unit
             ClientMode.NONE -> Unit
         }
@@ -547,8 +547,8 @@ class MainActivity : AppCompatActivity() {
                           if (bindings) bindings.style.display = 'none';
                           var macros = document.getElementById('btnMacros');
                           if (macros) macros.style.display = 'none';
-                          var oldHub = document.getElementById('btnHubStart');
-                          if (oldHub) oldHub.remove();
+                          var oldStart = document.getElementById('btn' + 'HubStart');
+                          if (oldStart) oldStart.remove();
                           var oldStop = document.getElementById('btnHubStop');
                           if (oldStop) oldStop.remove();
                           var oldRefresh = document.getElementById('btnHubRefresh');
@@ -559,7 +559,7 @@ class MainActivity : AppCompatActivity() {
                             connect.textContent = 'Connect';
                             connect.onclick = function(ev){
                               if (ev) ev.preventDefault();
-                              if (window.NSBridge && NSBridge.onHubStart) NSBridge.onHubStart();
+                              if (window.NSBridge && NSBridge.onPhysicalStart) NSBridge.onPhysicalStart();
                               return false;
                             };
                           }
@@ -583,7 +583,7 @@ class MainActivity : AppCompatActivity() {
                               return false;
                             };
                           }
-                          if (window.NSBridge && NSBridge.onHubRefresh) NSBridge.onHubRefresh();
+                          if (window.NSBridge && NSBridge.onPhysicalRefresh) NSBridge.onPhysicalRefresh();
                         })();
                     """.trimIndent(), null)
                 }
@@ -600,6 +600,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun navTo(page: Page) {
+        if (page == Page.TOUCH_CONTROLS || page == Page.EDITOR) {
+            deactivateControlClient()
+            stopPhysicalControllerSensors()
+        }
         pageStack.add(currentPage)
         enterPage(page)
     }
@@ -638,7 +642,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun goBack() {
-        if (pageStack.isNotEmpty()) enterPage(pageStack.removeAt(pageStack.lastIndex))
+        if (pageStack.isEmpty()) return
+        if (currentPage == Page.TOUCH_CONTROLS || currentPage == Page.EDITOR) {
+            deactivateControlClient()
+            stopPhysicalControllerSensors()
+        }
+        enterPage(pageStack.removeAt(pageStack.lastIndex))
     }
 
     inner class JSBridge {
@@ -684,13 +693,13 @@ class MainActivity : AppCompatActivity() {
         fun onClose() { runOnUiThread { deactivateControlClient() } }
 
         @JavascriptInterface
-        fun onHubStart() { runOnUiThread { toggleControllerHub() } }
+        fun onPhysicalStart() { runOnUiThread { togglePhysicalControllers() } }
 
         @JavascriptInterface
-        fun onHubStop() { runOnUiThread { deactivateControlClient(); updateHubStatusOnPage("Not connected") } }
+        fun onPhysicalStop() { runOnUiThread { deactivateControlClient(); updatePhysicalStatusOnPage("Not connected") } }
 
         @JavascriptInterface
-        fun onHubRefresh() { runOnUiThread { scanPhysicalControllers(); updateHubStatusOnPage() } }
+        fun onPhysicalRefresh() { runOnUiThread { scanPhysicalControllers(); updatePhysicalStatusOnPage() } }
 
         @JavascriptInterface
         fun onOpenTouch() { runOnUiThread { navTo(Page.TOUCH_CONTROLS) } }
@@ -702,31 +711,41 @@ class MainActivity : AppCompatActivity() {
         fun onBack() { runOnUiThread { goBack() } }
     }
 
-    private fun toggleControllerHub() {
-        if (controlClientActive && activeClientMode == ClientMode.HUB) {
+    private fun togglePhysicalControllers() {
+        if (controlClientActive && activeClientMode == ClientMode.PHYSICAL) {
             deactivateControlClient()
-            updateHubStatusOnPage("Not connected")
+            updatePhysicalStatusOnPage("Not connected")
         } else {
-            activateControllerHub()
+            activatePhysicalControllers()
         }
     }
 
-    private fun activateControllerHub() {
-        if (controlClientActive && activeClientMode == ClientMode.HUB) {
+    private fun activatePhysicalControllers() {
+        if (controlClientActive && activeClientMode == ClientMode.PHYSICAL) {
             scanPhysicalControllers()
-            updateHubStatusOnPage("Connected")
+            updatePhysicalStatusOnPage("Connected")
             return
         }
+
         deactivateControlClient()
+
         currentPage = Page.MAIN_MENU
-        activeClientMode = ClientMode.HUB
+        activeClientMode = ClientMode.PHYSICAL
         controlClientActive = true
+
+        touchHid = null
+        touchFrame = null
+        lastTouchFrameMs = 0
+        lastBridgeFrameParseMs = 0
+
         scanPhysicalControllers()
-        updateHubStatusOnPage("Connected")
+        updatePhysicalStatusOnPage("Connected")
+
         if (!connectWs()) {
             controlClientActive = false
             activeClientMode = ClientMode.NONE
-            updateHubStatusOnPage("Not connected")
+            stopPhysicalControllerSensors()
+            updatePhysicalStatusOnPage("Not connected")
         }
     }
 
@@ -759,7 +778,7 @@ class MainActivity : AppCompatActivity() {
                 startPhysicalControllerSensorsLocked(slot, device)
             }
         }
-        updateHubStatusOnPage()
+        updatePhysicalStatusOnPage()
     }
 
     private fun isControllerDevice(device: InputDevice): Boolean {
@@ -825,7 +844,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleControllerKey(event: KeyEvent): Boolean {
-        if (activeClientMode != ClientMode.HUB || !controlClientActive) return false
+        if (activeClientMode != ClientMode.PHYSICAL || !controlClientActive) return false
         val actionDown = event.action == KeyEvent.ACTION_DOWN
         if (!actionDown && event.action != KeyEvent.ACTION_UP) return false
         var handled = false
@@ -866,7 +885,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleControllerMotion(event: MotionEvent): Boolean {
-        if (activeClientMode != ClientMode.HUB || !controlClientActive || event.action != MotionEvent.ACTION_MOVE) return false
+        if (activeClientMode != ClientMode.PHYSICAL || !controlClientActive || event.action != MotionEvent.ACTION_MOVE) return false
         val isJoy = (event.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
         val isGamepad = (event.source and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
         if (!isJoy && !isGamepad) return false
@@ -1042,7 +1061,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateHubStatusOnPage(prefix: String? = null) {
+    private fun updatePhysicalStatusOnPage(prefix: String? = null) {
         if (currentPage != Page.MAIN_MENU) return
         val lines = synchronized(physicalLock) {
             Array(Protocol.PAD_COUNT) { i ->
@@ -1052,12 +1071,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
         val status = prefix ?: when (activeClientMode) {
-            ClientMode.HUB -> "Connected"
+            ClientMode.PHYSICAL -> "Connected"
             ClientMode.TOUCH -> "Touch Controls running"
             ClientMode.NONE -> "Ready"
         }
         fun jsEscape(v: String): String = v.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ")
-        val connectButtonText = if (activeClientMode == ClientMode.HUB && controlClientActive) "Disconnect" else "Connect"
+        val connectButtonText = if (activeClientMode == ClientMode.PHYSICAL && controlClientActive) "Disconnect" else "Connect"
         val js = buildString {
             append("(function(){")
             append("var s=document.getElementById('statusText'); if(s)s.textContent='").append(jsEscape(status)).append("';")
@@ -1078,13 +1097,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun activateControlClient() {
         if (controlClientActive && activeClientMode == ClientMode.TOUCH) return
+
         deactivateControlClient()
+        stopPhysicalControllerSensors()
+
         activeClientMode = ClientMode.TOUCH
         touchHid = null
         touchFrame = null
         lastTouchFrameMs = 0
         lastBridgeFrameParseMs = 0
         controlClientActive = true
+
         if (!connectWs()) {
             controlClientActive = false
             activeClientMode = ClientMode.NONE

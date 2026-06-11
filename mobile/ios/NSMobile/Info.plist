@@ -12,6 +12,10 @@
     <string>6.0</string>
     <key>CFBundleName</key>
     <string>NS Mobile</string>
+    <key>CFBundleDisplayName</key>
+    <string>NS Mobile</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
