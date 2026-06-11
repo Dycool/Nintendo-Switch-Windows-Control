@@ -532,7 +532,7 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
           var kb = document.getElementById('kbModeContainer'); if (kb) kb.style.display = 'none';
           var bindings = document.getElementById('btnBindings'); if (bindings) bindings.style.display = 'none';
           var macros = document.getElementById('btnMacros'); if (macros) macros.style.display = 'none';
-          var oldStart = document.querySelector('[id="btn"+"HubStart"]') || document.getElementById('btn' + 'HubStart'); if (oldStart) oldStart.remove();
+          var oldStart = document.getElementById('btn' + 'HubStart'); if (oldStart) oldStart.remove();
           var oldStop = document.getElementById('btn' + 'HubStop'); if (oldStop) oldStop.remove();
           var oldRefresh = document.getElementById('btn' + 'HubRefresh'); if (oldRefresh) oldRefresh.remove();
           var connect = document.getElementById('btnConnect');
@@ -541,16 +541,28 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
             connect.textContent = 'Connect';
             connect.onclick = function(ev){ if(ev)ev.preventDefault(); if(window.NSBridge&&NSBridge.onPhysicalStart)NSBridge.onPhysicalStart(); return false; };
           }
+          function nsButtonHost(){
+            return document.querySelector('.actions') || document.querySelector('main') || document.body;
+          }
           var touch = document.getElementById('btnTouchControls');
-          if (touch) {
-            touch.style.display = 'inline-block';
-            touch.onclick = function(ev){ if(ev)ev.preventDefault(); if(window.NSBridge&&NSBridge.onOpenTouch)NSBridge.onOpenTouch(); else window.location.href='mobile.html'; return false; };
+          if (!touch) {
+            touch = document.createElement('button');
+            touch.id = 'btnTouchControls';
+            touch.textContent = 'Touch Controls';
+            nsButtonHost().appendChild(touch);
           }
+          touch.style.display = 'inline-block';
+          touch.onclick = function(ev){ if(ev)ev.preventDefault(); if(window.NSBridge&&NSBridge.onOpenTouch)NSBridge.onOpenTouch(); else window.location.href='mobile.html'; return false; };
+
           var editor = document.getElementById('btnEditor');
-          if (editor) {
-            editor.style.display = 'inline-block';
-            editor.onclick = function(ev){ if(ev)ev.preventDefault(); if(window.NSBridge&&NSBridge.onOpenEditor)NSBridge.onOpenEditor(); else window.location.href='editor.html'; return false; };
+          if (!editor) {
+            editor = document.createElement('button');
+            editor.id = 'btnEditor';
+            editor.textContent = 'Editor';
+            nsButtonHost().appendChild(editor);
           }
+          editor.style.display = 'inline-block';
+          editor.onclick = function(ev){ if(ev)ev.preventDefault(); if(window.NSBridge&&NSBridge.onOpenEditor)NSBridge.onOpenEditor(); else window.location.href='editor.html'; return false; };
           if (window.NSBridge && NSBridge.onPhysicalRefresh) NSBridge.onPhysicalRefresh();
         })();
         """
@@ -903,9 +915,11 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
     private func remapForInterfaceOrientation(x: Float, y: Float, z: Float, orientation: UIInterfaceOrientation) -> (Float, Float, Float) {
         switch orientation {
         case .landscapeLeft:
-            return (y, -x, z)
-        case .landscapeRight:
+            // Match Android Surface.ROTATION_90 behavior: (-Y, +X, +Z).
             return (-y, x, z)
+        case .landscapeRight:
+            // Match Android Surface.ROTATION_270 behavior: (+Y, -X, +Z).
+            return (y, -x, z)
         case .portraitUpsideDown:
             return (-x, -y, z)
         default:
