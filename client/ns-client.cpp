@@ -846,11 +846,17 @@ static bool probe_server_sync(const std::string& host, int port) {
     }
 
     ns::ServerInfoProbe probe{};
-    send_all_udp(sock, dest, &probe, sizeof(probe));
-
-    bool ok = false;
     const uint64_t deadline = ns::now_us() + 1000000ULL;
+    int send_count = 0;
+    int max_sends = 3;
+
     while (ns::now_us() < deadline) {
+        // Retransmit probe periodically in case of packet loss
+        if (send_count < max_sends) {
+            send_all_udp(sock, dest, &probe, sizeof(probe));
+            send_count++;
+        }
+
         ns::ServerInfoReply reply{};
         sockaddr_in from{};
 #ifdef _WIN32
@@ -864,16 +870,15 @@ static bool probe_server_sync(const std::string& host, int port) {
         if (n == (int)sizeof(reply) &&
             reply.magic == ns::SERVER_INFO_MAGIC &&
             reply.version == ns::SERVER_INFO_VERSION) {
-            ok = true;
-            break;
+            closesocket(sock);
+            return true;
         }
-        if (n < 0 && socket_would_block()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     closesocket(sock);
-    return ok;
+    return false;
 }
 
 static uint32_t g_macro_udp_seq = 0;
