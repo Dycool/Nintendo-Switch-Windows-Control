@@ -14,7 +14,7 @@ This project was built from scratch in **C++** and uses **UDP** for low latency.
 
 **Web App & Mobile Touch Controls** - The server includes an embedded web interface with a desktop control panel and touch-optimized mobile gamepad, no client install needed.
 
-**Gyroscope and Rumble** - PC clients with gyro-capable controllers (DS4, DualSense, compatible USB motion pads), Android devices, and iOS devices can send motion data to the console and receive rumble feedback.
+**Gyroscope and Rumble** - PC clients with gyro-capable controllers (DS4, DualSense, compatible USB motion pads), Android and iOS can send motion data! Rumble is only supported on PC clients or controllers connected through the mobile apps.
 
 **Supports any raspberry pi with usb gadget!**
 
