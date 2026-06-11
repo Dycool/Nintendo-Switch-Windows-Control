@@ -143,7 +143,7 @@ window.WebSocket.CLOSED = 3;
     <div id="macroOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); justify-content:center; align-items:center; z-index:10001;">
         <div style="background:#1E1E1E; color:#E0E0E0; padding:18px; border-radius:8px; width:90%; max-width:520px; box-shadow:0 4px 12px rgba(0,0,0,0.5);">
             <h3 style="margin-top:0; color:#CC0000;">Macros</h3>
-            <div id="macroRows" style="min-height:28px; margin-bottom:12px;"></div>
+            <div id="macroRows" style="min-height:28px; max-height:45vh; overflow-y:auto; margin-bottom:12px;"></div>
             <input id="macroImportFile" type="file" accept="application/json,.json" style="display:none">
             <div style="display:grid; grid-template-columns:88px 1fr 88px; gap:8px; margin-top:10px;">
                 <button id="btnMacroImport">Import</button><button id="btnMacroRecord" style="grid-column:3;">Record P1</button>
@@ -334,13 +334,25 @@ function parseMacro(objOrText) {
     return steps;
 }
 function normalizeMacroKey(k) { return String(k || '').trim().toUpperCase(); }
+function isValidKeyCode(code) {
+    if (!code) return true;
+    const c = normalizeMacroKey(code);
+    if (c === 'ESCAPE' || c === 'SPACE' || c === 'ENTER' || c === 'TAB' || c === 'BACKSPACE' || c === 'DELETE' || c === 'INSERT' || c === 'HOME' || c === 'END' || c === 'PAGEUP' || c === 'PAGEDOWN' || c === 'CAPSLOCK' || c === 'NUMLOCK' || c === 'SCROLLLOCK' || c === 'PAUSE' || c === 'PRINTSCREEN' || c === 'CONTEXTMENU') return true;
+    if (/^KEY[A-Z]$/.test(c)) return true;
+    if (/^DIGIT[0-9]$/.test(c)) return true;
+    if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(c)) return true;
+    if (/^ARROW(?:UP|DOWN|LEFT|RIGHT)$/.test(c)) return true;
+    if (/^(?:SHIFT|CONTROL|ALT|META)(?:LEFT|RIGHT)$/.test(c)) return true;
+    if (/^NUMPAD(?:[0-9]|ADD|SUBTRACT|MULTIPLY|DIVIDE|DECIMAL|ENTER)$/.test(c)) return true;
+    return false;
+}
 function macroEntryName(m,i) { return (m && m.name) || `Macro ${i+1}`; }
 function uniqueMacroName(base) { base=String(base||'Recorded Macro').trim()||'Recorded Macro'; let n=base, s=2; while(savedMacros.some(m=>String(m.name||'').toUpperCase()===n.toUpperCase())) n=`${base} ${s++}`; return n; }
-function macroPrettyEntry(obj) { const m=macroPrettyObject(obj); if (!m.name) m.name='Macro'; m.hotkey=normalizeMacroKey(obj && obj.hotkey); return m; }
+function macroPrettyEntry(obj) { const m=macroPrettyObject(obj); if (!m.name) m.name='Macro'; const hk = normalizeMacroKey(obj && obj.hotkey); m.hotkey = isValidKeyCode(hk) ? hk : ''; return m; }
 function persistMacros() { savedMacros = savedMacros.map(macroPrettyEntry); localStorage.setItem('nswc_macros', JSON.stringify(savedMacros)); }
 function macroEntriesExport(entries=savedMacros) { return JSON.stringify({macros:entries.map(macroPrettyEntry)}, null, 2); }
-function macroHotkeyConflicts(code, skip=-1) { code=normalizeMacroKey(code); if (!code) return false; if (Object.values(currentBindings).includes(code)) return 'keyboard binding'; const dup=savedMacros.find((m,i)=>i!==skip && normalizeMacroKey(m.hotkey)===code); return dup ? (dup.name || 'another macro') : false; }
-function refreshMacroList() { const rows=document.getElementById('macroRows'); if(!rows) return; rows.innerHTML=''; if(!savedMacros.length){ const e=document.createElement('div'); e.textContent='No macros'; e.style.cssText='text-align:center; width:250px; padding:4px;'; rows.appendChild(e); } savedMacros.forEach((m,i)=>{ const r=document.createElement('div'); r.style.cssText='display:grid; grid-template-columns:minmax(0,250px) 110px 68px 64px 64px; gap:4px; margin-bottom:4px;'; const add=(txt,fn)=>{const b=document.createElement('button'); b.textContent=txt; b.onclick=fn; b.style.cssText='width:100%;box-sizing:border-box;'; r.appendChild(b);}; add(macroEntryName(m,i),()=>runMacroServerSide(m)); add(formatKeyName(m.hotkey),()=>beginMacroHotkeyListen(i)); add('Rename',()=>renameMacro(i)); add('Export',()=>exportOneMacro(i)); add('Delete',()=>{savedMacros.splice(i,1); persistMacros(); refreshMacroList();}); rows.appendChild(r); }); }
+function macroHotkeyConflicts(code, skip=-1) { code=normalizeMacroKey(code); if (!code) return false; if (Object.values(currentBindings).some(v=>normalizeMacroKey(v)===code)) return 'keyboard binding'; const dup=savedMacros.find((m,i)=>i!==skip && normalizeMacroKey(m.hotkey)===code); return dup ? (dup.name || 'another macro') : false; }
+function refreshMacroList() { const rows=document.getElementById('macroRows'); if(!rows) return; rows.innerHTML=''; if(!savedMacros.length){ const e=document.createElement('div'); e.textContent='No macros'; e.style.cssText='text-align:center; width:100%; padding:4px;'; rows.appendChild(e); } savedMacros.forEach((m,i)=>{ const r=document.createElement('div'); r.style.cssText='display:grid; grid-template-columns:minmax(0,250px) 110px 68px 64px 64px; gap:4px; margin-bottom:4px;'; const add=(txt,fn)=>{const b=document.createElement('button'); b.textContent=txt; b.onclick=fn; b.style.cssText='width:100%;box-sizing:border-box;display:flex;justify-content:center;align-items:center;'; r.appendChild(b);}; add(macroEntryName(m,i),()=>runMacroServerSide(m)); add(formatKeyName(m.hotkey),()=>beginMacroHotkeyListen(i)); add('Rename',()=>renameMacro(i)); add('Export',()=>exportOneMacro(i)); add('Delete',()=>{savedMacros.splice(i,1); persistMacros(); refreshMacroList();}); rows.appendChild(r); }); }
 function startMacro(objOrText) { macroSteps = parseMacro(objOrText); if (!macroSteps.length) { alert('No usable macro commands. Example: WAIT 200; A 100; B 100'); return; } macroRunning = true; macroStepIndex = 0; macroState = getNeutralState(); macroStepUntil = performance.now(); }
 function updateMacroState() {
     if (!macroRunning) return null; const now = performance.now();
@@ -377,14 +389,18 @@ function exportMacrosJson() {
 function exportOneMacro(i) { const blob=new Blob([macroEntriesExport([savedMacros[i]])],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=`${macroEntryName(savedMacros[i],i).replace(/[\\/:*?"<>|]/g,'_')}.json`; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); }
 function importMacrosJsonText(txt) {
     let data = JSON.parse(txt); let replace=false; if (data && Array.isArray(data.macros)) { data=data.macros; replace=true; } else if (!Array.isArray(data)) data=[data];
-    const imported=[]; for (const m of data) if (m && (m.commands || typeof m === 'string')) { const obj=macroPrettyEntry(typeof m === 'string' ? {name:`Macro ${savedMacros.length+1}`, commands:m} : m); validateMacro(obj); imported.push(obj); }
-    if (replace || imported.length > 1) savedMacros=imported; else if (imported.length) { const idx=savedMacros.findIndex(m=>String(m.name||'').toUpperCase()===String(imported[0].name||'').toUpperCase()); if(idx>=0) savedMacros[idx]=imported[0]; else savedMacros.push(imported[0]); }
+    const imported=[]; for (const m of data) if (m && (m.commands || typeof m === 'string')) { const obj=macroPrettyEntry(typeof m === 'string' ? {name:`Macro ${savedMacros.length+1}`, commands:m} : m); validateMacro(obj); if (obj.hotkey && (!isValidKeyCode(obj.hotkey) || Object.values(currentBindings).some(v=>v.toUpperCase()===obj.hotkey.toUpperCase()))) obj.hotkey=''; imported.push(obj); }
+    const nameInUse = (name, arr) => arr.some(x => String(x.name||'').toUpperCase() === String(name||'').toUpperCase());
+    const uniqueName = (base, arr) => { if (!nameInUse(base, arr)) return base; let n=1; while(nameInUse(`${base} (${n})`, arr)) n++; return `${base} (${n})`; };
+    if (replace || imported.length > 1) { for (const m of imported) m.name = uniqueName(m.name, imported); savedMacros=imported; }
+    else if (imported.length) { const m=imported[0]; m.name = uniqueName(m.name, savedMacros); savedMacros.push(m); }
     persistMacros(); refreshMacroList();
 }
 function beginMacroHotkeyListen(i) { const once=(ev)=>{ ev.preventDefault(); let code=ev.code==='Escape'?'':ev.code; const conflict=macroHotkeyConflicts(code,i); if(conflict){ alert('Macro keybind is already used by: '+conflict); } else { savedMacros[i].hotkey=code; persistMacros(); refreshMacroList(); } window.removeEventListener('keydown', once, true); }; window.addEventListener('keydown', once, true); }
 function renameMacro(i) { const old=macroEntryName(savedMacros[i],i); const name=prompt('Macro name:', old); if(name===null) return; const n=name.trim(); if(!n){ alert('Macro name cannot be empty.'); return; } const dup=savedMacros.findIndex((m,j)=>j!==i && String(m.name||'').toUpperCase()===n.toUpperCase()); if(dup>=0){ alert('Another macro already uses that name.'); return; } savedMacros[i].name=n; savedMacros[i]=macroPrettyEntry(savedMacros[i]); persistMacros(); refreshMacroList(); }
 function wireMacroMenu() {
-    const btn = document.getElementById('btnMacros'); if (!btn) return;
+    const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    const btn = document.getElementById('btnMacros'); if (!btn || isMobile) return;
     btn.onclick = () => { if (!isConnected) { alert('Not connected to server.'); return; } refreshMacroList(); document.getElementById('macroOverlay').style.display='flex'; };
     document.getElementById('btnMacroClose').onclick = () => document.getElementById('macroOverlay').style.display='none';
     document.getElementById('btnMacroExport').onclick = exportMacrosJson;
@@ -476,22 +492,26 @@ document.getElementById('btnConnect').onclick = async () => {
         try { window.focus(); document.body.focus(); } catch(e) {}
         loopId = setInterval(buildAndSendPacket, 4);
     };
-    ws.onerror = () => alert("Failed to connect to proxy!");
+    ws.onerror = () => {
+        document.getElementById('statusText').innerText = "Connection failed";
+    };
     ws.onclose = () => {
         isConnected = false; clearInterval(loopId);
         document.getElementById('btnConnect').innerText = "Connect";
-        document.getElementById('statusText').innerText = "Disconnected";
         document.getElementById('kbMode').disabled = false;
+        if (document.getElementById('statusText').innerText !== "Connection failed")
+            document.getElementById('statusText').innerText = "Disconnected";
     }
 };
 function formatKeyName(code) {
     if (code === 'Unbound') return '';
-    if (code.startsWith('Key')) return code.replace('Key', '');
-    if (code.startsWith('Digit')) return code.replace('Digit', '');
-    if (code.startsWith('Arrow')) return code.replace('Arrow', '');
-    if (code === 'ShiftLeft') return 'LShift'; if (code === 'ShiftRight') return 'RShift';
-    if (code === 'ControlLeft') return 'LCtrl'; if (code === 'ControlRight') return 'RCtrl';
-    if (code === 'AltLeft') return 'LAlt'; if (code === 'AltRight') return 'RAlt';
+    const c = code.toLowerCase();
+    if (c.startsWith('key')) return code.slice(3);
+    if (c.startsWith('digit')) return code.slice(5);
+    if (c.startsWith('arrow')) return code.slice(5);
+    if (c === 'shiftleft') return 'LShift'; if (c === 'shiftright') return 'RShift';
+    if (c === 'controlleft') return 'LCtrl'; if (c === 'controlright') return 'RCtrl';
+    if (c === 'altleft') return 'LAlt'; if (c === 'altright') return 'RAlt';
     return code;
 }
 let activeBindKey = null; let isSetupMode = false; let setupQueue = [];

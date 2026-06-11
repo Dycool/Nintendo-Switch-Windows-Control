@@ -2375,6 +2375,7 @@ struct WebClient {
     uint32_t ws_seq = 0;
     bool     ws_first = true;
     uint64_t ws_last_rx = 0;
+    uint64_t last_ping_us = 0;
     uint32_t last_rumble_seq[4] = {};
 
     uint8_t *wbuf = nullptr;
@@ -2969,8 +2970,20 @@ static void web_server_thread(int web_port, uint16_t udp_port, WebServerMode mod
             if (clients[i].state == WebClient::WS_ACTIVE)
                 flush_rumble_to_ws(&clients[i]);
 
-        // Idle WS timeout (30s) and HTTP handshake timeout (5s)
+        // Periodic WebSocket ping every 10s so clients detect dead connections.
         uint64_t now_ws = now_us();
+        for (int i = 0; i < n_clients; i++) {
+            if (clients[i].state == WebClient::WS_ACTIVE &&
+                now_ws - clients[i].last_ping_us >= 10000000 &&
+                clients[i].wbuf == nullptr) {
+                uint8_t ping[2] = {0x89, 0x00};
+                ssize_t n = write(clients[i].fd, ping, sizeof(ping));
+                if (n == (ssize_t)sizeof(ping))
+                    clients[i].last_ping_us = now_ws;
+            }
+        }
+
+        // Idle WS timeout (30s) and HTTP handshake timeout (5s)
         for (int i = 0; i < n_clients; i++) {
             if (clients[i].state == WebClient::WS_ACTIVE &&
                 now_ws - clients[i].ws_last_rx > 30000000)

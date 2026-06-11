@@ -30,6 +30,7 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
@@ -58,7 +59,9 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var controlClientActive = false
     @Volatile private var sending = false
     private var ws: WebSocket? = null
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .pingInterval(10, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
     private val seq = AtomicInteger(0)
     private val senderToken = AtomicInteger(0)
     private val sendLock = Any()
@@ -249,13 +252,14 @@ class MainActivity : AppCompatActivity() {
             val wsUrl = normalizeWsUrl(host)
             val req = Request.Builder().url(wsUrl).build()
             ws = client.newWebSocket(req, object : WebSocketListener() {
-                override fun onOpen(w: WebSocket, r: Response) {
-                    runOnUiThread {
-                        if (!controlClientActive || ws !== w) return@runOnUiThread
-                        statusText.text = "Connected"
-                        startSending()
-                    }
-                }
+    override fun onOpen(w: WebSocket, r: Response) {
+        runOnUiThread {
+            if (!controlClientActive || ws !== w) return@runOnUiThread
+            statusText.text = "Connected"
+            if (activeClientMode == ClientMode.PHYSICAL) updatePhysicalStatusOnPage("Connected")
+            startSending()
+        }
+    }
 
                 override fun onClosed(w: WebSocket, code: Int, reason: String) {
                     runOnUiThread { handleWsClosed(w, "Disconnected") }
@@ -307,6 +311,16 @@ class MainActivity : AppCompatActivity() {
         lastTouchFrameMs = 0
         ws = null
         stopPhoneSensors()
+        try { Toast.makeText(this, text, Toast.LENGTH_SHORT).show() } catch (_: Throwable) {}
+        try { webView.evaluateJavascript("""(function(){
+            window._connectionFailed = true;
+            var s=document.getElementById('statusText');
+            if(s)s.innerText='$text';
+            var btn=document.getElementById('btnConnect');
+            if(btn){btn.innerText='Connect';btn.classList.remove('connected');btn.style.display='block';}
+            var dot=document.getElementById('statusDot');
+            if(dot)dot.style.display='none';
+        })()""", null) } catch (_: Throwable) {}
     }
 
     private fun normalizeWsUrl(raw: String): String {
@@ -739,7 +753,7 @@ class MainActivity : AppCompatActivity() {
         lastBridgeFrameParseMs = 0
 
         scanPhysicalControllers()
-        updatePhysicalStatusOnPage("Connected")
+        updatePhysicalStatusOnPage("Connecting...")
 
         if (!connectWs()) {
             controlClientActive = false

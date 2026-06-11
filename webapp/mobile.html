@@ -316,7 +316,10 @@ document.getElementById('btnConnect').onclick = async () => {
     ws.onopen = () => {
         isConnected = true; const btn = document.getElementById('btnConnect');
         btn.innerText = "Connected"; btn.classList.add('connected');
-        connectTimeout = setTimeout(() => { btn.style.display = 'none'; document.getElementById('statusDot').style.display = 'block'; }, 2000);
+        connectTimeout = setTimeout(() => {
+            if (window._connectionFailed) { window._connectionFailed = false; return; }
+            btn.style.display = 'none'; document.getElementById('statusDot').style.display = 'block';
+        }, 2000);
         // Native app sends to the backend at ~250 Hz. The WebView only publishes
         // the latest touch state at display-rate, plus immediately on touch events.
         publishTouchState();

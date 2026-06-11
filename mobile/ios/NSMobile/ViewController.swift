@@ -282,6 +282,7 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
     private var controlClientActive = false
     private var sending = false
     private var webSocket: URLSessionWebSocketTask?
+    private var pingTimer: Timer?
     private lazy var session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
     private var seq: UInt32 = 0
     private let sendQueue = DispatchQueue(label: "ns.mobile.ios.sender")
@@ -728,7 +729,7 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
         lastTouchFrameMs = 0
         lastBridgeFrameParseMs = 0
         scanPhysicalControllers()
-        updatePhysicalStatusOnPage(prefix: "Connected")
+        updatePhysicalStatusOnPage(prefix: "Connecting...")
         if !connectWs() {
             controlClientActive = false
             activeClientMode = .none
@@ -763,6 +764,8 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
         touchFrame = nil
         lastTouchFrameMs = 0
         lastBridgeFrameParseMs = 0
+        pingTimer?.invalidate()
+        pingTimer = nil
         webSocket = nil
         stopPhoneSensors()
         stopAllPhysicalRumble()
@@ -811,7 +814,12 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
         DispatchQueue.main.async { [weak self, weak webSocketTask] in
             guard let self, let task = webSocketTask, self.webSocket === task, self.controlClientActive else { return }
             self.statusLabel.text = "Connected"
+            if self.activeClientMode == .physical { self.updatePhysicalStatusOnPage(prefix: "Connected") }
             self.startSending()
+            self.pingTimer?.invalidate()
+            self.pingTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+                self?.webSocket?.sendPing { _ in }
+            }
         }
     }
 
@@ -845,8 +853,25 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
         touchHid = nil
         touchFrame = nil
         lastTouchFrameMs = 0
+        pingTimer?.invalidate()
+        pingTimer = nil
         webSocket = nil
         stopPhoneSensors()
+        let ac = UIAlertController(title: nil, message: text, preferredStyle: .alert)
+        ac.addAction(UIAlertAction(title: "OK", style: .default))
+        present(ac, animated: true)
+        let js = """
+        (function(){
+            window._connectionFailed = true;
+            var s=document.getElementById('statusText');
+            if(s)s.innerText='\(text)';
+            var btn=document.getElementById('btnConnect');
+            if(btn){btn.innerText='Connect';btn.classList.remove('connected');btn.style.display='block';}
+            var dot=document.getElementById('statusDot');
+            if(dot)dot.style.display='none';
+        })()
+        """
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     private func normalizeWsUrl(_ raw: String) throws -> URL {

@@ -771,7 +771,7 @@ private:
     }
 };
 
-static void pump_udp_rumble(SOCKET sock, RumbleManager& rumble, const int controller_for_slot[4]) {
+static void pump_udp_replies(SOCKET sock, RumbleManager& rumble, const int controller_for_slot[4]) {
     uint8_t buf[64];
     for (;;) {
         sockaddr_in from{};
@@ -785,11 +785,17 @@ static void pump_udp_rumble(SOCKET sock, RumbleManager& rumble, const int contro
 #endif
         if (n < 0) {
             if (!socket_would_block()) {
-                // Keep the sender alive; rumble is opportunistic.
+                // Keep the sender alive; opportunistic reads.
             }
             break;
         }
-        if (n == (int)sizeof(ns::PrecisionRumblePacket)) {
+        if (n == (int)sizeof(ns::ServerInfoReply)) {
+            ns::ServerInfoReply reply{};
+            std::memcpy(&reply, buf, sizeof(reply));
+            if (reply.magic == ns::SERVER_INFO_MAGIC && reply.version == ns::SERVER_INFO_VERSION) {
+                g_serverLastReplyUs.store(ns::now_us());
+            }
+        } else if (n == (int)sizeof(ns::PrecisionRumblePacket)) {
             ns::PrecisionRumblePacket rp{};
             std::memcpy(&rp, buf, sizeof(rp));
             if (rp.magic == ns::PRECISION_RUMBLE_MAGIC) rumble.apply_precision_packet(rp, controller_for_slot);
@@ -819,6 +825,7 @@ static bool detect_server_is_legacy(SOCKET sock, const sockaddr_in& dest) {
         if (n == (int)sizeof(reply) &&
             reply.magic == ns::SERVER_INFO_MAGIC &&
             reply.version == ns::SERVER_INFO_VERSION) {
+            g_serverLastReplyUs.store(ns::now_us());
             return reply.backend == ns::SERVER_BACKEND_LEGACY;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1006,6 +1013,24 @@ static std::unordered_map<std::string, std::string> default_key_bindings() {
 
 static std::string normalize_key_name(std::string s) {
     return ns::macro::upper(ns::macro::trim(std::move(s)));
+}
+
+static bool is_valid_key_code(const std::string& s) {
+    std::string c = normalize_key_name(s);
+    if (c.empty()) return true;
+    static const char* named[] = {"ESC","ESCAPE","SPACE","ENTER","TAB","BACKSPACE","DELETE","INSERT","HOME","END","PAGEUP","PAGEDOWN","CAPSLOCK","NUMLOCK","SCROLLLOCK","PAUSE","SNAPSHOT","PRINTSCREEN","CONTEXTMENU","UP","DOWN","LEFT","RIGHT","LSHIFT","RSHIFT","LCTRL","RCTRL","LALT","RALT","LMETA","RMETA"};
+    for (const char* n : named) if (c == n) return true;
+    if (c.size() == 1 && ((c[0] >= 'A' && c[0] <= 'Z') || (c[0] >= '0' && c[0] <= '9'))) return true;
+    if (c.size() == 2 && c[0] == 'F' && c[1] >= '1' && c[1] <= '9') return true;
+    if (c.size() == 3 && c[0] == 'F' && c[1] == '1' && c[2] >= '0' && c[2] <= '9') return true;
+    if (c.size() == 3 && c[0] == 'F' && c[1] == '2' && c[2] >= '0' && c[2] <= '4') return true;
+    if (c.size() > 3 && c.substr(0, 3) == "KEY" && c.size() == 4 && c[3] >= 'A' && c[3] <= 'Z') return true;
+    if (c.size() > 4 && c.substr(0, 5) == "DIGIT" && c.size() == 6 && c[5] >= '0' && c[5] <= '9') return true;
+    if (c.size() > 4 && c.substr(0, 5) == "ARROW" && (c == "ARROWUP" || c == "ARROWDOWN" || c == "ARROWLEFT" || c == "ARROWRIGHT")) return true;
+    if (c.size() > 4 && (c.substr(0, 5) == "SHIFT" || c.substr(0, 5) == "METAL") && (c == "SHIFTLEFT" || c == "SHIFTRIGHT" || c == "METALEFT" || c == "METARIGHT")) return true;
+    if (c.size() > 6 && c.substr(0, 7) == "CONTROL" && (c == "CONTROLLEFT" || c == "CONTROLRIGHT")) return true;
+    if (c.size() > 2 && c.substr(0, 3) == "ALT" && (c == "ALTLEFT" || c == "ALTRIGHT")) return true;
+    return false;
 }
 
 static std::string normalize_macro_hotkey_for_io(const std::string& s) {
@@ -1405,6 +1430,7 @@ static std::atomic<bool> g_connected{false};
 static std::thread g_senderThread;
 static uint8_t g_hmacKey[32]{};
 static std::atomic<uint32_t> g_packetCount{0};
+static std::atomic<uint64_t> g_serverLastReplyUs{0};
 static std::mutex g_statusMutex;
 static std::string g_statusMessage = "Ready";
 static std::string g_lastError;
@@ -1606,6 +1632,11 @@ static int run_client_stream(const ClientStreamConfig& cfg,
     }
 
     const bool server_is_legacy = detect_server_is_legacy(sock, dest);
+    if (g_serverLastReplyUs.load() == 0) {
+        if (err_out) *err_out = "Server not reachable. Check the IP address.";
+        closesocket(sock);
+        return 1;
+    }
     const bool legacy_packet = cfg.force_legacy_udp || server_is_legacy;
     const bool send_motion = !legacy_packet;
     const int active_send_interval_ms = ns::LEGACY_UDP_INTERVAL_MS; // always 250 Hz
@@ -1614,6 +1645,8 @@ static int run_client_stream(const ClientStreamConfig& cfg,
     RumbleManager rumble;
     DigitalReleaseFilter sdl_filters[4];
     bool no_controllers_printed = false;
+
+    uint64_t last_probe_us = 0;
 
     while (running.load(std::memory_order_relaxed)) {
         if (cfg.gui_features) {
@@ -1641,12 +1674,24 @@ static int run_client_stream(const ClientStreamConfig& cfg,
 
         send_client_frame(sock, dest, cfg.hmac_key, seq, legacy_packet, frame);
 
+        pump_udp_replies(sock, rumble, frame.controller_for_slot);
         if (!legacy_packet) {
-            pump_udp_rumble(sock, rumble, frame.controller_for_slot);
             rumble.update_timeouts(frame.controller_for_slot);
         }
 
         ++g_packetCount;
+
+        const uint64_t now = ns::now_us();
+        if (now - last_probe_us >= 5000000ULL) {
+            ns::ServerInfoProbe probe{};
+            send_all_udp(sock, dest, &probe, sizeof(probe));
+            last_probe_us = now;
+        }
+        if (last_probe_us != 0 && now - g_serverLastReplyUs.load(std::memory_order_relaxed) > 15000000ULL) {
+            set_status_message("Lost connection to server");
+            running.store(false);
+            break;
+        }
 
         if (frame.active_count > 0) {
             no_controllers_printed = false;
@@ -1706,6 +1751,7 @@ static bool start_connection(const std::string& target, std::string* err_out = n
     save_last_ip(target);
     load_macro_entries();
     g_packetCount.store(0);
+    g_serverLastReplyUs.store(0);
     g_lastError.clear();
     g_connected.store(true);
     g_senderRunning.store(true);
@@ -2253,10 +2299,14 @@ public:
         setModal(false);
         setMinimumWidth(620);
         outer = new QVBoxLayout(this);
-        rows = new QGridLayout();
+        auto* scrollArea = new QScrollArea(this);
+        auto* scrollWidget = new QWidget(this);
+        rows = new QGridLayout(scrollWidget);
         rows->setHorizontalSpacing(4);
         rows->setVerticalSpacing(4);
-        outer->addLayout(rows);
+        scrollArea->setWidget(scrollWidget);
+        scrollArea->setWidgetResizable(true);
+        outer->addWidget(scrollArea);
         controls = new QGridLayout();
         importBtn = new QPushButton("Import", this);
         recordBtn = new QPushButton("Record P1", this);
@@ -2354,6 +2404,7 @@ private:
         if (entries.empty()) {
             QLabel* empty = new QLabel("No macros", this);
             empty->setMinimumWidth(250);
+            empty->setAlignment(Qt::AlignCenter);
             rows->addWidget(empty, 0, 0, 1, 5);
         }
         for (int i = 0; i < (int)entries.size(); ++i) {
@@ -2442,7 +2493,32 @@ private:
             QMessageBox::warning(this, "Macro validation", std_to_q("Invalid macro JSON: " + err));
             return;
         }
+        for (auto& e : imported) {
+            if (!e.hotkey.empty() && (!is_valid_key_code(e.hotkey) || macro_hotkey_conflicts(e.hotkey))) e.hotkey.clear();
+        }
+        auto name_in_use = [&](const std::string& name, const std::vector<ns::macro::Entry>& pool) {
+            return std::any_of(pool.begin(), pool.end(), [&](const ns::macro::Entry& x) { return ns::macro::upper(ns::macro::trim(x.name)) == ns::macro::upper(ns::macro::trim(name)); });
+        };
+        auto unique_name = [&](const std::string& base, const std::vector<ns::macro::Entry>& pool) {
+            if (!name_in_use(base, pool)) return base;
+            int n = 1;
+            while (name_in_use(base + " (" + std::to_string(n) + ")", pool)) n++;
+            return base + " (" + std::to_string(n) + ")";
+        };
         if (imported.size() > 1 || raw.find("\"macros\"") != std::string::npos) {
+            std::unordered_set<std::string> used_names;
+            for (auto& e : imported) {
+                std::string base = e.name;
+                std::string key = ns::macro::upper(base);
+                if (used_names.count(key)) {
+                    int n = 1;
+                    do {
+                        e.name = base + " (" + std::to_string(n) + ")";
+                        n++;
+                    } while (used_names.count(ns::macro::upper(e.name)));
+                }
+                used_names.insert(ns::macro::upper(e.name));
+            }
             {
                 std::lock_guard<std::mutex> lk(g_macro_mtx);
                 g_macro_entries = std::move(imported);
@@ -2450,6 +2526,10 @@ private:
             }
         } else {
             ns::macro::Entry e = imported[0];
+            {
+                std::lock_guard<std::mutex> lk(g_macro_mtx);
+                e.name = unique_name(e.name, g_macro_entries);
+            }
             std::string upsert_err;
             if (!upsert_macro_entry(e, false, &upsert_err)) {
                 QMessageBox::warning(this, "Macro validation", std_to_q("Invalid macro: " + upsert_err));
