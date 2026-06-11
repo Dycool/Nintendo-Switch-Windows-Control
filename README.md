@@ -102,11 +102,6 @@ Detailed guides and technical information are in the `docs/` folder:
 | **Cryptography** | [HMAC-SHA256](https://datatracker.ietf.org/doc/html/rfc4868) (standalone C++ implementation) |
 | **Protocol** | Custom UDP-based protocol with magic/version/sequence number guards |
 
----
-
-## Researching Features...
-
-* Xbox one/ series X console support
 
 ---
 
