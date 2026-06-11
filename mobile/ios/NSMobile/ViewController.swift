@@ -477,13 +477,73 @@ final class ViewController: UIViewController, WKScriptMessageHandler, WKNavigati
         host = (hostField.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !host.isEmpty else { return }
         UserDefaults.standard.set(host, forKey: "host")
-        connected = true
-        currentPage = .mainMenu
-        pageStack.removeAll()
-        statusLabel.text = "Loaded"
-        connectView.removeFromSuperview()
-        view.addSubview(webView)
-        load(page: .mainMenu)
+        statusLabel.text = "Connecting..."
+        connectButton.isEnabled = false
+        probeServer(host) { [weak self] reachable in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.connectButton.isEnabled = true
+                guard reachable else {
+                    self.statusLabel.text = "Server not reachable"
+                    return
+                }
+                self.connected = true
+                self.currentPage = .mainMenu
+                self.pageStack.removeAll()
+                self.statusLabel.text = "Loaded"
+                self.connectView.removeFromSuperview()
+                self.view.addSubview(self.webView)
+                self.load(page: .mainMenu)
+            }
+        }
+    }
+
+    private func probeServer(_ raw: String, completion: @escaping (Bool) -> Void) {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { completion(false); return }
+        let hadScheme = text.contains("://")
+        if !hadScheme { text = "ws://\(text)" }
+        guard let comps = URLComponents(string: text) else { completion(false); return }
+        guard let rawHost = comps.host, !rawHost.isEmpty else { completion(false); return }
+        let probePort = comps.port ?? 8080
+        let host = NWEndpoint.Host(rawHost)
+        let port = NWEndpoint.Port(integerLiteral: UInt16(probePort))
+        let connection = NWConnection(host: host, port: port, using: .tcp)
+        let probeLock = NSLock()
+        var probeDone = false
+        let timeoutWork = DispatchWorkItem {
+            probeLock.lock()
+            guard !probeDone else { probeLock.unlock(); return }
+            probeDone = true
+            probeLock.unlock()
+            connection.cancel()
+            completion(false)
+        }
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                probeLock.lock()
+                guard !probeDone else { probeLock.unlock(); return }
+                probeDone = true
+                probeLock.unlock()
+                timeoutWork.cancel()
+                connection.cancel()
+                completion(true)
+            case .failed:
+                probeLock.lock()
+                guard !probeDone else { probeLock.unlock(); return }
+                probeDone = true
+                probeLock.unlock()
+                timeoutWork.cancel()
+                completion(false)
+            case .cancelled:
+                break
+            default:
+                break
+            }
+        }
+        connection.start(queue: DispatchQueue.global(qos: .utility))
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0, execute: timeoutWork)
     }
 
     @objc private func edgeBack(_ recognizer: UIScreenEdgePanGestureRecognizer) {

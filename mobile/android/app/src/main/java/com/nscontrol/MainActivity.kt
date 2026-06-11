@@ -53,6 +53,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var hostInput: EditText
     private lateinit var statusText: TextView
+    private lateinit var connectBtn: Button
 
     private var host = ""
     private var connected = false
@@ -203,7 +204,8 @@ class MainActivity : AppCompatActivity() {
         webView = WebView(this)
         hostInput = connectView.findViewById(R.id.hostInput)
         statusText = connectView.findViewById(R.id.statusText)
-        connectView.findViewById<Button>(R.id.connectBtn).setOnClickListener { onConnect() }
+        connectBtn = connectView.findViewById(R.id.connectBtn)
+        connectBtn.setOnClickListener { onConnect() }
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -233,17 +235,52 @@ class MainActivity : AppCompatActivity() {
         gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
     }
 
+    private fun parseHostPort(raw: String): Pair<String, Int> {
+        val text = raw.trim()
+        val colon = text.lastIndexOf(':')
+        return if (colon > 0) {
+            val port = text.substring(colon + 1).toIntOrNull()
+            if (port != null && port in 1..65535) {
+                Pair(text.substring(0, colon), port)
+            } else {
+                Pair(text, 8080)
+            }
+        } else {
+            Pair(text, 8080)
+        }
+    }
+
     private fun onConnect() {
         host = hostInput.text.toString().trim()
         if (host.isEmpty()) return
         getPreferences(MODE_PRIVATE).edit().putString("host", host).apply()
-        setupWebView()
-        connected = true
-        currentPage = Page.MAIN_MENU
-        pageStack.clear()
-        setContentView(webView)
-        loadUrl(pageUrl(Page.MAIN_MENU))
-        statusText.text = "Loaded"
+        statusText.text = "Connecting..."
+        connectBtn.isEnabled = false
+        Thread {
+            val (probeHost, probePort) = parseHostPort(host)
+            val reachable = try {
+                val socket = java.net.Socket()
+                socket.connect(java.net.InetSocketAddress(probeHost, probePort), 2000)
+                socket.close()
+                true
+            } catch (_: Exception) {
+                false
+            }
+            runOnUiThread {
+                connectBtn.isEnabled = true
+                if (!reachable) {
+                    statusText.text = "Server not reachable"
+                    return@runOnUiThread
+                }
+                setupWebView()
+                connected = true
+                currentPage = Page.MAIN_MENU
+                pageStack.clear()
+                setContentView(webView)
+                loadUrl(pageUrl(Page.MAIN_MENU))
+                statusText.text = "Loaded"
+            }
+        }.start()
     }
 
     // WebSocket to the Raspberry Pi backend. Either physical controllers or Touch Controls owns the only live session.

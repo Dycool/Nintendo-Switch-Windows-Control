@@ -834,6 +834,48 @@ static bool detect_server_is_legacy(SOCKET sock, const sockaddr_in& dest) {
     return false;
 }
 
+static bool probe_server_sync(const std::string& host, int port) {
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock == INVALID_SOCKET) return false;
+    set_socket_nonblocking(sock);
+
+    sockaddr_in dest{};
+    if (!resolve_udp_destination(host, port, dest)) {
+        closesocket(sock);
+        return false;
+    }
+
+    ns::ServerInfoProbe probe{};
+    send_all_udp(sock, dest, &probe, sizeof(probe));
+
+    bool ok = false;
+    const uint64_t deadline = ns::now_us() + 1000000ULL;
+    while (ns::now_us() < deadline) {
+        ns::ServerInfoReply reply{};
+        sockaddr_in from{};
+#ifdef _WIN32
+        int from_len = sizeof(from);
+        int n = recvfrom(sock, reinterpret_cast<char*>(&reply), (int)sizeof(reply), 0,
+                         reinterpret_cast<sockaddr*>(&from), &from_len);
+#else
+        socklen_t from_len = sizeof(from);
+        ssize_t n = recvfrom(sock, &reply, sizeof(reply), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
+#endif
+        if (n == (int)sizeof(reply) &&
+            reply.magic == ns::SERVER_INFO_MAGIC &&
+            reply.version == ns::SERVER_INFO_VERSION) {
+            ok = true;
+            break;
+        }
+        if (n < 0 && socket_would_block()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    closesocket(sock);
+    return ok;
+}
+
 static uint32_t g_macro_udp_seq = 0;
 
 static uint32_t next_macro_upload_id() {
@@ -1741,6 +1783,10 @@ static bool start_connection(const std::string& target, std::string* err_out = n
     int port = ns::DEFAULT_PORT;
     if (!parse_host_port(target, host, port)) {
         if (err_out) *err_out = "Please enter a Raspberry Pi IP address.";
+        return false;
+    }
+    if (!probe_server_sync(host, port)) {
+        if (err_out) *err_out = "Server not reachable. Check the IP address.";
         return false;
     }
     if (!g_sdlInput.start()) {
