@@ -157,7 +157,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "if [ ! -d \"$SRCROOT/ns_mobile\" ]; then\n  cp -R \"$SRCROOT/../../../webapp\" \"$SRCROOT/ns_mobile\"\nfi\n";
+			shellScript = "set -e\nSRC_WEBAPP=\"$SRCROOT/../../webapp\"\nDST_WEBAPP=\"$SRCROOT/NSMobile/ns_mobile\"\nif [ ! -d \"$SRC_WEBAPP\" ]; then\n  echo \"Missing webapp directory: $SRC_WEBAPP\" >&2\n  exit 1\nfi\nrm -rf \"$DST_WEBAPP\"\nmkdir -p \"$DST_WEBAPP\"\ncp -R \"$SRC_WEBAPP\"/. \"$DST_WEBAPP\"/\n";
 		};
 		A00000000000000000000052 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
