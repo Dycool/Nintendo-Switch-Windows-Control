@@ -11,9 +11,8 @@ The Raspberry Pi server can emulate **two different controller profiles**. Each 
 | HID report size | 8 bytes | 64 bytes |
 | **Buttons, D-Pad, Sticks** | Yes | Yes |
 | **Latency** | **Lowest** | Low |
-| **Gyroscope (6-axis IMU)** | **No** | **Yes** |
-| **Accelerometer** | **No** | **Yes** |
-| **Rumble** | **No** | **Yes** (bidirectional) |
+| **Gyroscope** | **No** | **Yes** |
+| **Rumble** | **No** | **Yes** |
 
 ### Legacy Mode
 
