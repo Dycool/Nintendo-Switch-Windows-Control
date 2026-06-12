@@ -33,7 +33,7 @@ Once running, open the URLs below in a browser on the same network.
 - The web server binds to **`0.0.0.0`** (all interfaces).
 - WebSocket connections does not use the same HMAC-SHA256 protocol as native clients.
 - There is **no TLS** (HTTPS/WSS) built in. For use over untrusted networks, use it
-  with a reverse proxy such as **[Caddy](https://caddyserver.com/)**. It automatically does
+  with a reverse proxy such as **[Caddy](https://caddyserver.com/)**.
 
 ---
 
