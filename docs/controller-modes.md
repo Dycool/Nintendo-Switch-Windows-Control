@@ -43,7 +43,6 @@ Platform-specific gyro support:
 - **Desktop clients:** SDL3 `SDL_GetGamepadSensorData` (gyro-capable controllers on Windows, Linux, and macOS)
 - **Android:** Device sensors via `SensorManager` and `Sensor.TYPE_GAME_ROTATION_VECTOR` / `TYPE_GYROSCOPE`
 - **iOS:** Device sensors via `CMDeviceMotion` (`CMRotationRate` and `CMAcceleration`), remapped identically to the Android pipeline
-- **Browser:** Gamepad API (`pose.angularVelocity`, `pose.linearAcceleration`)
 
 > Gyro and rumble are **not available** in hori controller mode.
 
