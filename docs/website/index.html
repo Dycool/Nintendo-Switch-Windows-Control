@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NS-PC-Control | Zero-Lag Switch Controller Server</title>
+    <meta name="description" content="A custom C++ UDP server for Raspberry Pi to connect PC controllers to a Nintendo Switch with zero lag using USB Gadget mode.">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        switchRed: '#ff3c28',
+                        switchBlue: '#0ab9e6',
+                        darkBg: '#0f172a',
+                        cardBg: '#1e293b'
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-darkBg text-gray-200 font-sans antialiased selection:bg-switchRed selection:text-white">
+
+    <header class="relative overflow-hidden border-b border-gray-800">
+        <div class="absolute inset-0 bg-gradient-to-r from-switchBlue/20 to-switchRed/20 opacity-50"></div>
+        <div class="max-w-5xl mx-auto px-6 py-24 relative z-10 text-center">
+            <h1 class="text-5xl md:text-7xl font-extrabold text-white mb-6 tracking-tight">
+                NS-PC-<span class="text-transparent bg-clip-text bg-gradient-to-r from-switchBlue to-switchRed">Control</span>
+            </h1>
+            <p class="text-xl md:text-2xl text-gray-300 max-w-2xl mx-auto mb-10 font-light">
+                A high-performance C++ UDP server for Raspberry Pi that bridges your controllers directly to your Nintendo Switch using hardware USB emulation.
+            </p>
+            <div class="flex justify-center gap-4">
+                <a href="https://github.com/Dycool/NS-PC-Control" target="_blank" class="px-8 py-4 bg-switchRed hover:bg-red-600 text-white font-bold rounded-lg transition transform hover:-translate-y-1 shadow-lg shadow-switchRed/30">
+                    View on GitHub
+                </a>
+                <a href="#tutorial" class="px-8 py-4 bg-cardBg border border-gray-700 hover:border-switchBlue text-white font-bold rounded-lg transition transform hover:-translate-y-1">
+                    Read the Tutorial
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <section class="max-w-5xl mx-auto px-6 py-20">
+        <div class="text-center mb-16">
+            <h2 class="text-3xl font-bold text-white mb-4">Why use NS-PC-Control?</h2>
+            <p class="text-gray-400">Play your switch games in any way you wish to. Controllers, keyboards, even your own phone!</p>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <div class="bg-cardBg p-8 rounded-xl border border-gray-800 hover:border-switchBlue transition">
+                <div class="w-12 h-12 bg-switchBlue/20 rounded-lg flex items-center justify-center mb-6">
+                    <svg class="w-6 h-6 text-switchBlue" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                </div>
+                <h3 class="text-xl font-bold text-white mb-3">Gyroscope and Rumble</h3>
+                <p class="text-gray-400 leading-relaxed">Supports any controller with rumble and motion controls as well! You can also use your phone gyro!</p>
+            </div>
+            <div class="bg-cardBg p-8 rounded-xl border border-gray-800 hover:border-switchRed transition">
+                <div class="w-12 h-12 bg-switchRed/20 rounded-lg flex items-center justify-center mb-6">
+                    <svg class="w-6 h-6 text-switchRed" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+                </div>
+                <h3 class="text-xl font-bold text-white mb-3">4-Player Multiplayer</h3>
+                <p class="text-gray-400 leading-relaxed">With a single raspberry pi you can emulate up to 4 pro controllers at the same time!</p>
+            </div>
+            <div class="bg-cardBg p-8 rounded-xl border border-gray-800 hover:border-gray-500 transition">
+                <div class="w-12 h-12 bg-gray-700 rounded-lg flex items-center justify-center mb-6">
+                    <svg class="w-6 h-6 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"></path></svg>
+                </div>
+                <h3 class="text-xl font-bold text-white mb-3">Macros</h3>
+                <p class="text-gray-400 leading-relaxed">Create, record and share your own macros!</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="tutorial" class="bg-cardBg py-20 border-t border-b border-gray-800">
+        <div class="max-w-4xl mx-auto px-6">
+            <h2 class="text-3xl font-bold text-white mb-10 text-center">How to Get Started</h2>
+            
+            <div class="space-y-12">
+                <div class="flex flex-col md:flex-row gap-6 items-start">
+                    <div class="flex-shrink-0 w-12 h-12 rounded-full bg-switchBlue text-white font-bold flex items-center justify-center text-xl shadow-lg shadow-switchBlue/50">1</div>
+                    <div class="w-full">
+                        <h3 class="text-2xl font-bold text-white mb-2">Configure USB Gadget Mode</h3>
+                        <p class="text-gray-400 mb-4">To make the Switch recognize your Raspberry Pi as a physical controller, you must enable USB Gadget mode. SSH into your Pi and run these commands to configure the <code class="text-switchBlue">dwc2</code> driver and <code class="text-switchBlue">libcomposite</code>:</p>
+                        <div class="bg-gray-900 rounded-lg p-4 font-mono text-sm border border-gray-700 overflow-x-auto text-green-400 mb-2">
+                            <p class="whitespace-nowrap">echo "dtoverlay=dwc2" | sudo tee -a /boot/config.txt</p>
+                            <p class="whitespace-nowrap">echo "dwc2" | sudo tee -a /etc/modules</p>
+                            <p class="whitespace-nowrap">echo "libcomposite" | sudo tee -a /etc/modules</p>
+                        </div>
+                        <p class="text-sm text-gray-500 italic">Note: Make sure to reboot your Raspberry Pi after executing these lines to load the modules.</p>
+                    </div>
+                </div>
+
+                <!-- Step 2 -->
+                                <div class="flex flex-col md:flex-row gap-6 items-start">
+                                    <div class="flex-shrink-0 w-12 h-12 rounded-full bg-switchRed text-white font-bold flex items-center justify-center text-xl shadow-lg shadow-switchRed/50">2</div>
+                                    <div class="w-full min-w-0">
+                                        <h3 class="text-2xl font-bold text-white mb-2">Download the Server & Clients</h3>
+                                        
+                                        <p class="text-gray-400 mb-4">First, download and extract the backend server directly onto your Raspberry Pi using the terminal:</p>
+                                        
+                                        <!-- Unified Box Style for Server -->
+                                        <div class="bg-gray-900 rounded-lg p-4 font-mono text-sm border border-gray-700 overflow-x-auto text-green-400 mb-8">
+                                            <p class="whitespace-nowrap">wget https://github.com/Dycool/NS-PC-Control/releases/latest/download/ns-pc-control-raspberry-pi.zip</p>
+                                            <p class="whitespace-nowrap">unzip ns-pc-control-raspberry-pi.zip</p>
+                                        </div>
+
+                                        <p class="text-gray-400 mb-4">Next, download the companion client app for your preferred device to control the Switch:</p>
+                                        
+                                        <!-- Desktop Clients Row -->
+                                        <div class="flex flex-wrap justify-center gap-4 mb-4">
+                                            <!-- Windows Client -->
+                                            <a href="https://github.com/Dycool/NS-PC-Control/releases/latest/download/ns-pc-control-windows.zip" class="w-[calc(50%-0.5rem)] sm:w-48 bg-gray-900 p-4 rounded-lg border border-gray-700 hover:border-switchBlue transition text-center group">
+                                                <span class="block text-white font-bold group-hover:text-switchBlue">Windows</span>
+                                                <span class="text-xs text-gray-500">Client App</span>
+                                            </a>
+                                            <!-- macOS Client -->
+                                            <a href="https://github.com/Dycool/NS-PC-Control/releases/latest/download/ns-pc-control-mac.zip" class="w-[calc(50%-0.5rem)] sm:w-48 bg-gray-900 p-4 rounded-lg border border-gray-700 hover:border-switchBlue transition text-center group">
+                                                <span class="block text-white font-bold group-hover:text-switchBlue">macOS</span>
+                                                <span class="text-xs text-gray-500">Client App</span>
+                                            </a>
+                                            <!-- Linux Client -->
+                                            <a href="https://github.com/Dycool/NS-PC-Control/releases/latest/download/ns-pc-control-linux.zip" class="w-[calc(50%-0.5rem)] sm:w-48 bg-gray-900 p-4 rounded-lg border border-gray-700 hover:border-switchBlue transition text-center group">
+                                                <span class="block text-white font-bold group-hover:text-switchBlue">Linux</span>
+                                                <span class="text-xs text-gray-500">Client App</span>
+                                            </a>
+                                        </div>
+
+                                        <!-- Mobile Clients Row -->
+                                        <div class="flex flex-wrap justify-center gap-4 mb-2">
+                                            <!-- Android Client -->
+                                            <a href="https://github.com/Dycool/NS-PC-Control/releases/latest/download/ns-pc-control-android.zip" class="w-[calc(50%-0.5rem)] sm:w-48 bg-gray-900 p-4 rounded-lg border border-gray-700 hover:border-switchBlue transition text-center group">
+                                                <span class="block text-white font-bold group-hover:text-switchBlue">Android</span>
+                                                <span class="text-xs text-gray-500">Mobile Client</span>
+                                            </a>
+                                            <!-- iOS Client -->
+                                            <a href="https://github.com/Dycool/NS-PC-Control/releases/latest/download/ns-pc-control-ios.zip" class="w-[calc(50%-0.5rem)] sm:w-48 bg-gray-900 p-4 rounded-lg border border-gray-700 hover:border-switchBlue transition text-center group">
+                                                <span class="block text-white font-bold group-hover:text-switchBlue">iOS</span>
+                                                <span class="text-xs text-gray-500">Mobile Client</span>
+                                            </a>
+                                        </div>
+                                    </div>
+                                </div>
+
+                <div class="flex flex-col md:flex-row gap-6 items-start">
+                    <div class="flex-shrink-0 w-12 h-12 rounded-full bg-gray-600 text-white font-bold flex items-center justify-center text-xl">3</div>
+                    <div class="w-full">
+                        <h3 class="text-2xl font-bold text-white mb-2">Connect & Run</h3>
+                        <p class="text-gray-400 mb-4">Connect your Raspberry Pi directly into the Nintendo Switch Dock using its OTG data port (the USB-C port on a Pi 4/5, or the micro-USB data port on a Pi Zero). Next, run the server application with root privileges:</p>
+                        <div class="bg-gray-900 rounded-lg p-4 font-mono text-sm border border-gray-700 overflow-x-auto text-green-400 mb-4">
+                            <p class="whitespace-nowrap">sudo ./ns-backend</p>
+                        </div>
+                        <p class="text-gray-400 mb-4">Use <code class="text-switchBlue font-mono">-w</code> if you want to use the webapp! It binds natively to port <code class="text-switchBlue font-mono">8080</code> on your Raspberry Pi.</p>
+                        <p class="text-gray-400">Finally, launch your corresponding client software on your PC or mobile device, type in your Raspberry Pi's network IP address, and start playing your favorite games!</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <footer class="py-10 text-center text-gray-500 text-sm">
+        <p>Built by <a href="https://github.com/Dycool" target="_blank" class="text-switchBlue hover:text-white transition">Dycool</a>. Open Source Software.</p>
+    </footer>
+
+</body>
+</html>
