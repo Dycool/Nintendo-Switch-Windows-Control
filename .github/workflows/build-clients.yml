@@ -34,9 +34,10 @@ jobs:
         uses: actions/cache@v5
         with:
           path: _cache/vcpkg-bincache
-          key: vcpkg-windows-static-qtbase-sdl3-${{ env.QT_VERSION }}-${{ env.SDL_REF }}-${{ hashFiles('client/CMakeLists.txt') }}-v1
+          key: vcpkg-windows-static-qtbase-sdl3-${{ env.QT_VERSION }}-${{ env.SDL_REF }}-x64-windows-static-v2
           restore-keys: |
-            vcpkg-windows-static-qtbase-sdl3-${{ env.QT_VERSION }}-${{ env.SDL_REF }}-
+            vcpkg-windows-static-qtbase-sdl3-${{ env.QT_VERSION }}-${{ env.SDL_REF }}-x64-windows-static-
+            vcpkg-windows-static-qtbase-sdl3-${{ env.QT_VERSION }}-
             vcpkg-windows-static-qtbase-sdl3-
 
       - name: Bootstrap vcpkg
