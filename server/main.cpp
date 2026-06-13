@@ -82,6 +82,10 @@ static std::string g_switch2_wake_mac;
 static std::string g_switch2_wake_adv;
 static std::atomic<bool> g_switch2_wake_adv_running{false};
 static std::atomic<uint64_t> g_switch2_last_wake_adv_us{0};
+// Writer threads update this using the same host-disconnect/open-failure
+// signals already used for the "Host disconnected" backend logs. Runtime
+// wake is therefore gated as: new client + console USB host not connected.
+static std::atomic<bool> g_switch2_usb_host_connected{false};
 static constexpr uint64_t SWITCH2_WAKE_ADV_COOLDOWN_US = 8'000'000ULL;
 static constexpr int SWITCH2_WAKE_ADV_BURST_MS = 1000;
 
@@ -1422,6 +1426,7 @@ static bool create_hid_function(int id) {
 static void teardown_gadget() {
     if (!path_exists(GADGET_DIR)) return;
 
+    g_switch2_usb_host_connected.store(false, std::memory_order_relaxed);
     std::puts("[gadget] Closing USB gadget...");
 
     // Unbind first.  This disconnects the virtual controllers from the console.
@@ -1757,7 +1762,7 @@ static int run_switch2_wakeup_setup() {
         return 1;
 
     std::printf("[wake] Saved Switch 2 wake config to %s\n", g_switch2_wake_config_path.c_str());
-    std::puts("[wake] Setup complete. Start the backend normally; first client connection will trigger wake.");
+    std::puts("[wake] Setup complete. Start the backend normally; wake triggers when a new client connects while the USB host is disconnected.");
     return 0;
 }
 
@@ -1766,6 +1771,16 @@ static void maybe_send_switch2_wake_advert(const char* reason) {
         return;
     if (!g_switch2_wake_config_loaded)
         return;
+
+    // Do not wake-spam when the Switch/USB host is already connected/awake.
+    // This mirrors the backend's existing disconnected-host detection.
+    if (g_switch2_usb_host_connected.load(std::memory_order_relaxed)) {
+        if (g_verbose) {
+            std::printf("[wake] %s; Switch USB host already connected, skipping wake advert\n",
+                        reason ? reason : "client connected");
+        }
+        return;
+    }
 
     const uint64_t now = now_us();
 
@@ -1947,6 +1962,7 @@ static void legacy_writer_thread(int hz) {
         }
 
         if (!all_open) {
+            g_switch2_usb_host_connected.store(false, std::memory_order_relaxed);
             for (int i = 0; i < HID_PORT_COUNT; ++i) {
                 if (fds[i] >= 0) { close(fds[i]); fds[i] = -1; }
             }
@@ -1958,6 +1974,7 @@ static void legacy_writer_thread(int hz) {
         if (g_verbose || !was_connected)
             std::printf("%dx legacy /dev/hidg* opened\n", HID_PORT_COUNT);
         was_connected = true;
+        g_switch2_usb_host_connected.store(true, std::memory_order_relaxed);
 
         auto next = Clock::now() + tick;
         HIDReport prev[HID_PORT_COUNT];
@@ -2109,6 +2126,7 @@ static void legacy_writer_thread(int hz) {
 
             if (!ok) {
                 if (!error_shown) { std::puts("Host disconnected - waiting for reconnect..."); error_shown = true; }
+                g_switch2_usb_host_connected.store(false, std::memory_order_relaxed);
                 for (int i = 0; i < HID_PORT_COUNT; ++i) { close(fds[i]); fds[i] = -1; }
                 for (int wait_i = 0; wait_i < 100 && g_running.load(std::memory_order_relaxed); ++wait_i) std::this_thread::sleep_for(ms(10));
                 break;
@@ -2170,6 +2188,7 @@ static void writer_thread(int hz) {
         }
 
         if (!all_open) {
+            g_switch2_usb_host_connected.store(false, std::memory_order_relaxed);
             // Do not keep a partial set of opened endpoints around while the
             // gadget is being recreated/rebound.  Retry with a clean fd set.
             for (int i = 0; i < HID_PORT_COUNT; ++i) {
@@ -2183,6 +2202,7 @@ static void writer_thread(int hz) {
         if (g_verbose || !was_connected)
             std::printf("%dx USB gamepad /dev/hidg* opened\n", HID_PORT_COUNT);
         was_connected = true;
+        g_switch2_usb_host_connected.store(true, std::memory_order_relaxed);
 
         auto next = Clock::now() + tick;
         bool error_shown = false;
@@ -2520,6 +2540,7 @@ static void writer_thread(int hz) {
 
             if (!ok) {
                 if (!error_shown) { std::puts("Host disconnected — waiting for reconnect..."); error_shown = true; }
+                g_switch2_usb_host_connected.store(false, std::memory_order_relaxed);
                 for (int i = 0; i < 4; ++i) { close(fds[i]); fds[i] = -1; rt[i].fd = -1; }
                 for (int wait_i = 0; wait_i < 100 && g_running.load(std::memory_order_relaxed); ++wait_i) std::this_thread::sleep_for(ms(10));
                 break;
