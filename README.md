@@ -95,7 +95,7 @@ Detailed guides and technical information are in the `docs/` folder:
 * **[Macros](docs/macros.md)** - Recording and replaying button sequences for speedruns and TAS.
 * **[Architecture & Security](docs/architecture.md)** - Latency optimization tips and HMAC-SHA256 protocol details.
 * **[Web App & Mobile Clients](docs/web-app.md)** - Using the embedded web interface and mobile touch controls.
-* **[My vision](docs/wakeup.md)** - How to configure the wakeup packet for the switch 2.
+* **[Wakeup Setup](docs/wakeup.md)** - How to configure the wakeup packet for the switch 2.
 * **[My vision](docs/vision.md)** - The main goal behind this project.
 
 ---
