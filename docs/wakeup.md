@@ -18,7 +18,7 @@ This only works on a Raspberry Pi with BlueZ tools and only targets the Switch 2
 
 ### Configuration
 
-The config file is at `/etc/ns-pc-control/switch2_wakeup.conf` (or custom path via `--wakeup-config`):
+The config file is at `/etc/ns-pc-control/switch2_wakeup.conf`:
 
 ```
 # NS-PC-Control Switch 2 Joy-Con 2 wake configuration
