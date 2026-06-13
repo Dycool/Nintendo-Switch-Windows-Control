@@ -4049,14 +4049,6 @@ int main(int argc, char** argv) {
         else if (a == "-v")               g_verbose  = true;
         else if (a == "-wake")          g_switch2_wakeup_setup_requested = true;
         else if (a == "-hori")          g_legacy_mode = true;
-        else if (a == "--wakeup-config") {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "error: --wakeup-config requires a path\n");
-                return 1;
-            }
-            g_switch2_wakeup_config_path = argv[++i];
-        }
-        else if (a == "--no-switch2-wake-adv") g_switch2_wake_adv_enabled = false;
         else if (a == "--upnp")           do_upnp    = true;
         else if (a == "-w") {
             web_mode = WebServerMode::WebApp;
@@ -4077,10 +4069,6 @@ int main(int argc, char** argv) {
             puts("  --upnp          Forward the UDP port via UPnP for PC clients only.");
             puts("                  Mobile/web clients connect via WebSocket and don't need this.");
             puts("  -wake           Run interactive Joy-Con 2 wake setup, save switch2_wakeup.conf, test wake, then exit.");
-            puts("  --wakeup-config PATH");
-            puts("                  Wake config path, default /etc/ns-pc-control/switch2_wakeup.conf.");
-            puts("  --no-switch2-wake-adv");
-            puts("                  Disable Joy-Con 2 BLE wake advertisement bursts.");
             puts("  -hori           Expose the legacy 8-byte HORI controller gadget.");
             puts("                  Default mode exposes the 64-byte motion/rumble gadget.");
             puts("");

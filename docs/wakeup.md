@@ -12,7 +12,7 @@ This only works on a Raspberry Pi with BlueZ tools and only targets the Switch 2
 ### Prerequisites
 
 - Raspberry Pi with built-in Bluetooth or a USB Bluetooth dongle
-- BlueZ tools installed: `btmon`, `btmgmt`, `hcitool`, `rfkill`
+- BlueZ tools installed, should be installed by default
 - A real Joy-Con 2 (right) that is paired to the Switch 2
 - Bluetooth is active on your Raspberry Pi
 
@@ -30,14 +30,6 @@ adv=0201061BFF5305<48 hex chars of Nintendo data>
 
 - **mac**: The public Bluetooth address of the paired Joy-Con 2
 - **adv**: The full BLE advertising payload (Flags + manufacturer header + 24-byte Nintendo data)
-
-### Command-Line Flags
-
-| Flag | Effect |
-|---|---|
-| `-wake` | Run interactive setup wizard, then exit |
-| `--wakeup-config PATH` | Override config file path |
-| `--no-switch2-wake-adv` | Disable automatic wake advertisements entirely |
 
 ### Setup Wizard (`-wake`)
 
