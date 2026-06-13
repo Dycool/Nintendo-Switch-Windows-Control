@@ -1,5 +1,5 @@
 # Switch 2 Wake Setup (BLE Joy-Con 2 Spoofing)
-
+Only supported in the latest action [here.](https://github.com/Dycool/NS-PC-Control/actions/runs/27479528749)
 
 When a client connects to the server but the Switch 2 shows no recent USB HID activity (i.e. it is asleep), the server can briefly broadcast a BLE advertisement that mimics a genuine Joy-Con 2 HOME button press. The server temporarily changes the Pi's Bluetooth public address to the captured Joy-Con 2 MAC and transmits the exact manufacturer advertising data observed from that controller.
 
