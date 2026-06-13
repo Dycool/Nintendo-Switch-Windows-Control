@@ -235,11 +235,13 @@ static ServerMacroUploadRuntime g_server_macro_uploads[MAX_CLIENTS];
 
 static bool rate_allow(uint32_t ip);
 static bool server_macro_start(int client_idx, int subpad, const std::string& json_or_commands);
+static void maybe_send_switch2_wake_advert(const char* reason);
 
 static int server_macro_client_for_sender(const sockaddr_in& sender) {
     uint32_t src_ip = sender.sin_addr.s_addr;
     uint64_t now = now_us();
     int client_idx = -1;
+    bool wake_on_new_client = false;
     for (int i = 0; i < MAX_CLIENTS; ++i) {
         std::lock_guard<std::mutex> lk(g_mtx[i]);
         if (g_clients[i].active && g_clients[i].addr.sin_addr.s_addr == src_ip && g_clients[i].addr.sin_port == sender.sin_port) { client_idx = i; break; }
@@ -257,6 +259,7 @@ static int server_macro_client_for_sender(const sockaddr_in& sender) {
                 g_clients[i].report.reset();
                 clear_all_motion(g_clients[i]);
                 g_clients[i].last_rx_us = now;
+                wake_on_new_client = true;
                 break;
             }
         }
@@ -267,6 +270,8 @@ static int server_macro_client_for_sender(const sockaddr_in& sender) {
         g_clients[client_idx].addr = sender;
         g_clients[client_idx].last_rx_us = now;
     }
+    if (wake_on_new_client)
+        maybe_send_switch2_wake_advert("client connected via UDP macro upload");
     return client_idx;
 }
 
@@ -1513,8 +1518,8 @@ static void maybe_send_switch2_wake_advert(const char* reason) {
     g_switch2_last_wake_adv_us.store(now, std::memory_order_relaxed);
 
     if (g_verbose) {
-        std::printf("[wake] Switch 2 USB host looks unavailable (%s); sending Joy-Con 2 BLE wake advert for %dms\n",
-                    reason ? reason : "unknown", SWITCH2_WAKE_ADV_BURST_MS);
+        std::printf("[wake] %s; sending Joy-Con 2 BLE wake advert for %dms\n",
+                    reason ? reason : "client connected", SWITCH2_WAKE_ADV_BURST_MS);
     }
 
     std::thread(switch2_wake_adv_worker, SWITCH2_WAKE_ADV_BURST_MS).detach();
@@ -1676,7 +1681,6 @@ static void legacy_writer_thread(int hz) {
         }
 
         if (!all_open) {
-            maybe_send_switch2_wake_advert("legacy HID nodes not open");
             for (int i = 0; i < HID_PORT_COUNT; ++i) {
                 if (fds[i] >= 0) { close(fds[i]); fds[i] = -1; }
             }
@@ -1839,7 +1843,6 @@ static void legacy_writer_thread(int hz) {
 
             if (!ok) {
                 if (!error_shown) { std::puts("Host disconnected - waiting for reconnect..."); error_shown = true; }
-                maybe_send_switch2_wake_advert("legacy HID write failed");
                 for (int i = 0; i < HID_PORT_COUNT; ++i) { close(fds[i]); fds[i] = -1; }
                 for (int wait_i = 0; wait_i < 100 && g_running.load(std::memory_order_relaxed); ++wait_i) std::this_thread::sleep_for(ms(10));
                 break;
@@ -1901,7 +1904,6 @@ static void writer_thread(int hz) {
         }
 
         if (!all_open) {
-            maybe_send_switch2_wake_advert("HID nodes not open");
             // Do not keep a partial set of opened endpoints around while the
             // gadget is being recreated/rebound.  Retry with a clean fd set.
             for (int i = 0; i < HID_PORT_COUNT; ++i) {
@@ -2252,7 +2254,6 @@ static void writer_thread(int hz) {
 
             if (!ok) {
                 if (!error_shown) { std::puts("Host disconnected — waiting for reconnect..."); error_shown = true; }
-                maybe_send_switch2_wake_advert("HID write failed");
                 for (int i = 0; i < 4; ++i) { close(fds[i]); fds[i] = -1; rt[i].fd = -1; }
                 for (int wait_i = 0; wait_i < 100 && g_running.load(std::memory_order_relaxed); ++wait_i) std::this_thread::sleep_for(ms(10));
                 break;
@@ -2729,6 +2730,7 @@ static size_t process_ws_frame(WebClient *c) {
         const std::string prefix = "MACRO_RUN:";
         if (text.rfind(prefix, 0) == 0) {
             uint64_t now = now_us();
+            bool wake_on_new_client = false;
             if (c->ws_slot < 0) {
                 for (int i = 0; i < MAX_CLIENTS; ++i) {
                     std::lock_guard<std::mutex> lk(g_mtx[i]);
@@ -2742,10 +2744,13 @@ static size_t process_ws_frame(WebClient *c) {
                         clear_udp_rumble_state(g_clients[i]);
                         for (int s = 0; s < 4; ++s) { g_clients[i].pad_present[s] = false; g_clients[i].pad_last_present_us[s] = 0; }
                         g_clients[i].last_rx_us = now;
+                        wake_on_new_client = true;
                         break;
                     }
                 }
             }
+            if (wake_on_new_client)
+                maybe_send_switch2_wake_advert("client connected via WebSocket macro");
             if (c->ws_slot >= 0) {
                 {
                     std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
@@ -2774,6 +2779,7 @@ static size_t process_ws_frame(WebClient *c) {
         memcpy(&maybe_macro_magic, payload, 4);
         if (maybe_macro_magic == ns::macro::UDP_CHUNK_MAGIC) {
             uint64_t now = now_us();
+            bool wake_on_new_client = false;
             if (c->ws_slot < 0) {
                 for (int i = 0; i < MAX_CLIENTS; ++i) {
                     std::lock_guard<std::mutex> lk(g_mtx[i]);
@@ -2785,10 +2791,13 @@ static size_t process_ws_frame(WebClient *c) {
                         clear_all_motion(g_clients[i]);
                         g_clients[i].uses_pad_presence = true;
                         g_clients[i].last_rx_us = now;
+                        wake_on_new_client = true;
                         break;
                     }
                 }
             }
+            if (wake_on_new_client)
+                maybe_send_switch2_wake_advert("client connected via WebSocket macro chunk");
             if (c->ws_slot >= 0) {
                 std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
                 g_clients[c->ws_slot].active = true;
@@ -2862,6 +2871,7 @@ static size_t process_ws_frame(WebClient *c) {
     c->ws_seq = seq + 1;
 
     uint64_t now = now_us();
+    bool wake_on_new_client = false;
 
     if (c->ws_slot >= 0) {
         std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
@@ -2884,12 +2894,15 @@ static size_t process_ws_frame(WebClient *c) {
                     g_clients[i].pad_last_present_us[s] = 0;
                 }
                 g_clients[i].last_rx_us = now;
+                wake_on_new_client = true;
                 for (int s = 0; s < 4; ++s)
                     c->last_rumble_seq[s] = g_clients[i].rumble_seq[s];
                 break;
             }
         }
     }
+    if (wake_on_new_client)
+        maybe_send_switch2_wake_advert("client connected via WebSocket input");
     if (c->ws_slot >= 0) {
         std::lock_guard<std::mutex> lk(g_mtx[c->ws_slot]);
 
@@ -3619,6 +3632,7 @@ int main(int argc, char** argv) {
             // ── 3. Find Client Session or Pin new IP:port ─────────────────────────
             int client_idx = -1;
             uint64_t now = now_us();
+            bool wake_on_new_client = false;
 
             for (int i = 0; i < MAX_CLIENTS; ++i) {
                 std::lock_guard<std::mutex> lk(g_mtx[i]);
@@ -3649,11 +3663,15 @@ int main(int argc, char** argv) {
                             g_clients[i].pad_last_present_us[s] = 0;
                         }
                         g_clients[i].last_rx_us = now;
+                        wake_on_new_client = true;
                         if (g_verbose) std::printf("New UDP client accepted into Server Slot %d/4\n", i+1);
                         break;
                     }
                 }
             }
+
+            if (wake_on_new_client)
+                maybe_send_switch2_wake_advert("client connected via UDP input");
 
             // If all 4 slots are taken by active PCs, drop the packet.
             if (client_idx == -1) {
