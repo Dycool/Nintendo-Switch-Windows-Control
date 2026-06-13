@@ -1617,7 +1617,7 @@ static std::string adv_hex_to_hcitool_args(const std::string& adv_hex) {
     return oss.str();
 }
 
-static bool send_switch2_wake_advert_once(const std::string& mac, const std::string& adv_hex, int seconds) {
+static bool send_switch2_wake_advert_once(const std::string& mac, const std::string& adv_hex, int seconds, bool verbose_output = false) {
     if (!valid_mac_string(mac) || !valid_adv_hex(adv_hex)) {
         std::fprintf(stderr, "[wake] Invalid wake MAC/ADV; not sending\n");
         return false;
@@ -1890,6 +1890,8 @@ log "Done"
         << " --mac " << mac_lc
         << " --adv " << adv_uc
         << " --seconds " << seconds;
+    if (!verbose_output)
+        cmd << " >/dev/null 2>&1";
 
     int rc = std::system(cmd.str().c_str());
     unlink(script_path);
@@ -1902,7 +1904,7 @@ log "Done"
 
 static void switch2_wake_adv_worker(int burst_ms) {
     int seconds = std::max(1, (burst_ms + 999) / 1000);
-    send_switch2_wake_advert_once(g_switch2_wake_mac, g_switch2_wake_adv_hex, seconds);
+    send_switch2_wake_advert_once(g_switch2_wake_mac, g_switch2_wake_adv_hex, seconds, g_verbose);
     g_switch2_wake_adv_running.store(false, std::memory_order_relaxed);
 }
 
@@ -2030,14 +2032,12 @@ static void wait_for_enter(const char* prompt) {
 static bool auto_find_joycon_for_setup(std::string& joycon_mac) {
     std::puts("\n[wake] Step 1/4: Finding your Joy-Con 2 automatically.");
     std::puts("[wake] Put the Joy-Con 2 very close to the Pi and hold the small SYNC button.");
-    std::puts("[wake] Pairing with the Pi is skipped because Joy-Con 2/BlueZ pairing is flaky and not required.");
 
     std::string adv;
     for (int attempt = 1; attempt <= 12; ++attempt) {
         std::printf("[wake] Scanning for Nintendo/Joy-Con 2 advert... attempt %d/12\n", attempt);
         if (capture_switch2_wake_advert(10, "", joycon_mac, adv)) {
             std::printf("[wake] Found Nintendo controller: %s\n", joycon_mac.c_str());
-            std::puts("[wake] Continuing with this MAC. If this was not your Joy-Con 2, Ctrl+C and retry with it closer to the Pi.");
             return true;
         }
         std::puts("[wake] No Nintendo advert yet. Keep holding SYNC or press it again; retrying...");
@@ -2065,8 +2065,7 @@ static int run_switch2_wakeup_setup() {
     std::puts("------------------------------------------------");
     std::printf("[wake] Config will be saved to: %s\n", g_switch2_wakeup_config_path.c_str());
     std::puts("[wake] This setup scans your Joy-Con 2 on the Pi, captures its HOME advert, then asks you to attach it back to the Switch 2.");
-    std::puts("[wake] Pairing with the Pi is intentionally skipped because Joy-Con 2/BlueZ pairing is flaky and not required.");
-    std::puts("[wake] Use your own Joy-Con 2 that is/will be paired to this Switch 2.\n");
+    std::puts("[wake] Use your own Joy-Con 2 right joycon that is paired to this Switch 2.\n");
 
     std::string mac;
     if (!auto_find_joycon_for_setup(mac))
@@ -2074,7 +2073,8 @@ static int run_switch2_wakeup_setup() {
 
     std::puts("\n[wake] Step 2/4: Capture the Joy-Con 2 HOME wake advertisement.");
     std::puts("[wake] Keep the Joy-Con 2 very close to the Pi.");
-    std::puts("[wake] If pressing HOME wakes the Switch 2 before the Pi catches it, put the Switch 2 back to sleep and retry.");
+    std::puts("[wake] If pressing HOME wakes the Switch 2, put it back to sleep and retry.");
+    std::puts("[wake] It should take about 3-5 tries, this is normal.");
 
     std::string cap_mac, cap_adv;
     bool captured_home = false;
@@ -2111,7 +2111,7 @@ static int run_switch2_wakeup_setup() {
     std::printf("[wake] Saved wake config to %s\n", g_switch2_wakeup_config_path.c_str());
 
     std::puts("[wake] Step 4/4: Sending test wake advert with MAC spoofing...");
-    if (!send_switch2_wake_advert_once(g_switch2_wake_mac, g_switch2_wake_adv_hex, 1)) {
+    if (!send_switch2_wake_advert_once(g_switch2_wake_mac, g_switch2_wake_adv_hex, 1, false)) {
         std::fprintf(stderr, "[wake] Test wake send failed. Config was saved, but Bluetooth raw HCI send did not complete.\n");
         return 1;
     }
