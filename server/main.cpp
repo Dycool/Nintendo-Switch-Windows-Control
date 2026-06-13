@@ -87,7 +87,7 @@ static std::atomic<bool> g_switch2_usb_host_connected{false};
 static std::atomic<uint64_t> g_switch2_last_usb_activity_us{0};
 static constexpr uint64_t SWITCH2_USB_ACTIVITY_FRESH_US = 2'000'000ULL;
 static constexpr uint64_t SWITCH2_WAKE_ADV_COOLDOWN_US = 8'000'000ULL;
-static constexpr int SWITCH2_WAKE_ADV_BURST_MS = 1000;
+static constexpr int SWITCH2_WAKE_ADV_BURST_MS = 3000;
 
 static constexpr int HID_PORT_COUNT = 4;
 
@@ -1626,25 +1626,58 @@ static bool send_switch2_wake_advert_once(const std::string& mac, const std::str
     if (seconds > 10) seconds = 10;
 
     const std::string adv_args = adv_hex_to_hcitool_args(adv_hex);
+    const std::string mac_lc = lowercase_copy(mac);
+    const std::string mac_uc = uppercase_hex_copy(mac);
+
+    // Keep this close to the known-working bash script:
+    //   - stop bluetoothd so it does not fight raw HCI/mgmt state
+    //   - make sure the controller address really becomes the captured Joy-Con 2 MAC
+    //   - retry/reset hciuart if public-addr causes the controller to disappear/reindex
+    //   - use raw LE Set Advertising Parameters/Data/Enable commands
     std::ostringstream cmd;
     cmd << "sh -c '\n"
         << "set +e\n"
-        << "systemctl stop bluetooth >/dev/null 2>&1 || true\n"
-        << "rfkill unblock bluetooth >/dev/null 2>&1 || true\n"
-        << "btmgmt -i hci0 power off >/dev/null 2>&1 || true\n"
-        << "btmgmt -i hci0 privacy off >/dev/null 2>&1 || exit 20\n"
-        << "btmgmt -i hci0 bredr off >/dev/null 2>&1 || exit 21\n"
-        << "btmgmt -i hci0 le on >/dev/null 2>&1 || exit 22\n"
-        << "btmgmt -i hci0 public-addr " << lowercase_copy(mac) << " >/dev/null 2>&1 || exit 23\n"
-        << "btmgmt -i hci0 power on >/dev/null 2>&1 || exit 24\n"
-        << "sleep 0.3\n"
-        << "hcitool -i hci0 cmd 0x08 0x000A 00 >/dev/null 2>&1 || true\n"
-        << "hcitool -i hci0 cmd 0x08 0x0006 20 00 40 00 03 00 00 00 00 00 00 00 07 00 >/dev/null 2>&1 || exit 30\n"
-        << "hcitool -i hci0 cmd 0x08 0x0008 " << adv_args << " >/dev/null 2>&1 || exit 31\n"
-        << "hcitool -i hci0 cmd 0x08 0x0009 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 >/dev/null 2>&1 || exit 32\n"
-        << "hcitool -i hci0 cmd 0x08 0x000A 01 >/dev/null 2>&1 || exit 33\n"
-        << "sleep " << seconds << "\n"
-        << "hcitool -i hci0 cmd 0x08 0x000A 00 >/dev/null 2>&1 || true\n"
+        << "HCI_DEV=\"hci0\"\n"
+        << "MAC=\"" << mac_lc << "\"\n"
+        << "ADV_ARGS=\"" << adv_args << "\"\n"
+        << "SECONDS=\"" << seconds << "\"\n"
+        << "find_hci() { btmgmt info 2>/dev/null | awk '\''/^hci[0-9]+:/{gsub(\":\",\"\",$1); print $1; exit}'\''; }\n"
+        << "wait_for_hci() { i=0; while [ $i -lt 30 ]; do d=$(find_hci); if [ -n \"$d\" ]; then HCI_DEV=\"$d\"; return 0; fi; i=$((i+1)); sleep 0.5; done; return 1; }\n"
+        << "reset_bt_stack() { systemctl stop bluetooth >/dev/null 2>&1 || true; rfkill unblock bluetooth >/dev/null 2>&1 || true; hcitool -i \"$HCI_DEV\" cmd 0x08 0x000A 00 >/dev/null 2>&1 || true; systemctl restart hciuart >/dev/null 2>&1 || true; sleep 3; wait_for_hci; }\n"
+        << "prep() {\n"
+        << "  systemctl stop bluetooth >/dev/null 2>&1 || true\n"
+        << "  rfkill unblock bluetooth >/dev/null 2>&1 || true\n"
+        << "  wait_for_hci || reset_bt_stack || return 1\n"
+        << "  a=1; while [ $a -le 3 ]; do\n"
+        << "    btmgmt -i \"$HCI_DEV\" power off >/dev/null 2>&1 || true\n"
+        << "    btmgmt -i \"$HCI_DEV\" privacy off >/dev/null 2>&1 || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
+        << "    btmgmt -i \"$HCI_DEV\" bredr off >/dev/null 2>&1 || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
+        << "    btmgmt -i \"$HCI_DEV\" le on >/dev/null 2>&1 || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
+        << "    btmgmt -i \"$HCI_DEV\" public-addr \"$MAC\" >/dev/null 2>&1 || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
+        << "    wait_for_hci || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
+        << "    btmgmt -i \"$HCI_DEV\" power on >/dev/null 2>&1 || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
+        << "    sleep 0.5\n"
+        << "    info=$(btmgmt -i \"$HCI_DEV\" info 2>/dev/null)\n"
+        << "    cur=$(printf \"%s\\n\" \"$info\" | awk '\''/addr /{print toupper($2); exit}'\'')\n"
+        << "    want=$(printf \"%s\" \"$MAC\" | tr '\''[:lower:]'\'' '\''[:upper:]'\'')\n"
+        << "    if [ \"$cur\" = \"$want\" ]; then return 0; fi\n"
+        << "    reset_bt_stack || true\n"
+        << "    a=$((a+1))\n"
+        << "  done\n"
+        << "  return 1\n"
+        << "}\n"
+        << "advertise() {\n"
+        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x000A 00 >/dev/null 2>&1 || true\n"
+        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x0006 20 00 40 00 03 00 00 00 00 00 00 00 07 00 >/dev/null 2>&1 || return 30\n"
+        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x0008 $ADV_ARGS >/dev/null 2>&1 || return 31\n"
+        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x0009 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 >/dev/null 2>&1 || return 32\n"
+        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x000A 01 >/dev/null 2>&1 || return 33\n"
+        << "  sleep \"$SECONDS\"\n"
+        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x000A 00 >/dev/null 2>&1 || true\n"
+        << "  return 0\n"
+        << "}\n"
+        << "prep || exit 23\n"
+        << "advertise || { reset_bt_stack >/dev/null 2>&1 || true; prep || exit 24; advertise || exit 33; }\n"
         << "exit 0\n"
         << "'";
 
