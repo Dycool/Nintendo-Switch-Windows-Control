@@ -1625,63 +1625,274 @@ static bool send_switch2_wake_advert_once(const std::string& mac, const std::str
     if (seconds <= 0) seconds = 1;
     if (seconds > 10) seconds = 10;
 
-    const std::string adv_args = adv_hex_to_hcitool_args(adv_hex);
     const std::string mac_lc = lowercase_copy(mac);
-    const std::string mac_uc = uppercase_hex_copy(mac);
+    const std::string adv_uc = uppercase_hex_copy(adv_hex);
 
-    // Keep this close to the known-working bash script:
-    //   - stop bluetoothd so it does not fight raw HCI/mgmt state
-    //   - make sure the controller address really becomes the captured Joy-Con 2 MAC
-    //   - retry/reset hciuart if public-addr causes the controller to disappear/reindex
-    //   - use raw LE Set Advertising Parameters/Data/Enable commands
+    // Run the wake replay through an actual temporary bash script instead of
+    // embedding bash functions inside system("sh -c ...").  This intentionally
+    // mirrors wake-v4.sh as closely as possible: stop bluetoothd, set the Pi's
+    // public address to the captured Joy-Con 2 MAC, set raw advertising data,
+    // enable advertising briefly, then disable it.
+    char script_path[128];
+    std::snprintf(script_path, sizeof(script_path), "/tmp/ns_switch2_wake_replay_%ld.sh", (long)getpid());
+
+    const char* script = R"NSWAKE(#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+export LANG=C
+
+HCI_DEV="${HCI_DEV:-hci0}"
+DURATION="1"
+MAC=""
+ADV=""
+
+log() { echo "[+] $*"; }
+warn() { echo "[!] $*" >&2; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+
+find_hci() {
+  btmgmt info 2>/dev/null | awk '/^hci[0-9]+:/{gsub(":","",$1); print $1; exit}'
+}
+
+wait_for_hci() {
+  local i dev
+  for i in $(seq 1 30); do
+    dev="$(find_hci || true)"
+    if [ -n "$dev" ]; then
+      HCI_DEV="$dev"
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+reset_bt_stack() {
+  warn "Resetting Bluetooth stack / hciuart"
+  systemctl stop bluetooth >/dev/null 2>&1 || true
+  rfkill unblock bluetooth >/dev/null 2>&1 || true
+  hcitool -i "$HCI_DEV" cmd 0x08 0x000A 00 >/dev/null 2>&1 || true
+  systemctl restart hciuart >/dev/null 2>&1 || true
+  sleep 3
+  wait_for_hci
+}
+
+mgmt_cmd() {
+  local out rc
+  echo "+ btmgmt -i $HCI_DEV $*" >&2
+  set +e
+  out="$(btmgmt -i "$HCI_DEV" "$@" 2>&1)"
+  rc=$?
+  set -e
+  [ -n "$out" ] && echo "$out"
+  return "$rc"
+}
+
+hci_cmd() {
+  local out rc
+  echo "+ hcitool -i $HCI_DEV cmd $*" >&2
+  set +e
+  out="$(hcitool -i "$HCI_DEV" cmd "$@" 2>&1)"
+  rc=$?
+  set -e
+  [ -n "$out" ] && echo "$out"
+  return "$rc"
+}
+
+hex_to_args() {
+  local h="$1"
+  while [ -n "$h" ]; do
+    echo "${h:0:2}"
+    h="${h:2}"
+  done
+}
+
+cleanup() {
+  hcitool -i "$HCI_DEV" cmd 0x08 0x000A 00 >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --mac) MAC="$2"; shift 2 ;;
+    --adv) ADV="$2"; shift 2 ;;
+    --seconds) DURATION="$2"; shift 2 ;;
+    --hci) HCI_DEV="$2"; shift 2 ;;
+    *) die "Unknown option: $1" ;;
+  esac
+done
+
+[ "$(id -u)" -eq 0 ] || die "Run with sudo/root"
+need_cmd btmgmt
+need_cmd hcitool
+need_cmd rfkill
+need_cmd systemctl
+need_cmd awk
+
+MAC="$(echo "$MAC" | tr '[:upper:]' '[:lower:]')"
+ADV="$(echo "$ADV" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+
+[[ "$MAC" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || die "Bad MAC: $MAC"
+[[ "$ADV" =~ ^[0-9A-F]+$ ]] || die "Bad ADV hex"
+[ $(( ${#ADV} % 2 )) -eq 0 ] || die "ADV hex must have even length"
+
+ADV_BYTES=$(( ${#ADV} / 2 ))
+[ "$ADV_BYTES" -le 31 ] || die "ADV is ${ADV_BYTES} bytes, max is 31"
+
+mapfile -t ADV_ARGS < <(hex_to_args "$ADV")
+while [ "${#ADV_ARGS[@]}" -lt 31 ]; do
+  ADV_ARGS+=("00")
+done
+LEN_ARG="$(printf "%02X" "$ADV_BYTES")"
+
+prepare_controller() {
+  local attempt info rc current_addr wanted_addr
+  wanted_addr="$(echo "$MAC" | tr '[:lower:]' '[:upper:]')"
+
+  systemctl stop bluetooth >/dev/null 2>&1 || true
+  rfkill unblock bluetooth >/dev/null 2>&1 || true
+
+  if ! wait_for_hci; then
+    reset_bt_stack || return 1
+  fi
+
+  for attempt in 1 2 3; do
+    log "Preparing Bluetooth controller, attempt $attempt, device $HCI_DEV"
+
+    mgmt_cmd power off >/dev/null 2>&1 || true
+
+    if ! mgmt_cmd privacy off; then
+      reset_bt_stack || true
+      continue
+    fi
+
+    if ! mgmt_cmd bredr off; then
+      reset_bt_stack || true
+      continue
+    fi
+
+    if ! mgmt_cmd le on; then
+      reset_bt_stack || true
+      continue
+    fi
+
+    if ! mgmt_cmd public-addr "$MAC"; then
+      reset_bt_stack || true
+      continue
+    fi
+
+    if ! wait_for_hci; then
+      reset_bt_stack || true
+      continue
+    fi
+
+    if ! mgmt_cmd power on; then
+      reset_bt_stack || true
+      continue
+    fi
+
+    sleep 0.5
+
+    set +e
+    info="$(btmgmt -i "$HCI_DEV" info 2>&1)"
+    rc=$?
+    set -e
+
+    if [ "$rc" -ne 0 ]; then
+      echo "$info"
+      reset_bt_stack || true
+      continue
+    fi
+
+    echo "$info"
+    current_addr="$(printf '%s\n' "$info" | awk '/addr /{print toupper($2); exit}')"
+
+    if [ "$current_addr" = "$wanted_addr" ]; then
+      log "Controller public address is now $current_addr"
+      return 0
+    fi
+
+    warn "Controller address is $current_addr, wanted $wanted_addr"
+    reset_bt_stack || true
+  done
+
+  return 1
+}
+
+start_raw_advertising() {
+  log "Disable advertising first"
+  hci_cmd 0x08 0x000A 00 >/dev/null 2>&1 || true
+
+  log "Set advertising parameters"
+  hci_cmd 0x08 0x0006 \
+    20 00 \
+    40 00 \
+    03 \
+    00 \
+    00 \
+    00 00 00 00 00 00 \
+    07 \
+    00 || return 1
+
+  log "Set advertising data (${ADV_BYTES} bytes)"
+  hci_cmd 0x08 0x0008 "$LEN_ARG" "${ADV_ARGS[@]}" || return 1
+
+  log "Clear scan response data"
+  hci_cmd 0x08 0x0009 \
+    00 \
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 \
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 || return 1
+
+  log "Enable advertising as $MAC for ${DURATION}s"
+  hci_cmd 0x08 0x000A 01 || return 1
+
+  sleep "$DURATION"
+
+  log "Disable advertising"
+  cleanup
+
+  return 0
+}
+
+log "Wake MAC: $MAC"
+log "ADV bytes: $ADV_BYTES"
+log "Duration: ${DURATION}s"
+
+if ! prepare_controller; then
+  die "Could not prepare Bluetooth controller. Try: sudo systemctl restart hciuart || sudo reboot"
+fi
+
+if ! start_raw_advertising; then
+  warn "Raw advertising failed. Trying one Bluetooth stack reset, then retrying once."
+  reset_bt_stack || die "Bluetooth reset failed"
+  if ! prepare_controller; then
+    die "Could not prepare Bluetooth controller after reset"
+  fi
+  start_raw_advertising || die "Raw advertising failed after retry"
+fi
+
+log "Done"
+)NSWAKE";
+
+    {
+        std::ofstream f(script_path, std::ios::trunc);
+        if (!f) {
+            std::fprintf(stderr, "[wake] Failed to create temporary wake script: %s\n", script_path);
+            return false;
+        }
+        f << script;
+    }
+    chmod(script_path, 0700);
+
     std::ostringstream cmd;
-    cmd << "bash -c '\n"
-        << "set +e\n"
-        << "HCI_DEV=\"hci0\"\n"
-        << "MAC=\"" << mac_lc << "\"\n"
-        << "ADV_ARGS=\"" << adv_args << "\"\n"
-        << "SECONDS=\"" << seconds << "\"\n"
-        << "find_hci() { btmgmt info 2>/dev/null | awk '\''/^hci[0-9]+:/{gsub(\":\",\"\",$1); print $1; exit}'\''; }\n"
-        << "wait_for_hci() { i=0; while [ $i -lt 30 ]; do d=$(find_hci); if [ -n \"$d\" ]; then HCI_DEV=\"$d\"; return 0; fi; i=$((i+1)); sleep 0.5; done; return 1; }\n"
-        << "reset_bt_stack() { systemctl stop bluetooth >/dev/null 2>&1 || true; rfkill unblock bluetooth >/dev/null 2>&1 || true; hcitool -i \"$HCI_DEV\" cmd 0x08 0x000A 00 >/dev/null 2>&1 || true; systemctl restart hciuart >/dev/null 2>&1 || true; sleep 3; wait_for_hci; }\n"
-        << "prep() {\n"
-        << "  systemctl stop bluetooth >/dev/null 2>&1 || true\n"
-        << "  rfkill unblock bluetooth >/dev/null 2>&1 || true\n"
-        << "  wait_for_hci || reset_bt_stack || return 1\n"
-        << "  a=1; while [ $a -le 3 ]; do\n"
-        << "    btmgmt -i \"$HCI_DEV\" power off >/dev/null 2>&1 || true\n"
-        << "    btmgmt -i \"$HCI_DEV\" privacy off >/dev/null 2>&1 || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
-        << "    btmgmt -i \"$HCI_DEV\" bredr off >/dev/null 2>&1 || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
-        << "    btmgmt -i \"$HCI_DEV\" le on >/dev/null 2>&1 || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
-        << "    btmgmt -i \"$HCI_DEV\" public-addr \"$MAC\" >/dev/null 2>&1 || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
-        << "    wait_for_hci || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
-        << "    btmgmt -i \"$HCI_DEV\" power on >/dev/null 2>&1 || { reset_bt_stack || true; a=$((a+1)); continue; }\n"
-        << "    sleep 0.5\n"
-        << "    info=$(btmgmt -i \"$HCI_DEV\" info 2>/dev/null)\n"
-        << "    cur=$(printf \"%s\\n\" \"$info\" | awk '\''/addr /{print toupper($2); exit}'\'')\n"
-        << "    want=$(printf \"%s\" \"$MAC\" | tr '\''[:lower:]'\'' '\''[:upper:]'\'')\n"
-        << "    if [ \"$cur\" = \"$want\" ]; then return 0; fi\n"
-        << "    reset_bt_stack || true\n"
-        << "    a=$((a+1))\n"
-        << "  done\n"
-        << "  return 1\n"
-        << "}\n"
-        << "advertise() {\n"
-        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x000A 00 >/dev/null 2>&1 || true\n"
-        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x0006 20 00 40 00 03 00 00 00 00 00 00 00 00 07 00 >/dev/null 2>&1 || return 30\n"
-        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x0008 $ADV_ARGS >/dev/null 2>&1 || return 31\n"
-        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x0009 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 >/dev/null 2>&1 || return 32\n"
-        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x000A 01 >/dev/null 2>&1 || return 33\n"
-        << "  sleep \"$SECONDS\"\n"
-        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x000A 00 >/dev/null 2>&1 || true\n"
-        << "  return 0\n"
-        << "}\n"
-        << "prep || exit 23\n"
-        << "advertise || { reset_bt_stack >/dev/null 2>&1 || true; prep || exit 24; advertise || exit 33; }\n"
-        << "exit 0\n"
-        << "'";
+    cmd << "bash " << script_path
+        << " --mac " << mac_lc
+        << " --adv " << adv_uc
+        << " --seconds " << seconds;
 
     int rc = std::system(cmd.str().c_str());
+    unlink(script_path);
     if (rc != 0) {
         std::fprintf(stderr, "[wake] Raw HCI wake advert failed with status %d\n", rc);
         return false;
