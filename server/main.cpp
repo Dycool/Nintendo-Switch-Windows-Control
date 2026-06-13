@@ -1635,7 +1635,7 @@ static bool send_switch2_wake_advert_once(const std::string& mac, const std::str
     //   - retry/reset hciuart if public-addr causes the controller to disappear/reindex
     //   - use raw LE Set Advertising Parameters/Data/Enable commands
     std::ostringstream cmd;
-    cmd << "sh -c '\n"
+    cmd << "bash -c '\n"
         << "set +e\n"
         << "HCI_DEV=\"hci0\"\n"
         << "MAC=\"" << mac_lc << "\"\n"
@@ -1668,7 +1668,7 @@ static bool send_switch2_wake_advert_once(const std::string& mac, const std::str
         << "}\n"
         << "advertise() {\n"
         << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x000A 00 >/dev/null 2>&1 || true\n"
-        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x0006 20 00 40 00 03 00 00 00 00 00 00 00 07 00 >/dev/null 2>&1 || return 30\n"
+        << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x0006 20 00 40 00 03 00 00 00 00 00 00 00 00 07 00 >/dev/null 2>&1 || return 30\n"
         << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x0008 $ADV_ARGS >/dev/null 2>&1 || return 31\n"
         << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x0009 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 >/dev/null 2>&1 || return 32\n"
         << "  hcitool -i \"$HCI_DEV\" cmd 0x08 0x000A 01 >/dev/null 2>&1 || return 33\n"
@@ -1817,7 +1817,7 @@ static void wait_for_enter(const char* prompt) {
 }
 
 static bool auto_find_joycon_for_setup(std::string& joycon_mac) {
-    std::puts("\n[wake] Step 1/5: Finding your Joy-Con 2 automatically.");
+    std::puts("\n[wake] Step 1/4: Finding your Joy-Con 2 automatically.");
     std::puts("[wake] Put the Joy-Con 2 very close to the Pi and hold the small SYNC button.");
     std::puts("[wake] Pairing with the Pi is skipped because Joy-Con 2/BlueZ pairing is flaky and not required.");
 
@@ -1861,7 +1861,7 @@ static int run_switch2_wakeup_setup() {
     if (!auto_find_joycon_for_setup(mac))
         return 1;
 
-    std::puts("\n[wake] Step 2/5: Capture the Joy-Con 2 HOME wake advertisement.");
+    std::puts("\n[wake] Step 2/4: Capture the Joy-Con 2 HOME wake advertisement.");
     std::puts("[wake] Keep the Joy-Con 2 very close to the Pi.");
     std::puts("[wake] If pressing HOME wakes the Switch 2 before the Pi catches it, put the Switch 2 back to sleep and retry.");
 
@@ -1886,9 +1886,10 @@ static int run_switch2_wakeup_setup() {
     std::printf("[wake] Captured wake MAC: %s\n", mac.c_str());
     std::printf("[wake] Captured wake ADV: %s\n", cap_adv.c_str());
 
-    std::puts("\n[wake] Step 3/5: Attach the Joy-Con 2 to the Switch 2 now.");
-    std::puts("[wake] Wait until the Switch 2 accepts/pairs it again.");
-    wait_for_enter("[wake] Press Enter when the Joy-Con 2 is attached and paired back to the Switch 2... ");
+    std::puts("\n[wake] Step 3/4: Attach the Joy-Con 2 to the Switch 2, then suspend the Switch 2.");
+    std::puts("[wake] Attach the Joy-Con 2 to the Switch 2 and wait until the console accepts/pairs it again.");
+    std::puts("[wake] Then put the Switch 2 to sleep before continuing.");
+    wait_for_enter("[wake] Press Enter when the Joy-Con 2 is paired back AND the Switch 2 is asleep; setup will test wake... ");
 
     if (!save_switch2_wakeup_config(mac, cap_adv))
         return 1;
@@ -1898,10 +1899,7 @@ static int run_switch2_wakeup_setup() {
     g_switch2_wake_config_loaded = true;
     std::printf("[wake] Saved wake config to %s\n", g_switch2_wakeup_config_path.c_str());
 
-    std::puts("\n[wake] Step 4/5: Suspend the Switch 2 now.");
-    wait_for_enter("[wake] Press Enter after the Switch 2 is asleep; setup will send a test wake packet... ");
-
-    std::puts("[wake] Step 5/5: Sending test wake advert with MAC spoofing...");
+    std::puts("[wake] Step 4/4: Sending test wake advert with MAC spoofing...");
     if (!send_switch2_wake_advert_once(g_switch2_wake_mac, g_switch2_wake_adv_hex, 1)) {
         std::fprintf(stderr, "[wake] Test wake send failed. Config was saved, but Bluetooth raw HCI send did not complete.\n");
         return 1;
