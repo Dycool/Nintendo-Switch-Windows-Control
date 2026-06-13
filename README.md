@@ -18,7 +18,7 @@ This project was built from scratch in **C++** and uses **UDP** for low latency.
 
 **Macros** - Create, record and share your own macros from any PC client!
 
-**Play it whenever you wish to!** With the new support of wake up packets for the switch 2, the switch can now remain asleep until you connect to the server (additional setup required)!
+**Play it whenever you wish to!** With the new support of wake up packets for the switch 2, the switch can now remain asleep until you connect to the server (additional setup required, still not released, test it in actions)!
 
 **Supports any raspberry pi with usb gadget!**
 
